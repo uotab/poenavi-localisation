@@ -1,5 +1,6 @@
 param(
-    [string]$Python = "python"
+    [string]$Python = "python",
+    [int]$TimeoutSeconds = 600
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,13 +9,21 @@ $failedFiles = @()
 
 foreach ($testFile in $testFiles) {
     Write-Host "::group::$testFile"
-    & $Python -m pytest -q $testFile
-    $testExitCode = $LASTEXITCODE
+    $process = Start-Process -FilePath $Python -ArgumentList @("-m", "pytest", "-q", "`"$testFile`"") -NoNewWindow -PassThru
+    $null = $process.Handle  # cache the handle so ExitCode is readable after exit
+    if ($process.WaitForExit($TimeoutSeconds * 1000)) {
+        $testExitCode = $process.ExitCode
+    }
+    else {
+        # A hung file (e.g. a modal dialog) must not stall the whole run.
+        & taskkill /T /F /PID $process.Id | Out-Null
+        $testExitCode = "timeout after ${TimeoutSeconds}s"
+    }
     Write-Host "::endgroup::"
 
     if ($testExitCode -ne 0) {
         $failedFiles += $testFile
-        Write-Host "$testFile failed with exit code $testExitCode"
+        Write-Host "$testFile failed: $testExitCode"
     }
 }
 

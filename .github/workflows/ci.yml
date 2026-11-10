@@ -1,27 +1,29 @@
 name: CI
 
 on:
-  push: {}
+  push:
+    branches:
+      - main
   pull_request: {}
 
 permissions:
   contents: read
 
+# A newer push to the same branch/PR cancels the run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version:
-          - "3.11"
-          - "3.12"
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
           cache: pip
 
       - name: Install dependencies
@@ -32,8 +34,10 @@ jobs:
           PYTHONUTF8: "1"
         run: python scripts/validate_locales.py
 
+      # One process per file: a single pytest process can hang on a modal dialog.
       - name: Run tests
+        shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
           PYTHONUTF8: "1"
-        run: python -m pytest -q
+        run: .\scripts\run_tests_by_file.ps1 -Python python

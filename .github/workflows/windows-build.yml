@@ -9,9 +9,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -22,12 +27,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-build.txt
 
-      - name: Run tests
-        shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: .\scripts\run_tests_by_file.ps1 -Python python
-
+      # Tests run in the CI workflow on the same PR; this job only checks the build.
       - name: Build release assets
         shell: pwsh
         run: .\scripts\build_release.ps1 -Python python
