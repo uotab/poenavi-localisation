@@ -4889,6 +4889,10 @@ class MainWindow(QMainWindow):
             return
         screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
         image = screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height()).toImage()
+        # Debug aid: the exact frame that was matched, to compare with the in-game result.
+        capture_path = os.path.join(ConfigManager.get_user_data_dir(), "last_layout_capture.png")
+        image.save(capture_path)
+        print(f"[LAYOUT DEBUG] rect={rect.getRect()} image={image.width()}x{image.height()} saved={capture_path}")
         # shortcut: matching runs on the UI thread (~0.5 s); move to a worker if it stutters.
         detected = detect_layout(qimage_to_bgr(image), paths)
         if detected is None:
