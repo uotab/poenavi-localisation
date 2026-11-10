@@ -20,6 +20,9 @@ TEMPLATE_SIZE = 160  # long side of the capture template, in pixels
 # their detail; shrinking the template instead made tiny blurry templates match anywhere.
 CAPTURE_SHARES = tuple(np.linspace(0.2, 1.0, 17))
 MIN_CONTENT_PIXELS = 50
+# Share of the capture that must be map lines before ranking. Real 2560x1440 captures: a
+# correct pick had 0.87%; captures just after entering (wrong or coin-flip picks) had 0.19-0.39%.
+MIN_WALL_SHARE = 0.006
 UNCERTAIN_MARGIN = 0.02  # best-vs-runner-up score gap below which the result is flagged
 NOISE_SHARE = 0.25  # capture groups smaller than this share of the largest are discarded (life globe ~11%)
 
@@ -120,7 +123,11 @@ def _score(path: str, template: np.ndarray) -> float:
 
 def rank_layouts(capture_bgr: np.ndarray, paths: list[str]) -> list[tuple[str, float]]:
     """Return (path, score) best-first; scores are in [0, 1]. Empty if the capture shows no map."""
-    crop = _content_crop(drop_specks(wall_mask(capture_bgr)))
+    mask = drop_specks(wall_mask(capture_bgr))
+    # Layouts often share their start area, so a barely explored map gives confident wrong picks.
+    if np.count_nonzero(mask) < MIN_WALL_SHARE * mask.size:
+        return []
+    crop = _content_crop(mask)
     if crop is None:
         return []
     template = _scaled(crop, TEMPLATE_SIZE)

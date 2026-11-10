@@ -822,7 +822,7 @@
   "🔍 店売り・スタッシュ検索": "🔍 Store-specific inventory search",
   "🔓 クリックスルーON（{value_0}で解除）": "🔓 Click-through ON{value_0}(To release/unblock)",
   "🗺 PoEのウィンドウが見つかりません": "🗺 Path of Exile window not found",
-  "🗺 マップを読み取れませんでした。ゲーム内のマップ（Tab）を開いてから押してください": "🗺 Could not read the map. Open the in-game map (Tab), then press the hotkey",
+  "🗺 マップを判定できません。ゲーム内のマップ（Tab）を開き、もう少し探索してから押してください": "🗺 Not enough map to decide. Open the in-game map (Tab), explore a bit further, then press the hotkey",
   "🗺 マップレイアウト": "🗺 Map Layout",
   "🗺 マップレイアウト ({value_0}パターン)": "🗺 Map Layout{value_0}(Example)",
   "🗺 マップレイアウト ({value_0}パターン) — 判定: {value_1}": "🗺 Map layout ({value_0} patterns) — detected: {value_1}",

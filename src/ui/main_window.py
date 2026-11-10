@@ -4892,7 +4892,7 @@ class MainWindow(QMainWindow):
         ranked = rank_layouts(qimage_to_bgr(image), paths)
         if not ranked:
             self.map_thumbnail.header_label.setText(
-                tr_ui("🗺 マップを読み取れませんでした。ゲーム内のマップ（Tab）を開いてから押してください")
+                tr_ui("🗺 マップを判定できません。ゲーム内のマップ（Tab）を開き、もう少し探索してから押してください")
             )
             return
         uncertain = len(ranked) > 1 and ranked[0][1] - ranked[1][1] < UNCERTAIN_MARGIN

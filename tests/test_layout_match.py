@@ -39,14 +39,21 @@ def test_stray_specks_around_the_map_do_not_change_the_result():
     rng = np.random.default_rng(0)
     for truth in ZONE_PATHS:
         overlay = _partial_capture(truth)
-        height, width = overlay.shape[:2]
         for _ in range(5):
-            capture = np.full((height + 400, width + 600, 3), (40, 30, 28), np.uint8)
-            capture[200:200 + height, 300:300 + width] = overlay
+            capture = overlay.copy()
             for _ in range(4):
                 x, y = rng.integers(6, capture.shape[1] - 6), rng.integers(6, capture.shape[0] - 6)
                 cv2.circle(capture, (int(x), int(y)), 3, (200, 170, 170), 1)  # wall-coloured, so only grouping removes it
             assert rank_layouts(capture, ZONE_PATHS)[0][0] == truth
+
+
+def test_barely_explored_map_returns_no_ranking():
+    """Just after entering, layouts share their start area: refuse to guess instead of picking one."""
+    image = read_image(ZONE_PATHS[0])
+    height, width = image.shape[:2]
+    capture = np.full((1440, 2560, 3), (40, 30, 28), np.uint8)
+    capture[600:600 + height // 8, 1200:1200 + width // 8] = image[height // 2: height // 2 + height // 8, width // 2: width // 2 + width // 8]
+    assert rank_layouts(capture, ZONE_PATHS) == []
 
 
 def test_capture_without_map_lines_returns_no_ranking():
