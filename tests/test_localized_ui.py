@@ -85,6 +85,8 @@ def test_main_window_chrome_constructs_in_english(qapp):
         patch.object(MainWindow, "_run_startup_update_gate", return_value=True),
         patch.object(MainWindow, "register_hotkeys"),
         patch.object(MainWindow, "_show_area_note_migration_notice_once"),
+        # Modal box when no Client.txt is found (always on CI); it would block forever.
+        patch.object(MainWindow, "_show_missing_log_notice"),
         patch.object(MainWindow, "_restore_progress_flags"),
         patch.object(MainWindow, "_restore_timer_state"),
         patch("src.ui.main_window.ConfigManager.save_config"),
