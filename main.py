@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 from time import perf_counter
 
@@ -137,12 +138,22 @@ def ensure_language_selected(config):
     return config
 
 
+def install_ctrl_c_quit(app):
+    """Ctrl+C in the console closes the app like the window's close button (closeEvent cleanup runs)."""
+    signal.signal(signal.SIGINT, lambda *_: (app.closeAllWindows(), app.quit()))
+    # Qt's event loop is C++, so Python only sees the signal when it runs: wake it regularly.
+    app.ctrl_c_wakeup_timer = timer = QTimer()
+    timer.timeout.connect(lambda: None)
+    timer.start(200)
+
+
 def run():
     started_at = perf_counter()
     force_poetore = consume_windows_startup_poetore_argument(sys.argv)
     restart_pid = consume_restart_pid(sys.argv)
     wait_for_previous_instance(restart_pid)
     app = QApplication(sys.argv)
+    install_ctrl_c_quit(app)
     apply_bundled_ui_font(app)
     single_instance = SingleInstanceGuard(parent=app)
     if not single_instance.start():
