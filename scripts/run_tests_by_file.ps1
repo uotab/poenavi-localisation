@@ -9,7 +9,7 @@ $failedFiles = @()
 
 foreach ($testFile in $testFiles) {
     Write-Host "::group::$testFile"
-    $process = Start-Process -FilePath $Python -ArgumentList @("-m", "pytest", "-q", "`"$testFile`"") -NoNewWindow -PassThru
+    $process = Start-Process -FilePath $Python -ArgumentList @("-m", "pytest", "-q", "-o", "faulthandler_timeout=300", "`"$testFile`"") -NoNewWindow -PassThru
     $null = $process.Handle  # cache the handle so ExitCode is readable after exit
     if ($process.WaitForExit($TimeoutSeconds * 1000)) {
         $testExitCode = $process.ExitCode
