@@ -1,0 +1,1371 @@
+from __future__ import annotations
+
+import csv
+from dataclasses import replace
+import json
+from pathlib import Path
+
+import pytest
+
+from src.poetore.models import ItemModifier
+from src.poetore.poe2 import parser as poe2_parser
+from src.poetore.poe2.metadata import resolve_stat_line_candidates
+from src.poetore.poe2.parser import Poe2ItemParseError, TRADE_CATEGORY_BY_CATEGORY, parse_item_text
+from src.poetore.poe2.trade import build_search_query, poe2_trade_filters
+from src.poetore.poe2.fixture_loader import load_real_copy_rows
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "poe2" / "minimal_items.json"
+PHASE6_FIXTURES = Path(__file__).parent / "fixtures" / "poe2" / "phase6_special_items_ja.json"
+AMBIGUOUS_BASE_FIXTURES = (
+    Path(__file__).parent / "fixtures" / "poe2" / "ambiguous_bases_bilingual.json"
+)
+REAL_COPY_FIXTURES = Path(__file__).parent / "fixtures" / "poe2" / "real_copy_bilingual.csv"
+VAAL_SIPHONER_FIXTURE = Path(__file__).parent / "fixtures" / "poe2" / "vaal_siphoner_ja.txt"
+DOUBLE_CORRUPTED_GEM_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "poe2" / "whirling_assault_double_corrupted_ja.txt"
+)
+CONSTRICTING_COMMAND_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "poe2" / "constricting_command_ja.txt"
+)
+SKYSLIVER_FIXTURE = Path(__file__).parent / "fixtures" / "poe2" / "skysliver_ja.txt"
+
+KEEPER_OF_THE_ARC_JA = """アイテムクラス: 兜
+レアリティ: ユニーク
+弧の守りて
+スピリットボーンの冠
+--------
+アーマー: 476 (augmented)
+エナジーシールド: 138 (augmented)
+--------
+装備条件：レベル 62, 36 筋力, 36 知性
+--------
+アイテムレベル: 81
+--------
+{ ユニークモッド — アーマー, エナジーシールド }
+アーマーおよびエナジーシールドが272(240-340)%増加する
+{ ユニークモッド }
+5秒ごとに変化する:
+ヒットから受けるダメージが40%低下する
+受ける継続ダメージが40%低下する
+{ ユニークモッド — ライフ }
+毎秒17.8(15-25)のライフを自動回復する
+{ ユニークモッド — マナ }
+マナ自動回復レートが24(15-25)%増加する
+--------
+カルグールの神官たちは証明できぬ約束ではなく、
+数字や計算により信仰心を集める。
+"""
+
+
+def test_japanese_vaal_siphoner_builds_currency_search_query():
+    item = parse_item_text(VAAL_SIPHONER_FIXTURE.read_text(encoding="utf-8"))
+    payload = build_search_query(item)
+
+    assert item.category == "currency"
+    assert item.rarity == "currency"
+    assert item.name == "Vaal Siphoner"
+    assert item.base_type == "Vaal Siphoner"
+    assert payload["query"]["type"] == "Vaal Siphoner"
+    assert payload["query"]["filters"]["type_filters"]["filters"]["category"] == {
+        "option": "currency",
+    }
+
+
+def test_japanese_double_corrupted_gem_preserves_corrupted_state():
+    item = parse_item_text(DOUBLE_CORRUPTED_GEM_FIXTURE.read_text(encoding="utf-8"))
+
+    assert item.category == "active_gem"
+    assert item.base_type == "Whirling Assault"
+    assert "corrupted" in item.flags
+    assert not [modifier for modifier in item.modifiers if not modifier.ref]
+
+
+def test_jewel_scoped_stat_match_does_not_replace_general_item_stat():
+    text = "敵を倒した時にマナの1%を回復する"
+
+    jewel = resolve_stat_line_candidates(
+        text, "explicit", item_category="jewel",
+    )
+    general = resolve_stat_line_candidates(
+        text, "explicit", item_category="ring",
+    )
+
+    assert jewel[0][0]["id"] == "explicit.stat_1604736568"
+    assert general[0][0]["id"] == "explicit.stat_1030153674"
+
+
+def test_constricting_command_resolves_fewer_surrounded_enemies_as_negative_stat():
+    item = parse_item_text(CONSTRICTING_COMMAND_FIXTURE.read_text(encoding="utf-8"))
+
+    surrounded = next(
+        modifier for modifier in item.modifiers
+        if modifier.stat_id == "explicit.stat_2267564181"
+    )
+    assert item.name == "Constricting Command"
+    assert surrounded.values == (-3.0,)
+    assert surrounded.better == -1
+    assert (surrounded.roll_min, surrounded.roll_max) == (-4.0, -2.0)
+    assert not [modifier for modifier in item.modifiers if not modifier.stat_id]
+
+    row = next(
+        row for row in poe2_trade_filters(item)
+        if row.stat_id == "explicit.stat_2267564181"
+    )
+    assert row.enabled
+    assert row.min_value is None
+    assert row.max_value == -3.0
+
+
+def test_keeper_of_the_arc_resolves_alternating_multiline_stat():
+    item = parse_item_text(KEEPER_OF_THE_ARC_JA)
+
+    alternating = next(
+        modifier for modifier in item.modifiers
+        if modifier.stat_id == "explicit.stat_258955603"
+    )
+    assert alternating.text == (
+        "5秒ごとに変化する:\n"
+        "ヒットから受けるダメージが40%低下する\n"
+        "受ける継続ダメージが40%低下する"
+    )
+    assert alternating.values == (-40.0, -40.0)
+    assert not [modifier for modifier in item.modifiers if not modifier.stat_id]
+
+
+def _fixtures():
+    return json.loads(FIXTURES.read_text(encoding="utf-8"))["fixtures"]
+
+
+def _phase6_fixtures():
+    return json.loads(PHASE6_FIXTURES.read_text(encoding="utf-8"))["fixtures"]
+
+
+def _ambiguous_base_fixtures():
+    return json.loads(AMBIGUOUS_BASE_FIXTURES.read_text(encoding="utf-8"))["fixtures"]
+
+
+def _real_copy_fixtures():
+    return load_real_copy_rows(REAL_COPY_FIXTURES)
+
+
+def _real_copy(fixture_id):
+    return next(row for row in _real_copy_fixtures() if row["fixture_id"] == fixture_id)
+
+
+def test_real_copy_fixture_file_references_are_resolved_and_sandboxed(tmp_path):
+    fixture = tmp_path / "copy.txt"
+    fixture.write_text("Item Class: Belts\nRarity: Unique\nMageblood\nUtility Belt\n", encoding="utf-8")
+    csv_source = tmp_path / "fixtures.csv"
+    csv_source.write_text(
+        "fixture_id,日本語設定の詳細コピー全文,英語設定の詳細コピー全文\n"
+        "FX,@copy.txt,@copy.txt\n", encoding="utf-8",
+    )
+    rows = load_real_copy_rows(csv_source)
+    assert rows[0]["日本語設定の詳細コピー全文"].startswith("Item Class: Belts")
+    csv_source.write_text(
+        "fixture_id,日本語設定の詳細コピー全文,英語設定の詳細コピー全文\n"
+        "FX,@../outside.txt,@copy.txt\n", encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="不正なfixture参照"):
+        load_real_copy_rows(csv_source)
+
+
+def test_new_user_captured_special_pairs_preserve_state_stats_and_values():
+    fixtures = {row["fixture_id"]: row for row in _real_copy_fixtures()}
+    expected = {
+        "FX019": ("Anvil Maul", {"crafted", "desecrated", "sanctified"}, {
+            "implicit.stat_1503146834", "explicit.stat_9187492", "explicit.stat_53386210",
+        }),
+        "FX024": ("Ornate Ringmail", {"mirrored"}, {"explicit.stat_3032590688"}),
+        "FX026": ("Utility Belt", set(), {
+            "implicit.stat_1416292992", "explicit.stat_264262054|3",
+            "explicit.stat_264262054|11", "explicit.stat_264262054|4",
+            "explicit.stat_264262054|8",
+        }),
+        "FX027": ("Time-Lost Diamond", {"corrupted"}, {
+            "explicit.stat_2948688907", "explicit.stat_2217513089",
+        }),
+        "FX028": ("Gold Ring", set(), {
+            "explicit.stat_3372524247", "explicit.stat_4220027924",
+            "explicit.stat_1671376347",
+        }),
+    }
+    for fixture_id, (base_type, flags, expected_ids) in expected.items():
+        parsed = [parse_item_text(fixtures[fixture_id][column]) for column in (
+            "日本語設定の詳細コピー全文", "英語設定の詳細コピー全文",
+        )]
+        assert all(item.base_type == base_type for item in parsed)
+        assert [set(item.flags) for item in parsed] == [flags, flags]
+        assert all(not [modifier for modifier in item.modifiers if not modifier.ref] for item in parsed)
+        filter_ids = [
+            {row.stat_id for row in poe2_trade_filters(item)} for item in parsed
+        ]
+        assert expected_ids <= filter_ids[0] == filter_ids[1]
+
+    sanctified = parse_item_text(fixtures["FX019"]["日本語設定の詳細コピー全文"])
+    sanctified_rows = {row.stat_id: row for row in poe2_trade_filters(sanctified)}
+    assert sanctified_rows["explicit.stat_709508406"].read_value == 118.5
+    assert sanctified_rows["explicit.stat_9187492"].read_value == 4
+    assert "property.state.sanctified" not in sanctified_rows
+
+    ventor = parse_item_text(fixtures["FX028"]["英語設定の詳細コピー全文"])
+    ventor_rows = {row.stat_id: row for row in poe2_trade_filters(ventor)}
+    assert [ventor_rows[stat_id].read_value for stat_id in (
+        "explicit.stat_3372524247", "explicit.stat_4220027924",
+        "explicit.stat_1671376347",
+    )] == [-22, -21, -2]
+
+    for fixture_id, state in (
+        ("FX019", "sanctified"),
+        ("FX024", "mirrored"),
+        ("FX027", "corrupted"),
+    ):
+        item = parse_item_text(fixtures[fixture_id]["日本語設定の詳細コピー全文"])
+        rows = poe2_trade_filters(item)
+        assert all(row.stat_id != f"property.state.{state}" for row in rows)
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    tuple(
+        row for row in _real_copy_fixtures()
+        if row["日本語設定の詳細コピー全文"].strip()
+        and not row["日本語設定の詳細コピー全文"].startswith("ちょっと一旦保留")
+        and row["fixture_id"] != "FX008"
+    ),
+    ids=lambda row: row["fixture_id"],
+)
+def test_user_captured_real_copy_pairs_resolve_to_same_identity(fixture):
+    ja = parse_item_text(fixture["日本語設定の詳細コピー全文"])
+    en = parse_item_text(fixture["英語設定の詳細コピー全文"])
+    assert (ja.base_type, ja.category, ja.rarity) == (en.base_type, en.category, en.rarity)
+
+
+def test_meta_gem_without_item_class_uses_metadata_identity_like_ee2():
+    fixture = _real_copy("FX007")
+    for language in ("日本語設定の詳細コピー全文", "英語設定の詳細コピー全文"):
+        item = parse_item_text(fixture[language])
+        assert (item.base_type, item.category, item.modifiers) == ("Blasphemy", "meta_gem", ())
+        without_meta = fixture[language].replace("メタ", "永続").replace("Meta", "Persistent")
+        without_meta_item = parse_item_text(without_meta)
+        assert (without_meta_item.base_type, without_meta_item.category) == (
+            "Blasphemy", "meta_gem",
+        )
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("ブラスファミー\n--------\nメタ", "rarity未取得"),
+        ("レアリティ: 未知\nブラスファミー", "rarity未対応: 未知"),
+        ("レアリティ: ジェム\n--------\nメタ", "identity未取得"),
+        ("レアリティ: レア\nテスト品", "item class未取得"),
+        (
+            "レアリティ: ジェム\nアーク\n--------\nスペル, メタ",
+            "identity種別不一致",
+        ),
+    ],
+)
+def test_poe2_header_parse_errors_identify_the_missing_stage(text, message):
+    with pytest.raises(Poe2ItemParseError, match=message):
+        parse_item_text(text)
+
+
+def test_gem_prose_is_not_reported_as_unresolved_item_modifiers():
+    for fixture_id in ("FX005", "FX006", "FX007"):
+        fixture = _real_copy(fixture_id)
+        assert parse_item_text(fixture["日本語設定の詳細コピー全文"]).modifiers == ()
+        assert parse_item_text(fixture["英語設定の詳細コピー全文"]).modifiers == ()
+
+
+@pytest.mark.parametrize("name", (
+    "高貴なオーブ", "高貴なオーブ (上級)", "高貴なオーブ (完全)",
+    "宝飾職人のオーブ (見習い)", "宝飾職人のオーブ (上級)",
+    "宝飾職人のオーブ (完全)", "カオスオーブ", "カオスオーブ (上級)",
+    "カオスオーブ (完全)", "王者のオーブ", "王者のオーブ (上級)",
+    "王者のオーブ (完全)",
+))
+def test_currency_description_prose_is_not_reported_as_unresolved_modifiers(name):
+    item = parse_item_text(
+        "アイテムクラス: スタック可能カレンシー\n"
+        "レアリティ: カレンシー\n"
+        f"{name}\n"
+        "--------\n"
+        "スタック数: 2,152/20\n"
+        "--------\n"
+        "レアアイテムを1個の新しいランダムなモッドで強化する。\n"
+        "--------\n"
+        "このアイテムを右クリックした後、レアアイテムをクリックして使用する。"
+        "レアアイテムは最大で6個のランダムなモッドを持つことができる。\n"
+    )
+
+    assert item.category == "currency"
+    assert item.modifiers == ()
+
+
+def test_charm_properties_and_searchable_mods_resolve_equally_in_both_languages():
+    charm = _real_copy("FX009")
+    charm_items = [parse_item_text(charm[key]) for key in (
+        "日本語設定の詳細コピー全文", "英語設定の詳細コピー全文",
+    )]
+    assert [len(item.modifiers) for item in charm_items] == [2, 2]
+    assert all(any(mod.stat_id == "implicit.stat_1691862754" for mod in item.modifiers) for item in charm_items)
+    assert all(any(
+        mod.stat_id == "explicit.stat_388617051" and mod.values == (-20.0,)
+        for mod in item.modifiers
+    ) for item in charm_items)
+    assert all(item.properties["持続時間"] == "3" for item in charm_items)
+    assert all(item.properties["使用チャージ"] == "32" for item in charm_items)
+    assert all(item.properties["最大チャージ"] == "40" for item in charm_items)
+    assert all(item.properties["現在チャージ"] == "0" for item in charm_items)
+    assert all(item.properties["効果"] for item in charm_items)
+    for item in charm_items:
+        payload = build_search_query(item, stat_filters=poe2_trade_filters(item))
+        sent_ids = {
+            row["id"]
+            for group in payload["query"]["stats"]
+            for row in group["filters"]
+        }
+        assert sent_ids == {"implicit.stat_1691862754", "explicit.stat_388617051"}
+        charge_filter = next(
+            row
+            for group in payload["query"]["stats"]
+            for row in group["filters"]
+            if row["id"] == "explicit.stat_388617051"
+        )
+        assert charge_filter["value"] == {"max": -20.0}
+
+
+@pytest.mark.parametrize(
+    ("duration_line", "expected"),
+    [
+        ("3.20 (augmented)秒間持続", "3.20"),
+        ("Lasts 3.30 (augmented) Seconds", "3.30"),
+    ],
+)
+def test_charm_augmented_duration_is_property_not_unresolved_modifier(
+    duration_line, expected,
+):
+    item = parse_item_text(
+        "アイテムクラス: チャーム\n"
+        "レアリティ: ユニーク\n"
+        "ベイラの苦悶\n"
+        "消火のチャーム\n"
+        "--------\n"
+        f"{duration_line}\n"
+        "使用時に40中30チャージを消費\n"
+        "現在0チャージ\n"
+        "発火への完全無効化を付与する\n"
+        "--------\n"
+        "アイテムレベル: 81\n"
+    )
+    assert item.properties["持続時間"] == expected
+    assert item.modifiers == ()
+
+
+def test_life_flask_properties_are_consumed_like_ee2_and_affixes_stay_searchable():
+    text = (
+        Path(__file__).parent / "fixtures" / "poe2" / "magic_life_flask_ja.txt"
+    ).read_text(encoding="utf-8")
+    items = [
+        parse_item_text(text),
+        parse_item_text(
+            text.replace(
+                "3秒間かけて1877 (augmented)のライフを回復",
+                "Recovers 1877 (augmented) Life over 3 Seconds",
+            ).replace(
+                "使用時に75中10チャージを消費",
+                "Consumes 10 of 75 Charges on use",
+            ).replace("現在75チャージ", "Currently has 75 Charges")
+        ),
+    ]
+
+    for item in items:
+        assert (item.base_type, item.category, item.item_level) == (
+            "Ultimate Life Flask", "life_flask", 78,
+        )
+        assert item.properties["回復量"] == "1877"
+        assert item.properties["回復時間"] == "3"
+        assert item.properties["使用チャージ"] == "10"
+        assert item.properties["最大チャージ"] == "75"
+        assert item.properties["現在チャージ"] == "75"
+        assert len(item.modifiers) == 2
+        assert all(modifier.stat_id for modifier in item.modifiers)
+        assert {modifier.text for modifier in item.modifiers} == {
+            "回復量が70(66-70)%増加する",
+            "毎秒チャージを0.20獲得する",
+        }
+
+
+def test_unique_life_flask_augmented_properties_are_not_unresolved_modifiers():
+    item = parse_item_text(
+        "アイテムクラス: ライフフラスコ\n"
+        "レアリティ: ユニーク\n"
+        "好機\n"
+        "究極のライフフラスコ\n"
+        "--------\n"
+        "5.30 (augmented)秒間かけて1978 (augmented)のライフを回復\n"
+        "使用時に75中3 (augmented)チャージを消費\n"
+        "現在0チャージ\n"
+        "--------\n"
+        "装備条件：レベル 60\n"
+        "--------\n"
+        "アイテムレベル: 84\n"
+        "--------\n"
+        "{ ユニークモッド — ライフ }\n"
+        "未リザーブライフがフルになった時でも効果は取り除かれない\n"
+        "{ ユニークモッド }\n"
+        "手動で使用できなくなる — スケールできない値\n"
+        "{ ユニークモッド }\n"
+        "完璧なタイミングでスキルを放った時に使用される — スケールできない値\n"
+        "{ ユニークモッド }\n"
+        "効果中はスキルの完全なタイミングの幅が109(80-120)%長くなる\n"
+        "{ ユニークモッド }\n"
+        "回復量が115(100-150)%増加する\n"
+        "{ ユニークモッド }\n"
+        "回復レートが43(50-25)%減少する\n"
+        "{ ユニークモッド }\n"
+        "使用に必要なチャージ量が61(75-50)%減少する\n"
+    )
+
+    assert (item.name, item.base_type, item.category) == (
+        "Opportunity", "Ultimate Life Flask", "life_flask",
+    )
+    assert item.properties["回復量"] == "1978"
+    assert item.properties["回復時間"] == "5.30"
+    assert item.properties["使用チャージ"] == "3"
+    assert item.properties["最大チャージ"] == "75"
+    assert item.properties["現在チャージ"] == "0"
+    assert all("秒間かけて" not in modifier.text for modifier in item.modifiers)
+    assert all("チャージを消費" not in modifier.text for modifier in item.modifiers)
+    assert all(modifier.stat_id for modifier in item.modifiers)
+
+
+def test_wombgift_hiveblood_cost_is_property_not_search_modifier_like_ee2():
+    text = (
+        Path(__file__).parent / "fixtures" / "poe2" / "signet_wombgift_ja.txt"
+    ).read_text(encoding="utf-8")
+    item = parse_item_text(text)
+
+    assert (item.base_type, item.category, item.item_level) == (
+        "Signet Wombgift", "wombgift", 80,
+    )
+    assert item.properties["必要ハイヴブラッド"] == "1023"
+    assert item.modifiers == ()
+
+
+def test_timelost_unscalable_suffixes_resolve_equally_in_both_languages():
+
+    jewel = _real_copy("FX014")
+    jewel_items = [parse_item_text(jewel[key]) for key in (
+        "日本語設定の詳細コピー全文", "英語設定の詳細コピー全文",
+    )]
+    assert all(len(item.modifiers) == 5 for item in jewel_items)
+    assert all(sum(not mod.stat_id for mod in item.modifiers) == 0 for item in jewel_items)
+    assert all({"crafted", "desecrated"}.issubset(item.flags) for item in jewel_items)
+
+
+@pytest.mark.parametrize("fixture_id", ("FX001", "FX003", "FX010", "FX022", "FX023"))
+def test_real_copy_previously_unresolved_numeric_lines_are_resolved(fixture_id):
+    fixture = _real_copy(fixture_id)
+    for language in ("日本語設定の詳細コピー全文", "英語設定の詳細コピー全文"):
+        item = parse_item_text(fixture[language])
+        assert all(mod.stat_id for mod in item.modifiers), [
+            mod.text for mod in item.modifiers if not mod.stat_id
+        ]
+    if fixture_id == "FX010":
+        ja = parse_item_text(fixture["日本語設定の詳細コピー全文"])
+        en = parse_item_text(fixture["英語設定の詳細コピー全文"])
+        assert ja.properties["残り使用回数"] == en.properties["残り使用回数"] == "10"
+
+
+def test_runemastered_and_unidentified_unique_are_preserved_as_distinct_states():
+    runemastered = parse_item_text(_real_copy("FX022")["英語設定の詳細コピー全文"])
+    assert "runemastered" in runemastered.flags
+    assert "runeforged" not in runemastered.flags
+    evasion = next(mod for mod in runemastered.modifiers if "Evasion Rating" in (mod.ref or ""))
+    assert evasion.stat_id == "explicit.stat_124859000"
+
+    unidentified = _real_copy("FX025")
+    for language in ("日本語設定の詳細コピー全文", "英語設定の詳細コピー全文"):
+        item = parse_item_text(unidentified[language])
+        assert (item.name, item.base_type, item.category) == ("", "Nettle Talisman", "talisman")
+        assert "unidentified" in item.flags
+
+
+@pytest.mark.parametrize("fixture", _fixtures(), ids=lambda row: row["id"])
+def test_parse_minimal_poe2_fixtures(fixture):
+    item = parse_item_text(fixture["text"])
+    expected = fixture["expected"]
+    assert item.name == expected["name"]
+    assert item.base_type == expected["base_type"]
+    assert item.category == expected["category"]
+    assert item.item_level == expected.get("item_level")
+    assert TRADE_CATEGORY_BY_CATEGORY[item.category] == expected["trade_category"]
+
+
+def test_bilingual_pairs_resolve_to_same_trade_identity():
+    by_pair = {}
+    for fixture in _fixtures():
+        item = parse_item_text(fixture["text"])
+        identity = (item.base_type, item.category, TRADE_CATEGORY_BY_CATEGORY[item.category])
+        by_pair.setdefault(fixture["pair"], set()).add(identity)
+    assert all(len(values) == 1 for values in by_pair.values())
+
+
+@pytest.mark.parametrize("fixture", _ambiguous_base_fixtures(), ids=lambda row: row["id"])
+@pytest.mark.parametrize("language", ("ja", "en"))
+def test_user_captured_bilingual_ambiguous_bases_resolve_exactly(fixture, language):
+    item = parse_item_text(fixture[language])
+    assert item.base_type == fixture["expected_base_type"]
+    assert item.category in {"body_armour", "boots", "gloves", "helmet"}
+
+
+def test_ambiguous_localized_base_without_discriminator_is_not_guessed():
+    text = (
+        "アイテムクラス: 靴\nレアリティ: レア\nテスト品\n要塞のサバトン\n"
+        "--------\nアイテムレベル: 80\n"
+    )
+    with pytest.raises(Poe2ItemParseError, match="base identity曖昧"):
+        parse_item_text(text)
+
+
+@pytest.mark.parametrize("fixture", _phase6_fixtures(), ids=lambda row: row["id"])
+def test_phase6_special_categories_resolve_to_trade_identity(fixture):
+    item = parse_item_text(fixture["text"])
+    assert item.base_type == fixture["base_type"]
+    assert item.category == fixture["category"]
+    assert TRADE_CATEGORY_BY_CATEGORY[item.category] == fixture["trade_category"]
+    if "name" in fixture:
+        assert item.name == fixture["name"]
+
+
+def test_phase6_relic_trial_and_timelost_properties_are_preserved():
+    fixtures = {row["id"]: parse_item_text(row["text"]) for row in _phase6_fixtures()}
+    relic = fixtures["sanctum_relic"]
+    assert [(mod.kind, mod.stat_id, mod.values) for mod in relic.modifiers] == [
+        ("sanctum", "sanctum.stat_4057192895", (5.0,)),
+    ]
+    assert fixtures["djinn_barya"].properties == {"エリアレベル": "80", "試練数": "3"}
+    assert fixtures["inscribed_ultimatum"].properties["Ultimatum Hint"] == "Deadly"
+    assert fixtures["timelost_jewel"].properties["半径"] == "大"
+    assert fixtures["normal_tablet"].properties["残り使用回数"] == "10"
+
+
+def test_magic_relic_prefix_and_suffix_use_sanctum_stat_namespace():
+    item = parse_item_text("""アイテムクラス: レリック
+レアリティ: マジック
+補強された 浸漬の 壷のレリック
+--------
+アイテムレベル: 62
+--------
+{ プレフィックスモッド「補強された」 (ティア: 4) }
+アーマー、回避力およびエナジーシールドが21(20-29)%増加する
+{ サフィックスモッド 「浸漬の」 (ティア: 3) }
+モンスターは7(7-8)%の確率で二倍の神聖な水をドロップする
+--------
+セケマの試練開始時にこのアイテムをレリックの祭壇に置く""")
+
+    assert item.category == "relic"
+    assert len(item.modifiers) == 2
+    assert all(mod.kind == "sanctum" for mod in item.modifiers)
+    assert all(mod.stat_id.startswith("sanctum.") for mod in item.modifiers)
+
+
+def test_poe2_roll_ranges_are_averaged_and_only_safe_ranges_get_better_direction():
+    spear = parse_item_text(
+        (Path(__file__).parent / "fixtures" / "poe2" / "rare_spear_ja.txt").read_text(
+            encoding="utf-8"
+        )
+    )
+    flat = next(mod for mod in spear.modifiers if mod.stat_id == "explicit.stat_1940865751")
+    assert (flat.roll_min, flat.roll_max, flat.better) == (28.5, 42.0, 1)
+
+    assert [
+        modifier.affix for modifier in spear.modifiers
+        if modifier.kind == "explicit"
+    ] == [
+        "prefix", "prefix", "suffix",
+    ]
+
+    text = """アイテムクラス: ウェイストーン
+レアリティ: マジック
+減退する ウェイストーン (ティア15)
+--------
+アイテムレベル: 81
+--------
+{ サフィックスモッド }
+モンスターがクリティカルヒットから受ける追加ダメージが28(26-30)%減少する
+"""
+    reduced = parse_item_text(text).modifiers[0]
+    assert (reduced.roll_min, reduced.roll_max, reduced.better) == (26.0, 30.0, None)
+
+
+def test_waystone_players_cooldown_recovery_reduction_uses_negated_trade_stat():
+    item = parse_item_text("""アイテムクラス: ウェイストーン
+レアリティ: レア
+埋もれた方向
+ウェイストーン (ティア15)
+--------
+アイテムレベル: 82
+--------
+{ サフィックスモッド 「疲労の」 (ティア: 1) }
+全てのプレイヤーのクールダウン解消レートが27(30-25)%低下する
+""")
+    modifier = item.modifiers[0]
+    assert modifier.stat_id == "explicit.stat_941368244"
+    assert modifier.values == (-27.0,)
+    assert (modifier.roll_min, modifier.roll_max, modifier.better) == (-30.0, -25.0, -1)
+    filters = poe2_trade_filters(item)
+    cooldown_filter = next(
+        row for row in filters if row.stat_id == "explicit.stat_941368244"
+    )
+    assert not cooldown_filter.enabled
+    enabled_filters = tuple(
+        replace(row, enabled=True) if row is cooldown_filter else row
+        for row in filters
+    )
+    payload = build_search_query(item, stat_filters=enabled_filters)
+    sent = next(
+        row
+        for group in payload["query"]["stats"]
+        for row in group["filters"]
+        if row["id"] == "explicit.stat_941368244"
+    )
+    assert sent["value"] == {"max": -27.0}
+
+
+def test_poe2_standalone_rune_line_counts_one_installed_augment():
+    item = parse_item_text(
+        (Path(__file__).parent / "fixtures" / "poe2" / "phase45_sceptre_ja.txt").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert item.augment_count == 1
+
+
+def test_two_identical_runes_collapsed_into_one_line_count_as_two_augments():
+    item = parse_item_text(
+        (Path(__file__).parent / "fixtures" / "poe2"
+         / "rare_body_armour_two_identical_runes_ja.txt").read_text(encoding="utf-8")
+    )
+    assert item.properties["ソケット"] == "S S"
+    assert item.augment_count == 2
+    augment = next(modifier for modifier in item.modifiers if modifier.kind == "augment")
+    assert augment.stat_id == "rune.stat_3523867985"
+    assert augment.values == (36.0,)
+
+
+def test_different_augments_collapsed_into_one_section_count_separately(monkeypatch):
+    monkeypatch.setattr(poe2_parser, "augment_entries", lambda: (
+        {
+            "ref_name": "First Rune",
+            "effects": ({
+                "categories": ["Body Armour"],
+                "text": {"en": "# to maximum Life"},
+                "values": [10],
+                "trade_ids": ["rune.first"],
+            },),
+        },
+        {
+            "ref_name": "Second Rune",
+            "effects": ({
+                "categories": ["Body Armour"],
+                "text": {"en": "# to maximum Mana"},
+                "values": [20],
+                "trade_ids": ["rune.second"],
+            },),
+        },
+    ))
+    modifiers = [
+        ItemModifier("+10 to maximum Life", (10.0,), "augment", stat_id="rune.first"),
+        ItemModifier("+20 to maximum Mana", (20.0,), "augment", stat_id="rune.second"),
+    ]
+
+    assert poe2_parser._aggregate_augment_count(modifiers, "body_armour", 2) == 2
+
+
+def test_bonded_support_stats_do_not_consume_augment_sockets(monkeypatch):
+    monkeypatch.setattr(poe2_parser, "augment_entries", lambda: ({
+        "ref_name": "Bonded Helper",
+        "effects": ({
+            "categories": ["Body Armour"],
+            "text": {"en": "Bonded: #% reduced Chill Duration on you"},
+            "values": [20],
+            "trade_ids": ["rune.stat_2174462855"],
+        },),
+    },))
+    modifiers = [ItemModifier(
+        "Bonded: 20% reduced Chill Duration on you", (20.0,), "augment",
+        stat_id="rune.stat_2174462855",
+    )]
+
+    assert poe2_parser._aggregate_augment_count(modifiers, "body_armour", 2) == 0
+
+
+def test_one_multi_stat_augment_counts_once(monkeypatch):
+    monkeypatch.setattr(poe2_parser, "augment_entries", lambda: ({
+        "ref_name": "Dual Rune",
+        "effects": (
+            {
+                "categories": ["Body Armour"],
+                "text": {"en": "# to maximum Life"},
+                "values": [10],
+                "trade_ids": ["rune.first"],
+            },
+            {
+                "categories": ["Body Armour"],
+                "text": {"en": "# to maximum Mana"},
+                "values": [20],
+                "trade_ids": ["rune.second"],
+            },
+        ),
+    },))
+    modifiers = [
+        ItemModifier("+10 to maximum Life", (10.0,), "augment", stat_id="rune.first"),
+        ItemModifier("+20 to maximum Mana", (20.0,), "augment", stat_id="rune.second"),
+    ]
+
+    assert poe2_parser._aggregate_augment_count(modifiers, "body_armour", 2) == 1
+
+
+def test_augment_inference_stops_when_candidate_count_exceeds_eight(monkeypatch):
+    entries = tuple({
+        "ref_name": f"Candidate {index}",
+        "effects": ({
+            "categories": ["Body Armour"],
+            "text": {"en": "# to maximum Life"},
+            "values": [index],
+            "trade_ids": [f"rune.{index}"],
+        },),
+    } for index in range(1, 10))
+    monkeypatch.setattr(poe2_parser, "augment_entries", lambda: entries)
+    modifiers = [
+        ItemModifier(str(index), (float(index),), "augment", stat_id=f"rune.{index}")
+        for index in range(1, 10)
+    ]
+
+    assert poe2_parser._aggregate_augment_count(modifiers, "body_armour", 9) == 0
+
+
+def test_augment_inference_does_not_search_combinations_longer_than_six(monkeypatch):
+    monkeypatch.setattr(poe2_parser, "augment_entries", lambda: ({
+        "ref_name": "Repeatable Rune",
+        "effects": ({
+            "categories": ["Body Armour"],
+            "text": {"en": "# to maximum Life"},
+            "values": [1],
+            "trade_ids": ["rune.life"],
+        },),
+    },))
+    modifiers = [
+        ItemModifier("+7 to maximum Life", (7.0,), "augment", stat_id="rune.life")
+    ]
+
+    assert poe2_parser._aggregate_augment_count(modifiers, "body_armour", 7) == 0
+
+
+def test_real_multi_stat_augment_lines_in_one_section_count_once():
+    item = parse_item_text("""Item Class: Boots
+Rarity: Rare
+Test Pace
+Rawhide Boots
+--------
+Sockets: S S
+--------
+Item Level: 80
+--------
+20% increased Curse Duration (rune)
+20% increased Poison Duration (rune)
+""")
+
+    assert item.augment_count == 1
+    assert {modifier.stat_id for modifier in item.modifiers} == {
+        "rune.stat_3824372849",
+        "rune.stat_2011656677",
+    }
+
+
+def test_real_different_augment_lines_in_one_section_count_separately():
+    item = parse_item_text("""Item Class: Body Armours
+Rarity: Rare
+Test Shelter
+Leather Vest
+--------
+Sockets: S S
+--------
+Item Level: 80
+--------
++45 to maximum Life (rune)
++14% to Fire Resistance (rune)
+""")
+
+    assert item.augment_count == 2
+    assert {modifier.stat_id for modifier in item.modifiers} == {
+        "rune.stat_3299347043",
+        "rune.stat_3372524247",
+    }
+
+
+def test_poe2_standalone_rune_prefers_augment_stat_over_same_text_explicit():
+    item = parse_item_text("""アイテムクラス: 靴
+レアリティ: レア
+巨大な靴底
+ダガーフットシューズ
+--------
+ソケット: S
+--------
+アイテムレベル: 82
+--------
+プレイヤーのスピードは減速の影響を受けない (rune)
+""")
+    assert item.augment_count == 1
+    assert len(item.modifiers) == 1
+    modifier = item.modifiers[0]
+    assert (modifier.kind, modifier.stat_id) == ("augment", "rune.stat_50721145")
+    rows = poe2_trade_filters(item)
+    assert [(row.kind, row.stat_id) for row in rows if row.stat_id.endswith("50721145")] == [
+        ("augment", "rune.stat_50721145"),
+    ]
+    assert not next(row for row in rows if row.stat_id == "rune.stat_50721145").enabled
+    payload = build_search_query(item, stat_filters=rows)
+    sent_ids = {
+        row["id"]
+        for group in payload["query"]["stats"]
+        for row in group["filters"]
+    }
+    assert "rune.stat_50721145" not in sent_ids
+    assert "explicit.stat_50721145" not in sent_ids
+
+
+def test_unknown_base_is_not_silently_guessed():
+    with pytest.raises(Poe2ItemParseError, match="base identity未解決"):
+        parse_item_text("Item Class: Bows\nRarity: Rare\nTest Name\nUnknown Bow\n")
+
+
+@pytest.mark.parametrize(
+    ("localized_base", "expected_base"),
+    [
+        ("監視者の弓", "Warden Bow"),
+        ("ルーンフォージの監視者の弓", "Runeforged Warden Bow"),
+    ],
+)
+def test_ironbound_resolves_both_legacy_and_runeforged_bases(
+    localized_base, expected_base,
+):
+    item = parse_item_text(
+        "アイテムクラス: 弓\nレアリティ: ユニーク\nアイアンバウンド\n"
+        f"{localized_base}\n--------\nアイテムレベル: 80\n"
+    )
+
+    assert item.name == "Ironbound"
+    assert item.base_type == expected_base
+
+
+@pytest.mark.parametrize(
+    ("item_class", "affixed_name", "expected_base", "expected_category"),
+    [
+        ("Focus", "Pulsing Antler Focus", "Antler Focus", "focus"),
+        ("Two Hand Mace", "Reaver's Temple Maul of Stunning", "Temple Maul", "two_mace"),
+        ("指輪", "火炎の アメジストの指輪", "Amethyst Ring", "ring"),
+        ("鎧", "幻術の スリップストライクベスト", "Slipstrike Vest", "body_armour"),
+    ],
+)
+def test_magic_items_extract_longest_category_matching_base_from_affixed_name(
+    item_class, affixed_name, expected_base, expected_category,
+):
+    item = parse_item_text(
+        f"アイテムクラス: {item_class}\n"
+        f"レアリティ: マジック\n{affixed_name}\n--------\nアイテムレベル: 80\n"
+    )
+
+    assert item.base_type == expected_base
+    assert item.category == expected_category
+    assert affixed_name not in item.base_type
+
+
+@pytest.mark.parametrize(
+    ("item_class", "rare_name", "localized_base", "expected_base"),
+    [
+        ("スピア", "崇高なエッジ", "飛翔のスピア", "Soaring Spear"),
+        ("鎧", "災いのカーテン", "スリップストライクベスト", "Slipstrike Vest"),
+        ("指輪", "大渦の環", "アメジストの指輪", "Amethyst Ring"),
+    ],
+)
+def test_rare_items_keep_generated_name_separate_from_exact_base_line(
+    item_class, rare_name, localized_base, expected_base,
+):
+    item = parse_item_text(
+        f"アイテムクラス: {item_class}\nレアリティ: レア\n"
+        f"{rare_name}\n{localized_base}\n--------\nアイテムレベル: 80\n"
+    )
+
+    assert item.name == rare_name
+    assert item.base_type == expected_base
+
+
+def test_rare_properties_and_resolved_mod_are_kept_for_editable_trade_filters():
+    text = (
+        "Item Class: Bows\nRarity: Rare\nTest Name\nRider Bow\n--------\n"
+        "Quality: +20%\nPhysical Damage: 12-34\n--------\nItem Level: 80\n--------\n"
+        "123 to maximum Life\n999 unrecognised power\n"
+    )
+    item = parse_item_text(text)
+    assert item.properties["Quality"] == "+20%"
+    assert item.modifiers[0].stat_id == "explicit.stat_3299347043"
+    assert item.modifiers[0].values == (123.0,)
+    assert item.modifiers[1].stat_id is None
+    assert item.modifiers[1].text == "999 unrecognised power"
+
+
+def test_reported_japanese_mageblood_resolves_all_searchable_mods():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "mageblood_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    assert item.name == "Mageblood"
+    assert item.base_type == "Utility Belt"
+    assert item.category == "belt"
+    assert item.properties["装備条件"] == "レベル 55"
+    assert len(item.modifiers) == 7
+    assert all(mod.stat_id for mod in item.modifiers)
+    assert [mod.stat_id for mod in item.modifiers[2:6]] == [
+        "explicit.stat_264262054|3", "explicit.stat_264262054|11",
+        "explicit.stat_264262054|4", "explicit.stat_264262054|8",
+    ]
+    assert item.modifiers[1].values == (2.0,)
+    assert item.modifiers[-1].values == (43.0,)
+
+
+def test_reported_japanese_rare_gloves_resolve_chaos_and_desecrated_mods():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_gloves_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    assert item.base_type == "Grand Bracers"
+    assert item.category == "gloves"
+    assert len(item.modifiers) == 7
+    assert all(mod.stat_id for mod in item.modifiers)
+    chaos = next(mod for mod in item.modifiers if mod.text.startswith("混沌耐性"))
+    assert chaos.stat_id == "explicit.stat_2923486259"
+    assert chaos.values == (15.0,)
+    cold = next(mod for mod in item.modifiers if "冷気ダメージ" in mod.text)
+    assert cold.stat_id.startswith("desecrated.")
+    attack_speed = next(mod for mod in item.modifiers if "アタックスピード" in mod.text)
+    assert attack_speed.stat_id == "explicit.stat_681332047"
+
+
+def test_reported_japanese_rare_spear_keeps_quality_and_both_flat_damage_values():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_spear_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    assert item.base_type == "Soaring Spear"
+    assert item.category == "spear"
+    assert item.properties["品質"] == "+20% (augmented)"
+    flat = next(mod for mod in item.modifiers if "物理ダメージを追加" in mod.text)
+    assert flat.stat_id == "explicit.stat_1940865751"
+    assert flat.values == (25.0, 39.0)
+    fractured = next(mod for mod in item.modifiers if "アタックスピードが28" in mod.text)
+    assert fractured.kind == "fractured"
+    assert fractured.tier == 1
+    assert "fractured" in item.flags
+    crafted_accuracy = next(mod for mod in item.modifiers if mod.text.startswith("命中力"))
+    assert crafted_accuracy.tier is None
+    assert crafted_accuracy.stat_id == "crafted.stat_803737631"
+    crafted_speed = next(mod for mod in item.modifiers if "アタックスピードが8" in mod.text)
+    assert crafted_speed.stat_id == "crafted.stat_210067635"
+
+
+def test_reported_unique_skysliver_prefers_local_attack_speed():
+    item = parse_item_text(SKYSLIVER_FIXTURE.read_text(encoding="utf-8"))
+    attack_speed = next(mod for mod in item.modifiers if "アタックスピード" in mod.text)
+
+    assert item.category == "spear"
+    assert item.rarity == "unique"
+    assert attack_speed.stat_id == "explicit.stat_210067635"
+    assert attack_speed.values == (16.0,)
+
+
+@pytest.mark.parametrize("category", sorted(poe2_parser._WEAPON_LOCAL_AFFIX_CATEGORIES))
+def test_every_weapon_category_prefers_local_attack_properties(category):
+    global_entry = {
+        "id": "explicit.stat_681332047",
+        "text": {"en": "#% increased Attack Speed"},
+    }
+    local_entry = {
+        "id": "explicit.stat_210067635",
+        "text": {"en": "#% increased Attack Speed (Local)"},
+    }
+
+    selected, values = poe2_parser._select_scoped_stat_candidate(
+        ((global_entry, (16.0,)), (local_entry, (16.0,))),
+        category,
+        "explicit",
+    )
+
+    assert selected["id"] == "explicit.stat_210067635"
+    assert values == (16.0,)
+
+
+def test_audited_crossbow_accuracy_keeps_local_scope_when_both_ids_have_results():
+    fixture = _real_copy("FX001")
+    for language in ("日本語設定の詳細コピー全文", "英語設定の詳細コピー全文"):
+        item = parse_item_text(fixture[language])
+        accuracy = next(
+            mod for mod in item.modifiers if "命中" in mod.text or "Accuracy" in mod.text
+        )
+        assert accuracy.stat_id == "explicit.stat_691932474"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        """アイテムクラス: 手袋
+レアリティ: ノーマル
+規格外の 磨かれた弓籠手
+--------
+回避力: 170
+--------
+装備条件：レベル 80, 101 器用さ
+--------
+ソケット: S S
+--------
+アイテムレベル: 82""",
+        """Item Class: Gloves
+Rarity: Normal
+Exceptional Polished Bracers
+--------
+Evasion Rating: 170
+--------
+Requires: Level 80, 101 Dex
+--------
+Sockets: S S
+--------
+Item Level: 82""",
+    ),
+)
+def test_reported_exceptional_normal_base_is_normalized_for_trade2(text):
+    item = parse_item_text(text)
+    assert item.rarity == "normal"
+    assert item.category == "gloves"
+    assert item.base_type == "Polished Bracers"
+    assert item.item_level == 82
+    assert "exceptional" in item.flags
+
+    filters = poe2_trade_filters(item)
+    augment_sockets = next(
+        row for row in filters if row.stat_id == "property.augment_sockets"
+    )
+    assert augment_sockets.enabled
+    assert augment_sockets.min_value == 2
+
+    query = build_search_query(item, stat_filters=filters)["query"]
+    assert query["type"] == "Polished Bracers"
+    assert query["filters"]["type_filters"]["filters"]["rarity"]["option"] == "normal"
+    assert query["filters"]["equipment_filters"]["filters"]["rune_sockets"] == {
+        "min": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("base_type", "needle", "expected_id"),
+    (
+        ("Swathed Cap", "Accuracy", "explicit.stat_803737631"),
+        ("Runeforged Swathed Cap", "Accuracy", "explicit.stat_803737631"),
+        ("Runemastered Fine Bracers", "Evasion Rating", "explicit.stat_124859000"),
+        ("Runemastered Spined Bracers", "Evasion Rating", "explicit.stat_124859000"),
+    ),
+)
+def test_audited_ambiguous_base_stats_use_confirmed_scope(base_type, needle, expected_id):
+    fixture = next(
+        row for row in _ambiguous_base_fixtures()
+        if row["expected_base_type"] == base_type
+    )
+    for language in ("ja", "en"):
+        item = parse_item_text(fixture[language])
+        matching = [
+            mod for mod in item.modifiers
+            if needle in (mod.ref or "") and mod.stat_id in {
+                "explicit.stat_803737631", "explicit.stat_691932474",
+                "explicit.stat_124859000", "explicit.stat_2106365538",
+            }
+        ]
+        assert matching and all(mod.stat_id == expected_id for mod in matching)
+
+
+def test_reported_japanese_rare_body_armour_prefers_local_evasion_stats():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_body_armour_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    increased = [mod for mod in item.modifiers if mod.text.startswith("回避力が")]
+    assert [(mod.stat_id, mod.values) for mod in increased] == [
+        ("explicit.stat_124859000", (105.0,)),
+        ("explicit.stat_124859000", (40.0,)),
+    ]
+    assert all(not mod.stat_ids for mod in increased)
+    deflection = next(mod for mod in item.modifiers if "受け流し力" in mod.text)
+    assert deflection.stat_id == "explicit.stat_3033371881"
+    assert deflection.values == (17.0,)
+    assert {"augment", "desecrated", "crafted", "corrupted"} <= set(item.flags)
+
+
+def test_phase45_sceptre_parses_spirit_augment_sockets_and_sanctified_state():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "phase45_sceptre_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    assert item.category == "sceptre"
+    assert item.properties["スピリット"] == "100"
+    assert item.properties["ソケット"] == "S S"
+    assert {"augment", "sanctified"} <= set(item.flags)
+    augment = next(mod for mod in item.modifiers if mod.kind == "augment")
+    assert augment.stat_id and augment.stat_id.startswith("rune.")
+
+
+def test_phase45_waystone_parses_all_dedicated_properties():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "phase45_waystone_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    assert item.category == "waystone"
+    assert item.base_type == "Waystone (Tier 15)"
+    assert item.properties["ウェイストーンティア"] == "15"
+    assert item.properties["復活が利用可能"] == "3"
+    assert item.properties["モンスターパックサイズ"] == "+42%"
+
+
+def test_reported_magic_waystone_extracts_affixed_base_and_resolves_all_mods():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "magic_waystone_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    assert item.rarity == "magic"
+    assert item.category == "waystone"
+    assert item.base_type == "Waystone (Tier 15)"
+    assert item.properties["復活が利用可能"] == "4 (augmented)"
+    assert item.properties["パックサイズ"] == "+16% (augmented)"
+    assert item.properties["ウェイストーンドロップ確率"] == "+30% (augmented)"
+    assert [(mod.stat_id, mod.values) for mod in item.modifiers] == [
+        ("explicit.stat_2753083623", (224.0,)),
+        ("explicit.stat_57326096", (25.0,)),
+        ("explicit.stat_3477720557", ()),
+    ]
+    assert all(mod.confidence == 1.0 for mod in item.modifiers)
+
+
+def test_reported_rare_waystone_keeps_affix_name_separate_from_trade_base():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_waystone_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+
+    assert item.rarity == "rare"
+    assert item.category == "waystone"
+    assert item.name == "先祖の突撃"
+    assert item.base_type == "Waystone (Tier 15)"
+
+
+def test_reported_waystone_keeps_item_rarity_as_searchable_property():
+    item = parse_item_text("""アイテムクラス: ウェイストーン
+レアリティ: レア
+恐るべき辺境
+ウェイストーン (ティア3)
+--------
+復活が利用可能: 2 (augmented)
+アイテムレアリティ: +29% (augmented)
+モンスターレアリティ: +18% (augmented)
+ウェイストーンドロップ確率: +55% (augmented)
+--------
+アイテムレベル: 70
+""")
+
+    assert item.properties["アイテムレアリティ"] == "+29% (augmented)"
+
+
+def test_reported_breach_tablet_resolves_uses_and_variable_rare_monster_line():
+    item = parse_item_text("""アイテムクラス: 石板
+レアリティ: レア
+虚無に触れられし命令
+ブリーチの石板
+--------
+アイテムレベル: 80
+--------
+{ 暗黙モッド }
+マップに異世界からのブリーチを追加する
+残り使用可能回数 10回
+--------
+{ サフィックスモッド 「侵略の」 (ティア: 1) }
+マップの不安定なブリーチは安定化した後レアモンスターが追加で3(1-3)体スポーンする
+""")
+
+    assert item.properties["残り使用回数"] == "10"
+    assert [(mod.stat_id, mod.values, mod.confidence) for mod in item.modifiers] == [
+        ("explicit.stat_3762913035", (), 1.0),
+    ]
+
+
+def test_phase45_runemastered_base_and_desecrated_state_are_not_collapsed():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "phase45_runemastered_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    assert item.base_type == "Runemastered Vaal Cuirass"
+    assert {"runemastered", "desecrated", "fractured"} <= set(item.flags)
+    assert "runeforged" not in item.flags
+    desecrated = next(mod for mod in item.modifiers if mod.kind == "desecrated")
+    assert desecrated.stat_id == "desecrated.stat_2923486259"
+
+
+def test_japanese_enhancement_anointment_uses_enchant_trade_stat():
+    item = parse_item_text("""アイテムクラス: アミュレット
+レアリティ: レア
+恐るべきスカラベ
+前兆のアミュレット
+--------
+装備条件：レベル 64
+--------
+アイテムレベル: 82
+--------
+{ エンハンス }
+ソーマタージー発生装置 を割り当てる — スケールできない値
+--------
+{ 暗黙モッド }
+サフィックスモッド -1個
+""")
+
+    anointment = next(
+        modifier for modifier in item.modifiers
+        if modifier.stat_id == "enchant.stat_2954116742|56666"
+    )
+    assert anointment.kind == "enchant"
+    assert anointment.stat_id == "enchant.stat_2954116742|56666"
+    filters = poe2_trade_filters(item)
+    trade_filter = next(
+        row for row in filters
+        if row.stat_id == "enchant.stat_2954116742|56666"
+    )
+    assert trade_filter.kind == "enchant"
+    assert trade_filter.stat_id == "enchant.stat_2954116742|56666"
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    json.loads(
+        (Path(__file__).parent / "fixtures" / "poe2" / "phase45_augment_items_ja.json").read_text(
+            encoding="utf-8"
+        )
+    )["fixtures"],
+    ids=lambda row: row["id"],
+)
+def test_phase45_standalone_rune_and_soul_core_categories(fixture):
+    item = parse_item_text(fixture["text"])
+    assert item.category == fixture["category"]
+    assert item.base_type == fixture["base_type"]
+    assert TRADE_CATEGORY_BY_CATEGORY[item.category] == fixture["trade_category"]
+
+
+def test_phase45_gem_identity_and_socket_property():
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "phase45_gem_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_item_text(text)
+    assert item.rarity == "gem"
+    assert item.base_type == "Arc"
+    assert item.category == "active_gem"
+    assert item.properties["ソケット"] == "S S"
+
+
+@pytest.mark.parametrize("marker", ["\ufeff", "\u200b", "\u2060", "\u202a", "\x00"])
+def test_real_meta_gem_without_item_class_accepts_windows_leading_marker(marker):
+    item = parse_item_text(marker + """レアリティ: ジェム
+ブラスファミー
+--------
+バフ, 永続, 範囲効果, オーラ, メタ
+レベル: 10
+--------
+装備条件：レベル 36, 65 知性
+--------
+ソケット: G G
+--------
+ソケットされたすべての呪いスキルをオーラに変化させる。
+""")
+    assert item.category == "meta_gem"
+    assert item.base_type == "Blasphemy"
+    assert item.properties["ソケット"] == "G G"
+def test_real_uncut_skill_gem_is_exchange_identity_without_description_mods():
+    import csv
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "fixtures" / "poe2" / "real_copy_bilingual.csv"
+    with fixture.open(encoding="utf-8-sig", newline="") as stream:
+        row = next(row for row in csv.DictReader(stream) if row["収集対象"] == "Uncut Gem")
+    for column in ("日本語設定の詳細コピー全文", "英語設定の詳細コピー全文"):
+        item = parse_item_text(row[column])
+        assert item.name == "Uncut Skill Gem (Level 18)"
+        assert item.base_type == "Uncut Skill Gem (Level 18)"
+        assert item.category == "uncut_gem"
+        assert item.modifiers == ()
+
+
+@pytest.mark.parametrize(
+    ("item_class", "base_type", "category"),
+    [
+        ("Life Flasks", "Ultimate Life Flask", "life_flask"),
+        ("Mana Flasks", "Ultimate Mana Flask", "mana_flask"),
+        ("Wombgifts", "Ornate Wombgift", "wombgift"),
+        ("Map Fragments", "Simulacrum", "map_fragment"),
+        ("Pinnacle Keys", "Ancient Crisis Fragment", "pinnacle_key"),
+        ("Vault Keys", "Zarokh's Reliquary Key: Against the Darkness", "vault_key"),
+        ("Expedition Logbooks", "Expedition Logbook", "expedition_logbook"),
+        ("Breachstones", "Breachstone", "breachstone"),
+    ],
+)
+def test_special_trade_and_exchange_categories_resolve_from_identity(
+    item_class, base_type, category,
+):
+    item = parse_item_text(
+        f"Item Class: {item_class}\nRarity: Normal\n{base_type}\n--------\n"
+    )
+    assert (item.base_type, item.category) == (base_type, category)
+
+
+@pytest.mark.parametrize(
+    ("item_class", "localized_name", "base_type"),
+    [
+        ("Omens", "Aldur's Saga", "Aldur's Saga"),
+        ("Omens", "Medved's Saga", "Medved's Saga"),
+        ("Omens", "Olroth's Saga", "Olroth's Saga"),
+        ("Omens", "Uhtred's Saga", "Uhtred's Saga"),
+        ("お告げ", "ヴォラナの叙事詩", "Vorana's Saga"),
+    ],
+)
+def test_expedition_sagas_parse_as_exchange_currency(item_class, localized_name, base_type):
+    item = parse_item_text(
+        f"Item Class: {item_class}\nRarity: Currency\n{localized_name}\n"
+        "--------\nStack Size: 1/10\n"
+    )
+
+    assert (item.name, item.base_type, item.category) == (base_type, base_type, "currency")
+
+
+def test_normal_map_fragment_help_text_is_not_an_unresolved_modifier_like_ee2():
+    text = (
+        Path(__file__).parent / "fixtures" / "poe2" / "simulacrum_ja.txt"
+    ).read_text(encoding="utf-8")
+    item = parse_item_text(text)
+
+    assert (item.base_type, item.category, item.rarity) == (
+        "Simulacrum", "map_fragment", "normal",
+    )
+    assert item.modifiers == ()
+
+
+def test_magic_poe2_flask_resolves_affixed_name_to_base():
+    item = parse_item_text(
+        "Item Class: Life Flasks\nRarity: Magic\nHealthy Ultimate Life Flask\n"
+        "--------\nQuality: +20%\n"
+    )
+    assert (item.base_type, item.category) == ("Ultimate Life Flask", "life_flask")

@@ -1,28 +1,223 @@
-from io import BytesIO
-from dataclasses import replace
 import json
-import pytest
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
+
+import pytest
+import urllib3
 
 from src.poetore.parser import parse_item_text
 from src.poetore.metadata import unique_fixed_stats
 from src.poetore.models import ItemModifier, ParsedItem
 from src.poetore.trade import (
     PRESET_BASE, PRESET_FINISHED, PriceListing, PriceResult, TradeApiError, TradeStatFilter,
-    active_pc_league, available_pc_leagues, available_trade_presets, build_search_query,
-    default_pc_league, elemental_dps,
+    UniqueCandidate,
+    active_pc_league, apply_search_range, available_pc_leagues, available_trade_presets, build_search_query,
+    default_pc_league, elemental_dps, english_trade_identity,
+    japanese_trade_item_label,
     default_trade_currency, physical_dps, physical_dps_at_20_quality,
-    resolve_trade_stat_filters, search_prices, unique_candidates, unique_variants,
+    resolve_trade_stat_filters, search_prices, unique_candidate_details,
+    unique_candidates, unique_variants,
     unresolved_modifier_warnings, uses_dedicated_exact_preset, resolve_official_base_type,
     is_inscribed_ultimatum,
 )
 from src.poetore.trade import _request_json
 from src.poetore.trade import _base_defence_percentile
 from src.poetore.trade import _trade_response_cache
+from src.poetore.trade import _value_for_template
 from src.poetore.trade import _awakened_tier_tags
-from src.poetore.trade import _japanese_trade_item_name, _japanese_trade_item_type
+from src.poetore.trade import _apply_atzoatl_room_rules
+from src.poetore.trade import _group_price_listings
+from src.poetore.trade import (
+    _prevent_trade_queue, _trade2_rate_limiter, _trade_rate_limiter,
+)
+from src.poetore.trade import (
+    _divination_card_identities,
+    _english_divination_card_type,
+    _english_trade_item_name,
+    _english_trade_item_type,
+    _japanese_divination_card_type,
+    _japanese_trade_item_name,
+    _japanese_trade_item_type,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_trade_api_test_state(monkeypatch):
+    """Keep synthetic requests out of user logs and limiter state isolated."""
+    monkeypatch.setattr(
+        "src.poetore.trade.record_trade_api_event", lambda *_args, **_kwargs: None,
+    )
+    _trade_rate_limiter.reset()
+    _trade2_rate_limiter.reset()
+    yield
+    _trade_rate_limiter.reset()
+    _trade2_rate_limiter.reset()
+
+
+def test_value_for_template_uses_single_placeholder_not_fixed_number():
+    assert _value_for_template(
+        "エンデュランスチャージ1個ごとに毎秒ライフの0.2%を自動回復する",
+        "エンデュランスチャージ1個ごとに毎秒ライフの#%を自動回復する",
+    ) == 0.2
+
+
+def test_value_for_template_averages_added_damage_range_only():
+    assert _value_for_template(
+        "プレイヤーおよび近くの味方は青ソケット1個ごとに3から60の追加雷ダメージを獲得する",
+        "プレイヤーおよび近くの味方は青ソケット1個ごとに#から#の追加雷ダメージを獲得する",
+    ) == 31.5
+    assert _value_for_template(
+        "効果は4秒間持続し効果が20%増加する",
+        "効果は#秒間持続し効果が#%増加する",
+    ) == 4.0
+
+
+def test_value_for_template_applies_reviewed_stat_rules():
+    assert _value_for_template(
+        "ブロック時に6から12の物理ダメージをアタックしてきた敵に反射する",
+        "ブロック時に#から#の物理ダメージをアタックしてきた敵に反射する",
+        "crafted.stat_1445684883",
+    ) == 6.0
+    assert _value_for_template(
+        "ブロック時に6から12の物理ダメージをアタックしてきた敵に反射する",
+        "ブロック時に#から#の物理ダメージをアタックしてきた敵に反射する",
+        "explicit.stat_1445684883",
+    ) == 9.0
+    assert _value_for_template(
+        "トラップを投げると4秒間移動スピードが20%増加する",
+        "トラップを投げると#秒間移動スピードが#%増加する",
+        "explicit.stat_3102860761",
+    ) == 20.0
+    assert _value_for_template(
+        "移動中に地面に燃焼領域を生成し、毎秒100の火ダメージを4秒間与える",
+        "移動中に地面に燃焼領域を生成し、毎秒#の火ダメージを#秒間与える",
+        "explicit.stat_3595254837",
+    ) is None
+
+
+def test_japanese_trade_item_label_uses_unique_name_and_regular_type():
+    with (
+        patch(
+            "src.poetore.trade._japanese_trade_item_name",
+            return_value="忠臣の皮膚",
+        ) as unique_name,
+        patch(
+            "src.poetore.trade._japanese_trade_item_type",
+            return_value="チャユラの祝福",
+        ) as item_type,
+    ):
+        assert japanese_trade_item_label(
+            "UNIQUE", "Skin of the Loyal", "Simple Robe",
+        ) == "忠臣の皮膚"
+        assert japanese_trade_item_label(
+            "ITEM", "Blessing of Chayula",
+        ) == "チャユラの祝福"
+        unique_name.assert_called_once_with("Skin of the Loyal")
+        item_type.assert_called_once_with("Blessing of Chayula")
+
+
+def test_japanese_trade_item_label_distinguishes_doryani_delusion_variants():
+    with (
+        patch(
+            "src.poetore.trade._japanese_trade_item_name",
+            return_value="ドリヤニの妄想",
+        ),
+        patch(
+            "src.poetore.trade._japanese_trade_item_type",
+            return_value="タイタングリーヴ",
+        ),
+    ):
+        assert japanese_trade_item_label(
+            "UNIQUE", "Doryani's Delusion", "Leviathan Greaves",
+        ) == "ドリヤニの妄想（タイタングリーヴ）"
+
+
+def test_japanese_trade_item_label_falls_back_to_english_name():
+    with (
+        patch("src.poetore.trade._japanese_trade_item_name", return_value=None),
+        patch("src.poetore.trade._japanese_trade_item_type", return_value=None),
+    ):
+        assert japanese_trade_item_label("UNIQUE", "Unknown Unique") == "Unknown Unique"
+        assert japanese_trade_item_label("ITEM", "Unknown Item") == "Unknown Item"
+
+
+def test_divination_card_identity_catalog_is_complete_and_stable():
+    identities = _divination_card_identities()
+
+    assert len(identities) == 467
+    assert len({english for english, _japanese in identities}) == 467
+    assert len({japanese for _english, japanese in identities}) == 465
+    assert {
+        english for english, japanese in identities if japanese == "取り引き"
+    } == {"The Bargain", "The Deal"}
+    assert {
+        english for english, japanese in identities if japanese == "生贄"
+    } == {"The Offering", "The Sacrifice"}
+
+
+@pytest.mark.parametrize(("japanese", "english"), (
+    ("闇の魔術師", "The Dark Mage"),
+    ("欺く者", "The Deceiver"),
+    ("悪霊", "The Fiend"),
+    ("最後の仕上げ", "The Finishing Touch"),
+    ("聖者の宝物", "The Saint's Treasure"),
+    ("侍の眼", "The Samurai's Eye"),
+    ("冬の抱擁", "Winter's Embrace"),
+))
+def test_divination_card_identity_does_not_depend_on_api_array_position(
+    japanese, english,
+):
+    assert _english_divination_card_type(japanese) == english
+    assert _japanese_divination_card_type(english) == japanese
+    assert _english_trade_item_type(japanese, "divination_card") == english
+    assert japanese_trade_item_label("DIVINATION_CARD", english) == japanese
+
+
+@pytest.mark.parametrize("japanese", ("取り引き", "生贄"))
+def test_ambiguous_japanese_divination_card_name_is_not_misidentified(japanese):
+    assert _english_divination_card_type(japanese) is None
+    assert _english_trade_item_type(japanese, "divination_card") is None
+
+
+def test_finishing_touch_uses_correct_english_trade_identity_and_query():
+    item = parse_item_text("""アイテムクラス: 占いカード
+レアリティ: ノーマル
+最後の仕上げ
+--------
+スタック数: 1/10
+--------
+報酬
+""")
+
+    trade_type, trade_name = english_trade_identity(item)
+    query = build_search_query(item, trade_type, trade_name=trade_name)["query"]
+
+    assert item.category == "divination_card"
+    assert trade_type == "The Finishing Touch"
+    assert trade_name is None
+    assert query["type"] == "The Finishing Touch"
+
+
+def test_finishing_touch_search_and_japanese_link_keep_the_same_identity():
+    item = parse_item_text("""アイテムクラス: 占いカード
+レアリティ: ノーマル
+最後の仕上げ
+--------
+スタック数: 1/10
+""")
+    response = ({"id": "qid", "result": [], "total": 0}, {}, False)
+
+    with patch(
+        "src.poetore.trade._cached_request_json", return_value=response,
+    ) as request:
+        result = search_prices(item, league="Standard")
+
+    api_payload = request.call_args.args[1]
+    web_payload = json.loads(parse_qs(urlsplit(result.web_url).query)["q"][0])
+    assert api_payload["query"]["type"] == "The Finishing Touch"
+    assert web_payload["query"]["type"] == "最後の仕上げ"
 
 
 ITEM = """Item Class: Two Hand Swords
@@ -94,16 +289,16 @@ Syndicate's Garb
 
 
 def test_japanese_type_mapping_keeps_safe_prefix_of_unequal_item_groups():
-    english = (({"type": "First Base"}, {"type": "Syndicate's Garb"},
+    english = (("armour", ({"type": "First Base"}, {"type": "Syndicate's Garb"},
                 {"type": "Missing Later"}, {"type": "Unique", "name": "Unique",
                                             "flags": {"unique": True}},
                 {"type": "Crusader Gloves", "name": "Repentance",
-                 "flags": {"unique": True}}),)
-    japanese = (({"type": "最初のベース"}, {"type": "シンジケートの服"},
+                 "flags": {"unique": True}})),)
+    japanese = (("armour", ({"type": "最初のベース"}, {"type": "シンジケートの服"},
                  {"type": "ユニーク", "name": "ユニーク",
                   "flags": {"unique": True}},
                  {"type": "聖戦士のグローブ", "name": "悔恨",
-                  "flags": {"unique": True}}),)
+                  "flags": {"unique": True}})),)
     with patch("src.poetore.trade._trade_item_groups", return_value=english), patch(
         "src.poetore.trade._jp_trade_item_groups", return_value=japanese,
     ):
@@ -111,6 +306,109 @@ def test_japanese_type_mapping_keeps_safe_prefix_of_unequal_item_groups():
         # 欠落entry自体を誤った日本語typeへ変換せず、その後のUnique境界で再同期する。
         assert _japanese_trade_item_type("Missing Later") is None
         assert _japanese_trade_item_name("Repentance") == "悔恨"
+
+
+def test_item_mapping_uses_stable_group_id_instead_of_group_order():
+    english = (
+        ("accessory", ({"type": "Iron Ring"},)),
+        ("armour", ({"type": "Mesh Boots", "name": "Wake of Destruction",
+                     "flags": {"unique": True}},)),
+    )
+    japanese = (
+        ("armour", ({"type": "メッシュブーツ", "name": "破滅の軌跡",
+                     "flags": {"unique": True}},)),
+        ("accessory", ({"type": "鉄の指輪"},)),
+    )
+    with patch("src.poetore.trade._trade_item_groups", return_value=english), patch(
+        "src.poetore.trade._jp_trade_item_groups", return_value=japanese,
+    ):
+        assert _english_trade_item_type("メッシュブーツ") == "Mesh Boots"
+        assert _english_trade_item_name("破滅の軌跡") == "Wake of Destruction"
+
+
+def test_item_mapping_rejects_ambiguous_localized_identity():
+    english = (("weapon", (
+        {"type": "Heavy Arrow Quiver"},
+        {"type": "Heavy Quiver"},
+    )),)
+    japanese = (("weapon", (
+        {"type": "重い矢筒"},
+        {"type": "重い矢筒"},
+    )),)
+    with patch("src.poetore.trade._trade_item_groups", return_value=english), patch(
+        "src.poetore.trade._jp_trade_item_groups", return_value=japanese,
+    ):
+        assert _english_trade_item_type("重い矢筒") is None
+
+
+@pytest.mark.parametrize(("localized", "expected"), (
+    ("重い矢筒", "Heavy Arrow Quiver"),
+    ("原始の矢筒", "Primal Arrow Quiver"),
+    ("羽根付きの矢筒", "Feathered Arrow Quiver"),
+    ("灼熱の矢筒", "Blazing Arrow Quiver"),
+))
+def test_confirmed_quiver_overrides_resolve_ambiguous_official_data(
+    localized, expected,
+):
+    assert _english_trade_item_type(localized, "accessory") == expected
+
+
+def test_confirmed_rabid_rhoa_card_override_is_category_scoped():
+    assert _english_trade_item_type(
+        "狂犬病のロア", "divination_card",
+    ) == "The Rabid Rhoa"
+    assert _english_trade_item_type("狂犬病のロア", "captured_beast") is None
+
+
+def test_329_japanese_copy_resolves_base_type_for_nonunique_items():
+    item = ParsedItem("靴", "レア", "破滅の足跡", "メッシュブーツ", "armour")
+    with patch(
+        "src.poetore.trade._english_trade_item_type", return_value="Mesh Boots",
+    ) as item_type, patch(
+        "src.poetore.trade._english_trade_item_name",
+    ) as item_name:
+        assert english_trade_identity(
+            item, item.base_type, item.name,
+        ) == ("Mesh Boots", "破滅の足跡")
+    item_type.assert_called_once_with("メッシュブーツ", "armour")
+    item_name.assert_not_called()
+
+
+def test_329_japanese_copy_resolves_unique_name_and_base_type():
+    item = ParsedItem("靴", "ユニーク", "破滅の軌跡", "メッシュブーツ", "armour")
+    with patch(
+        "src.poetore.trade._english_trade_item_type", return_value="Mesh Boots",
+    ), patch(
+        "src.poetore.trade._english_trade_item_name", return_value="Wake of Destruction",
+    ):
+        assert english_trade_identity(
+            item, item.base_type, item.name,
+        ) == ("Mesh Boots", "Wake of Destruction")
+
+
+def test_329_japanese_magic_one_line_name_resolves_contained_base_type():
+    english = (("flask", ({"type": "Jade Flask"}, {"type": "Blood Sap Tincture"})),)
+    japanese = (("flask", ({"type": "翡翠のフラスコ"}, {"type": "血の樹液のチンキ"})),)
+    with patch("src.poetore.trade._trade_item_groups", return_value=english), patch(
+        "src.poetore.trade._jp_trade_item_groups", return_value=japanese,
+    ):
+        assert _english_trade_item_type(
+            "初学者の 消費の 翡翠のフラスコ",
+        ) == "Jade Flask"
+        assert _english_trade_item_type(
+            "固く握った 殴打の 血の樹液のチンキ",
+        ) == "Blood Sap Tincture"
+
+
+def test_329_unidentified_unique_base_is_not_used_as_unique_name():
+    item = ParsedItem("スタッフ", "ユニーク", "ねじれた枝", "ねじれた枝", "weapon")
+    with patch(
+        "src.poetore.trade._english_trade_item_type", return_value="Gnarled Branch",
+    ), patch("src.poetore.trade._english_trade_item_name") as item_name:
+        assert english_trade_identity(
+            item, item.base_type, item.name,
+        ) == ("Gnarled Branch", None)
+    item_name.assert_not_called()
 
 
 def test_warlord_syndicates_garb_web_url_uses_japanese_official_base_type():
@@ -148,34 +446,184 @@ def test_awakened_tier_tags_preserve_each_aggregated_mod():
     assert _awakened_tier_tags(mixed) == (1, 2)
 
 
-def test_trade_api_retries_429_once_using_retry_after():
-    error = HTTPError(
-        "https://example.invalid", 429, "rate limited", {"Retry-After": "2"},
-        BytesIO(b'{}'),
+def test_trade_api_surfaces_rate_limit_immediately():
+    response = SimpleNamespace(
+        status=429, headers={"Retry-After": "580"}, data=b"{}",
     )
-    response = MagicMock()
-    response.__enter__.return_value = response
-    response.read.return_value = b'{"ok": true}'
-    response.headers = {"X-Rate-Limit-Ip-State": "1:10:0"}
-    with patch("src.poetore.trade.urlopen", side_effect=[error, response]), patch(
-        "src.poetore.trade.time.sleep"
-    ) as sleep:
-        payload, headers = _request_json("https://example.invalid")
-    assert payload == {"ok": True}
-    assert headers["X-Rate-Limit-Ip-State"] == "1:10:0"
-    sleep.assert_called_once_with(2.0)
+    with patch(
+        "src.poetore.trade._trade_http_pool.request", return_value=response,
+    ) as request, patch(
+        "src.poetore.trade.record_trade_api_event",
+    ) as record_event:
+        with pytest.raises(Exception) as exc_info:
+            _request_json("https://example.invalid", {"query": {}})
+    assert str(exc_info.value) == (
+        "検索回数が多いため、PoE Trade APIの利用制限に達しました。"
+        " 約10分後に、もう一度検索してください。"
+    )
+    request.assert_called_once()
+    assert request.call_args.kwargs["retries"] is False
+    assert record_event.call_args.kwargs["status"] == 429
+    assert record_event.call_args.kwargs["outcome"] == "http_error"
+
+
+def test_trade_api_surfaces_rate_limit_without_retry_after():
+    response = SimpleNamespace(
+        status=429, headers={}, data=b"{}",
+    )
+    with patch("src.poetore.trade._trade_http_pool.request", return_value=response):
+        with pytest.raises(Exception) as exc_info:
+            _request_json("https://example.invalid", {"query": {}})
+    assert str(exc_info.value) == (
+        "検索回数が多いため、PoE Trade APIの利用制限に達しました。"
+        " しばらく時間を置いてから、もう一度検索してください。"
+    )
 
 
 def test_trade_api_surfaces_official_error_message():
-    error = HTTPError(
-        "https://example.invalid", 400, "bad request", {},
-        BytesIO(b'{"error":{"code":2,"message":"Unknown item base type"}}'),
+    response = SimpleNamespace(
+        status=400, headers={},
+        data=b'{"error":{"code":2,"message":"Unknown item base type"}}',
     )
-    with patch("src.poetore.trade.urlopen", side_effect=error):
+    with patch("src.poetore.trade._trade_http_pool.request", return_value=response):
         with pytest.raises(Exception) as exc_info:
             _request_json("https://example.invalid", {"query": {}})
     assert "HTTP 400" in str(exc_info.value)
     assert "Unknown item base type" in str(exc_info.value)
+
+
+def test_trade_http_pool_reuses_connections_without_automatic_retries():
+    response = SimpleNamespace(status=200, headers={}, data=b'{"ok":true}')
+    with patch(
+        "src.poetore.trade._trade_http_pool.request", return_value=response,
+    ) as request:
+        assert _request_json("https://example.invalid/a")[0] == {"ok": True}
+        assert _request_json("https://example.invalid/b")[0] == {"ok": True}
+
+    assert request.call_count == 2
+    assert all(call.kwargs["retries"] is False for call in request.call_args_list)
+
+
+def test_trade_api_retries_read_timeout_once_with_fresh_connection_and_diagnostics(capsys):
+    response = SimpleNamespace(status=200, headers={}, data=b'{"ok":true}')
+    timeout = urllib3.exceptions.ReadTimeoutError(
+        None, "https://example.invalid/api/trade/search/Standard", "timed out",
+    )
+    payload = {
+        "query": {
+            "stats": [{
+                "type": "and",
+                "filters": [{"id": "explicit.stat_1"}, {"id": "explicit.stat_2"}],
+            }],
+        },
+    }
+    with patch(
+        "src.poetore.trade._trade_http_pool.request",
+        side_effect=[timeout, response],
+    ) as request, patch(
+        "src.poetore.trade._trade_http_pool.clear",
+    ) as clear, patch(
+        "src.poetore.trade.record_trade_api_event",
+    ) as record_event:
+        assert _request_json(
+            "https://example.invalid/api/trade/search/Standard", payload,
+        )[0] == {"ok": True}
+
+    assert request.call_count == 2
+    clear.assert_called_once_with()
+    assert all(
+        call.kwargs["timeout"].total == 20
+        for call in request.call_args_list
+    )
+    output = capsys.readouterr().out
+    assert "stage=search_post" in output
+    assert "mod_filters=2" in output
+    assert "attempt=1" in output
+    assert "status=none" in output
+    assert "outcome=retrying" in output
+    assert "attempt=2" in output
+    assert "status=200" in output
+    assert "outcome=success" in output
+    assert [call.kwargs["outcome"] for call in record_event.call_args_list] == [
+        "retrying", "success",
+    ]
+    assert all("url" not in call.kwargs for call in record_event.call_args_list)
+    assert all("payload" not in call.kwargs for call in record_event.call_args_list)
+
+
+def test_trade_api_retries_read_timeout_only_once_for_result_fetch(capsys):
+    timeout = urllib3.exceptions.ReadTimeoutError(
+        None, "https://example.invalid/api/trade/fetch/a?query=q", "timed out",
+    )
+    with patch(
+        "src.poetore.trade._trade_http_pool.request",
+        side_effect=[timeout, timeout],
+    ) as request, patch(
+        "src.poetore.trade._trade_http_pool.clear",
+    ) as clear:
+        with pytest.raises(TradeApiError, match="接続に失敗"):
+            _request_json("https://example.invalid/api/trade/fetch/a?query=q")
+
+    assert request.call_count == 2
+    clear.assert_called_once_with()
+    output = capsys.readouterr().out
+    assert "stage=result_fetch_get" in output
+    assert "mod_filters=0" in output
+    assert "attempt=2" in output
+    assert "outcome=failed" in output
+
+
+def test_trade_api_does_not_retry_non_read_timeout(capsys):
+    error = urllib3.exceptions.ConnectTimeoutError(
+        None, "https://example.invalid", "connect timed out",
+    )
+    with patch(
+        "src.poetore.trade._trade_http_pool.request", side_effect=error,
+    ) as request, patch(
+        "src.poetore.trade._trade_http_pool.clear",
+    ) as clear:
+        with pytest.raises(TradeApiError, match="接続に失敗"):
+            _request_json("https://example.invalid/api/trade/search/Standard", {"query": {}})
+
+    request.assert_called_once()
+    clear.assert_not_called()
+    assert "outcome=failed" in capsys.readouterr().out
+
+
+def test_trade2_search_persists_sanitized_stage_mod_count_and_status():
+    response = SimpleNamespace(
+        status=200, headers={}, data=b'{"id":"query-id","result":[]}',
+    )
+    payload = {
+        "query": {
+            "stats": [
+                {"type": "and", "filters": [
+                    {"id": "explicit.stat_1"},
+                    {"id": "explicit.stat_2"},
+                ]},
+                {"type": "not", "filters": [{"id": "explicit.stat_3"}]},
+            ],
+        },
+    }
+    with patch(
+        "src.poetore.trade._trade_http_pool.request", return_value=response,
+    ), patch(
+        "src.poetore.trade.record_trade_api_event",
+    ) as record_event:
+        _request_json(
+            "https://www.pathofexile.com/api/trade2/search/poe2/Standard",
+            payload,
+        )
+
+    details = record_event.call_args.kwargs
+    assert details["stage"] == "search_post"
+    assert details["method"] == "POST"
+    assert details["mod_filters"] == 3
+    assert details["status"] == 200
+    assert details["outcome"] == "success"
+    assert details["elapsed_ms"] >= 0
+    assert "url" not in details
+    assert "payload" not in details
 
 
 def test_weapon_search_uses_english_base_rarity_and_comparable_pdps():
@@ -252,6 +700,34 @@ def test_nonunique_jewels_can_search_their_whole_jewel_category(
     }
 
 
+@pytest.mark.parametrize("preset", [PRESET_FINISHED, PRESET_BASE])
+def test_fractured_abyss_jewel_can_switch_between_category_and_exact_base(preset):
+    item = ParsedItem(
+        item_class="Abyss Jewels", rarity="Rare", name="Test Jewel",
+        base_type="Ghastly Eye Jewel", category="abyss_jewel", item_level=84,
+        modifiers=(ItemModifier(
+            "+35 to maximum Life", (35.0,), kind="fractured",
+            stat_id="fractured.stat_3299347043",
+        ),),
+        raw_text="fractured abyss jewel",
+    )
+    assert available_trade_presets(item) == (PRESET_FINISHED, PRESET_BASE)
+
+    broad = build_search_query(
+        item, item.base_type, (), preset=preset, exact_base_type=False,
+    )["query"]
+    assert "type" not in broad
+    assert broad["filters"]["type_filters"]["filters"]["category"] == {
+        "option": "jewel.abyss"
+    }
+
+    exact = build_search_query(
+        item, item.base_type, (), preset=preset, exact_base_type=True,
+    )["query"]
+    assert exact["type"] == "Ghastly Eye Jewel"
+    assert "category" not in exact["filters"].get("type_filters", {}).get("filters", {})
+
+
 def test_magic_single_line_affixed_name_resolves_longest_official_base():
     entries = (
         {"type": "Wand", "flags": {}},
@@ -278,7 +754,9 @@ def test_search_auto_resolves_magic_single_line_detail_name_before_api():
 
 def test_normal_search_rejects_japanese_identity_before_api_request():
     item = parse_item_text(ITEM)
-    with patch("src.poetore.trade._cached_request_json") as request_json:
+    with patch(
+        "src.poetore.trade._english_trade_item_type", return_value=None,
+    ), patch("src.poetore.trade._cached_request_json") as request_json:
         with pytest.raises(TradeApiError, match="英語のアイテム名またはベースタイプ"):
             search_prices(
                 item, "上質な エゾマイトの刃", league="Standard",
@@ -293,7 +771,9 @@ def test_normal_equipment_defaults_to_any_currency():
     item = parse_item_text(ITEM)
     assert default_trade_currency(item) == "any"
     query = build_search_query(item, "Reaver Sword")["query"]
-    assert "trade_filters" not in query["filters"]
+    trade_filters = query["filters"]["trade_filters"]["filters"]
+    assert trade_filters == {"collapse": {"option": "true"}}
+    assert "price" not in trade_filters
 
 
 def test_consumable_craftable_item_defaults_to_chaos_and_divine():
@@ -346,6 +826,192 @@ def test_stat_filter_supports_maximum_exact_and_trade_inversion():
         {"id": "explicit.exact", "value": {"min": 3, "max": 3}},
         {"id": "explicit.inverted", "value": {"min": -20, "max": -10}},
     ]
+
+
+def test_infamous_slower_rage_loss_uses_negative_faster_value():
+    item = parse_item_text("""アイテムクラス: 兜
+レアリティ: レア
+恐ろしい堅塁
+征服者のヘルメット
+--------
+アーマー: 615 (augmented)
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「悪名高い」 (ティア: 1) }
+憤怒の固有効果による喪失が20%遅くなる
+(この効果は直近にヒット受けていないか憤怒を獲得していない時の憤怒の減少にのみ影響を与える)
+""")
+    filters = resolve_trade_stat_filters(item)
+    infamous = next(
+        row for row in filters if row.stat_id == "explicit.stat_3645269560"
+    )
+    assert infamous.generation == "infamous"
+    assert infamous.inverted is True
+    assert unresolved_modifier_warnings(item, filters) == ()
+
+    query = build_search_query(
+        item, stat_filters=(replace(infamous, enabled=True),),
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": "explicit.stat_3645269560",
+        "value": {"max": -20.0},
+    }]
+
+
+def test_doppelgangers_guise_reduced_damage_taken_resolves_more_stat():
+    item = parse_item_text("""アイテムクラス: 鎧
+レアリティ: ユニーク
+ドッペルゲンガーの装い
+サディストの服
+--------
+品質: +20% (augmented)
+回避力: 564 (augmented)
+エナジーシールド: 122 (augmented)
+--------
+装備要求:
+レベル: 72
+筋力: 72
+器用さ: 103 (unmet)
+知性: 159 (unmet)
+--------
+ソケット: W-B-R-G-W-B
+--------
+アイテムレベル: 86
+--------
+{ ユニークモッド }
+レベル20錯乱スキルを付与する
+{ ユニークモッド — クリティカル }
+狂気状態の時にクリティカル率が58(40-60)%上昇する
+{ ユニークモッド }
+狂気状態の時にプレイヤーのヒットにより倒された敵は破壊される
+{ ユニークモッド — 物理, 混沌 }
+正気状態の時に受ける物理ダメージおよび混沌ダメージが40(40-30)%低下する
+{ ユニークモッド — ライフ }
+正気状態の時にヒットを受けるとライフの10%を1秒かけて自動回復する
+--------
+我らの内には純粋なる悪意の存在がおり、
+我らが己に言い聞かせる嘘によってのみ抑えられている。""")
+    filters = resolve_trade_stat_filters(item)
+    sane = next(
+        row for row in filters if row.stat_id == "explicit.stat_388639924"
+    )
+
+    assert sane.inverted is True
+    assert sane.read_value == 40.0
+    assert unresolved_modifier_warnings(item, filters) == ()
+    query = build_search_query(
+        item, stat_filters=(replace(sane, enabled=True),),
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": "explicit.stat_388639924",
+        "value": {"max": -40.0},
+    }]
+
+
+def test_reduced_curse_effect_flask_uses_awakened_positive_minimum():
+    item = parse_item_text("""アイテムクラス: ユーティリティフラスコ
+レアリティ: マジック
+医者の モッキングバードの 水銀のフラスコ
+--------
+アイテムレベル: 84
+--------
+{ サフィックスモッド 「モッキングバードの」 (ティア: 4) }
+効果中にプレイヤーに対する呪いの効果が45(47-42)%減少する
+""")
+    filters = resolve_trade_stat_filters(item)
+    curse = next(
+        row for row in filters if row.stat_id == "explicit.stat_4265534424"
+    )
+
+    assert (curse.min_value, curse.max_value, curse.inverted) == (40.0, None, False)
+    query = build_search_query(
+        item, stat_filters=(replace(curse, enabled=True),),
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": "explicit.stat_4265534424",
+        "value": {"min": 40.0},
+    }]
+
+
+@pytest.mark.parametrize(("stat_id", "line", "suffix"), [
+    (
+        "explicit.stat_1574578643",
+        "ピュリティオブエレメントの影響を受けている間受ける反射元素ダメージの66%を防ぐ",
+        "",
+    ),
+    (
+        "explicit.stat_2255585376",
+        "デターミネーションの影響を受けている間受ける反射物理ダメージの66%を防ぐ",
+        "",
+    ),
+    (
+        "explicit.stat_3829555156",
+        "右の指輪スロット: プレイヤーおよびミニオンは反射物理ダメージの110%を防ぐ",
+        "",
+    ),
+    (
+        "explicit.stat_3991837781",
+        "左の指輪スロット: プレイヤーおよびミニオンは反射元素ダメージの110%を防ぐ",
+        "",
+    ),
+    (
+        "implicit.stat_1973340656",
+        "アトラスのピナクルボスが付近にいる場合、ミニオンは受ける反射ダメージの90%を防ぐ",
+        " (implicit)",
+    ),
+    (
+        "implicit.stat_2467518140",
+        "ミニオンは受ける反射ダメージの66%を防ぐ",
+        " (implicit)",
+    ),
+    (
+        "crafted.stat_603134774",
+        "効果中は反射ダメージの60%を防ぐ",
+        " (crafted)",
+    ),
+    (
+        "explicit.stat_603134774",
+        "効果中は反射ダメージの60%を防ぐ",
+        "",
+    ),
+    (
+        "implicit.stat_2173565521",
+        "アトラスのピナクルボスが付近にいる場合、反射ダメージの90%を防ぐ",
+        " (implicit)",
+    ),
+    (
+        "implicit.stat_2510655429",
+        "反射ダメージの66%を防ぐ",
+        " (implicit)",
+    ),
+])
+def test_reflected_damage_prevention_uses_positive_trade_minimum(
+    stat_id, line, suffix,
+):
+    item = parse_item_text(f"""アイテムクラス: 胴体防具
+レアリティ: レア
+反射監査用胴体
+ヴァールレガリア
+--------
+アイテムレベル: 86
+--------
+{line}{suffix}
+""")
+    stat_filter = next(
+        row for row in resolve_trade_stat_filters(item) if row.stat_id == stat_id
+    )
+
+    assert stat_filter.inverted is False
+    assert stat_filter.min_value is not None and stat_filter.min_value > 0
+    assert stat_filter.max_value is None
+    query = build_search_query(
+        item, stat_filters=(replace(stat_filter, enabled=True),),
+    )["query"]
+    sent = query["stats"][0]["filters"][0]
+    assert sent["id"] == stat_id
+    assert sent["value"]["min"] > 0
+    assert "max" not in sent["value"]
 
 
 def test_high_item_level_unfinished_rare_has_finished_and_base_presets():
@@ -416,6 +1082,134 @@ def test_fractured_item_can_offer_base_preset_below_ilvl_82():
     assert query["stats"][0]["filters"] == [
         {"id": "fractured.phys", "value": {"min": 74.0}},
     ]
+
+
+def test_low_level_magic_can_offer_base_preset_only_when_explicitly_enabled():
+    item = ParsedItem(
+        "Rings", "Magic", "Healthy Ruby Ring", "Ruby Ring", "ring",
+        item_level=75, raw_text="low-level magic ring",
+    )
+
+    assert available_trade_presets(item) == (PRESET_FINISHED,)
+    assert available_trade_presets(
+        item, allow_low_level_magic=True,
+    ) == (PRESET_FINISHED, PRESET_BASE)
+
+
+def test_quality_twenty_fractured_armour_still_offers_base_preset():
+    item = parse_item_text("""アイテムクラス: 靴
+レアリティ: レア
+腐敗した足取り
+ウォーロックブーツ
+--------
+品質: +20% (augmented)
+エナジーシールド: 194 (augmented)
+--------
+アイテムレベル: 85
+--------
+{ フラクチャー プレフィックスモッド「競技者の」 (ティア: 1) — ライフ }
+最大ライフ +122(115-129)
+--------
+フラクチャーアイテム
+""")
+    entries = ({
+        "id": "fractured.stat_3299347043",
+        "text": "+# to maximum Life",
+        "type": "fractured",
+    },)
+
+    assert available_trade_presets(item) == (PRESET_FINISHED, PRESET_BASE)
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        filters = resolve_trade_stat_filters(item, PRESET_BASE)
+
+    fractured = next(
+        row for row in filters
+        if row.stat_id == "fractured.stat_3299347043"
+    )
+    assert fractured.enabled
+    query = build_search_query(
+        item, "Warlock Boots", filters, preset=PRESET_BASE,
+    )["query"]
+    assert query["filters"]["misc_filters"]["filters"]["fractured_item"] == {
+        "option": "true",
+    }
+    assert query["stats"][0]["filters"] == [{
+        "id": "fractured.stat_3299347043",
+        "value": {"min": 122.0},
+    }]
+
+
+@pytest.mark.parametrize("blocked_flag", ("corrupted", "mirrored"))
+def test_unmodifiable_fractured_item_does_not_offer_base_preset(blocked_flag):
+    item = ParsedItem(
+        "Body Armours", "Rare", "Test Mantle", "Vaal Regalia", "armour",
+        item_level=85, flags=(blocked_flag,),
+        modifiers=(
+            ItemModifier(
+                "+100 to maximum Life", (100,), kind="fractured",
+                ref="+# to maximum Life", stat_id="fractured.life",
+            ),
+        ),
+    )
+
+    assert available_trade_presets(item) == (PRESET_FINISHED,)
+
+
+@pytest.mark.parametrize("strong_flag", ("synthesised", "influence:elder"))
+def test_crafted_item_with_strong_crafting_identity_offers_base_preset(
+        strong_flag):
+    item = ParsedItem(
+        "Boots", "Rare", "Test Boots", "Warlock Boots", "armour",
+        item_level=85, flags=(strong_flag,),
+        modifiers=(
+            ItemModifier(
+                "+20 to maximum Energy Shield", (20,), kind="crafted",
+                ref="+# to maximum Energy Shield", stat_id="crafted.es",
+            ),
+        ),
+    )
+
+    assert available_trade_presets(item) == (PRESET_FINISHED, PRESET_BASE)
+
+
+def test_japanese_329_fractured_local_mod_uses_stat_id_when_trade_text_has_local_suffix():
+    item = parse_item_text("""アイテムクラス: 手袋
+レアリティ: レア
+巻き込む前脚
+賢者のグローブ
+--------
+エナジーシールド: 110 (augmented)
+--------
+アイテムレベル: 85
+--------
+{ フラクチャー プレフィックスモッド「恐れ知らずな」 (ティア: 3) — 防御, エナジーシールド }
+エナジーシールドが74(68-79)%増加する
+--------
+フラクチャーアイテム
+""")
+    entries = ({
+        "id": "fractured.stat_4015621042",
+        "text": "エナジーシールドが#%増加する (ローカル)",
+        "type": "fractured",
+    },)
+
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        filters = resolve_trade_stat_filters(item, PRESET_BASE)
+
+    fractured = next(row for row in filters if row.kind == "fractured")
+    assert fractured.stat_id == "fractured.stat_4015621042"
+    assert fractured.min_value == 74.0
+    assert fractured.enabled is True
+
+    query = build_search_query(
+        item, "Sage's Gloves", filters, preset=PRESET_BASE,
+    )["query"]
+    misc = query["filters"]["misc_filters"]["filters"]
+    assert misc["fractured_item"] == {"option": "true"}
+    assert query["stats"][0]["filters"] == [{
+        "id": "fractured.stat_4015621042",
+        "value": {"min": 74.0},
+    }]
 
 
 def test_influenced_and_synthesised_items_add_strict_base_conditions():
@@ -493,8 +1287,59 @@ Item Level: 85
     exact_query = build_search_query(
         item, "Ruby Ring", filters, preset=PRESET_BASE, magic_exact=True,
     )["query"]
-    assert default_query["filters"]["type_filters"]["filters"]["rarity"] == {"option": "nonunique"}
+    assert "type_filters" not in default_query["filters"]
     assert exact_query["filters"]["type_filters"]["filters"]["rarity"] == {"option": "magic"}
+
+
+def test_dedicated_exact_magic_flask_uses_nonunique_rarity_like_awakened():
+    item = ParsedItem(
+        "Utility Flasks", "Magic", "Test Flask", "Granite Flask", "flask",
+        item_level=85,
+    )
+
+    default_query = build_search_query(item, "Granite Flask")["query"]
+    magic_query = build_search_query(
+        item, "Granite Flask", magic_exact=True,
+    )["query"]
+
+    assert default_query["filters"]["type_filters"]["filters"]["rarity"] == {
+        "option": "nonunique",
+    }
+    assert magic_query["filters"]["type_filters"]["filters"]["rarity"] == {
+        "option": "nonunique",
+    }
+
+
+@pytest.mark.parametrize("category", [
+    "map", "memory_line", "heist_contract", "heist_blueprint",
+    "tincture", "sanctum_relic", "charm", "idol",
+])
+def test_dedicated_exact_magic_items_exclude_uniques_like_awakened(category):
+    item = ParsedItem(
+        "Test Items", "Magic", "Test Item", "Test Base", category,
+        item_level=85,
+    )
+
+    query = build_search_query(item, "Test Base")["query"]
+
+    assert query["filters"]["type_filters"]["filters"]["rarity"] == {
+        "option": "nonunique",
+    }
+
+
+def test_unique_flask_still_uses_unique_rarity():
+    item = ParsedItem(
+        "Utility Flasks", "Unique", "Kiara's Determination", "Silver Flask", "flask",
+        item_level=85,
+    )
+
+    query = build_search_query(
+        item, "Silver Flask", trade_name="Kiara's Determination",
+    )["query"]
+
+    assert query["filters"]["type_filters"]["filters"]["rarity"] == {
+        "option": "unique",
+    }
 
 
 def test_nonexact_accessory_search_uses_item_class_category():
@@ -536,19 +1381,66 @@ Item Level: 84
         assert available_trade_presets(item) == (PRESET_FINISHED,)
 
 
-def test_base_preset_keeps_implicit_enchant_and_memory_strands_like_awakened():
-    item = parse_item_text("""Item Class: Two Hand Swords
+@pytest.mark.parametrize(("item_class", "base_type", "category"), (
+    ("Two Hand Swords", "Reaver Sword", "weapon"),
+    ("Body Armours", "Vaal Regalia", "armour"),
+    ("Rings", "Ruby Ring", "accessory"),
+    ("Jewels", "Crimson Jewel", "jewel"),
+    ("Abyss Jewels", "Searching Eye Jewel", "abyss_jewel"),
+    ("Cluster Jewels", "Large Cluster Jewel", "cluster_jewel"),
+))
+def test_normal_craftable_items_exclude_fractured_results(
+    item_class, base_type, category,
+):
+    item = ParsedItem(
+        item_class, "Normal", "", base_type, category, item_level=84,
+    )
+
+    assert available_trade_presets(item) == (PRESET_FINISHED,)
+    query = build_search_query(item, base_type, preset=PRESET_FINISHED)["query"]
+    misc = query["filters"]["misc_filters"]["filters"]
+
+    assert misc["fractured_item"] == {"option": "false"}
+
+
+@pytest.mark.parametrize(("flags", "modifiers"), (
+    (("corrupted",), ()),
+    (("mirrored",), ()),
+    ((), (ItemModifier("+10 to Strength", (10,), kind="fractured"),)),
+))
+def test_awakened_fractured_exclusion_skips_unmodifiable_or_fractured_source(
+    flags, modifiers,
+):
+    item = ParsedItem(
+        "Rings", "Normal", "", "Ruby Ring", "accessory",
+        item_level=84, flags=flags, modifiers=modifiers,
+    )
+
+    query = build_search_query(item, "Ruby Ring", preset=PRESET_FINISHED)["query"]
+    misc = query["filters"].get("misc_filters", {}).get("filters", {})
+
+    assert "fractured_item" not in misc
+
+
+@pytest.mark.parametrize(("strands", "expected_enabled"), (
+    (59, False),
+    (60, True),
+    (64, True),
+))
+def test_base_preset_uses_awakened_memory_strands_threshold(
+        strands, expected_enabled):
+    item = parse_item_text(f"""Item Class: Two Hand Swords
 Rarity: Rare
 Test Sword
 Reaver Sword
 --------
-Memory Strands: 70
+Memory Strands: {strands}
 --------
 Item Level: 85
 --------
 +25% to Global Critical Strike Multiplier (implicit)
 --------
-{ Enchant Modifier }
+{{ Enchant Modifier }}
 10% increased Attack Speed
 """)
     entries = (
@@ -560,10 +1452,27 @@ Item Level: 85
     by_id = {row.stat_id: row for row in filters}
     assert by_id["implicit.crit"].enabled is True
     assert by_id["enchant.speed"].enabled is True
-    assert by_id["property.memory_strands"].enabled is True
+    assert by_id["property.memory_strands"].enabled is expected_enabled
 
 
-def test_finished_preset_does_not_force_special_base_state():
+def test_finished_preset_hides_memory_strands_even_above_threshold():
+    item = parse_item_text("""Item Class: Rings
+Rarity: Rare
+Test Ring
+Manifold Ring
+--------
+Memory Strands: 64
+--------
+Item Level: 86
+""")
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        filters = resolve_trade_stat_filters(item)
+    strands = next(row for row in filters if row.stat_id == "property.memory_strands")
+    assert strands.enabled is False
+    assert strands.hidden_reason
+
+
+def test_finished_preset_keeps_awakened_fractured_exclusion_only():
     item = parse_item_text(ITEM.replace(
         "74% increased Physical Damage", "74% increased Physical Damage\nHunter Item",
     ))
@@ -572,7 +1481,7 @@ def test_finished_preset_does_not_force_special_base_state():
     query = build_search_query(item, "Reaver Sword", filters, preset=PRESET_FINISHED)["query"]
     misc = query["filters"].get("misc_filters", {}).get("filters", {})
     assert "synthesised_item" not in misc
-    assert "fractured_item" not in misc
+    assert misc["fractured_item"] == {"option": "false"}
     assert not any(
         row.get("id") == "pseudo.pseudo_has_hunter_influence"
         for row in query["stats"][0]["filters"]
@@ -637,19 +1546,139 @@ Item Level: 86
     with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
         rows = resolve_trade_stat_filters(item)
     ids = [row.stat_id for row in rows]
-    expected = [
-        "explicit.gem_level",
-        "pseudo.pseudo_increased_spell_damage",
-        "pseudo.pseudo_total_cast_speed",
-        "pseudo.pseudo_critical_strike_chance_for_spells",
-        "pseudo.pseudo_total_mana",
+    major_ids = {
+        "property.total_dps", "property.physical_dps", "property.elemental_dps",
+    }
+    assert [row.stat_id for row in rows[:3] if row.stat_id in major_ids] == [
+        row.stat_id for row in rows if row.stat_id in major_ids
     ]
+    expected = ["explicit.gem_level"]
     assert [stat_id for stat_id in ids if stat_id in expected] == expected
     assert next(row for row in rows if row.stat_id == "explicit.gem_level").enabled
     assert not any(
         row.enabled for row in rows
         if row.stat_id in set(expected) - {"explicit.gem_level"}
     )
+
+
+def test_armour_finished_filters_show_final_defence_then_pseudos_then_special_mods():
+    item = parse_item_text("""Item Class: Body Armours
+Rarity: Rare
+Test Armour
+Saintly Chainmail
+--------
+Armour: 800
+Energy Shield: 200
+--------
+Item Level: 86
+--------
++70 to maximum Life
++30% to Fire Resistance
+Enemies you Kill Explode, dealing 3% of their Life as Physical Damage
+""")
+    entries = ({
+        "id": "explicit.explode", "text": "Enemies you Kill Explode, dealing #% of their Life as Physical Damage",
+        "type": "explicit",
+    },)
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        rows = resolve_trade_stat_filters(item)
+    ids = [row.stat_id for row in rows]
+    assert ids.index("property.armour") < ids.index("pseudo.pseudo_total_life")
+    assert ids.index("property.energy_shield") < ids.index("pseudo.pseudo_total_life")
+    assert ids.index("pseudo.pseudo_total_life") < ids.index("explicit.explode")
+    assert ids.index("pseudo.pseudo_total_elemental_resistance") < ids.index("explicit.explode")
+
+
+def test_finished_gear_orders_affix_families_by_original_modifier_position():
+    item = ParsedItem(
+        item_class="Helmets", rarity="Rare", name="Test Helmet",
+        base_type="Conqueror Helmet", category="armour",
+        properties={"Armour": "956"},
+        modifiers=(
+            ItemModifier(
+                "10% increased Area of Effect", (10,), kind="implicit",
+                stat_id="implicit.area", ref="#% increased Area of Effect",
+            ),
+            ItemModifier(
+                "Crafted Prefix", (8,), kind="crafted", affix="prefix",
+                stat_id="crafted.prefix", ref="Crafted Prefix",
+            ),
+            ItemModifier(
+                "+2 to Level of Socketed Area of Effect Gems", (2,),
+                kind="prefix", affix="prefix", stat_id="explicit.gem",
+                ref="+# to Level of Socketed Area of Effect Gems",
+            ),
+            ItemModifier(
+                "+100 to maximum Life", (100,), kind="prefix", affix="prefix",
+                stat_id="explicit.life", ref="+# to maximum Life",
+            ),
+            ItemModifier(
+                "+570 to Accuracy Rating", (570,), kind="fractured", affix="suffix",
+                stat_id="fractured.accuracy", ref="+# to Accuracy Rating",
+            ),
+            ItemModifier(
+                "Crafted Suffix", (9,), kind="crafted", affix="suffix",
+                stat_id="crafted.suffix", ref="Crafted Suffix",
+            ),
+            ItemModifier(
+                "+34% to Chaos Resistance", (34,), kind="suffix", affix="suffix",
+                stat_id="explicit.chaos", ref="+#% to Chaos Resistance",
+            ),
+            ItemModifier(
+                "Regenerate 104.7 Life per second", (104.7,),
+                kind="suffix", affix="suffix", stat_id="explicit.regen",
+                ref="Regenerate # Life per second",
+            ),
+        ),
+    )
+    entries = (
+        {"id": "implicit.area", "text": "#% increased Area of Effect", "type": "implicit"},
+        {"id": "crafted.prefix", "text": "Crafted Prefix", "type": "crafted"},
+        {"id": "explicit.gem", "text": "+# to Level of Socketed Area of Effect Gems", "type": "explicit"},
+        {"id": "fractured.accuracy", "text": "+# to Accuracy Rating", "type": "fractured"},
+        {"id": "crafted.suffix", "text": "Crafted Suffix", "type": "crafted"},
+    )
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        rows = resolve_trade_stat_filters(item)
+    relevant = {
+        "property.armour", "crafted.prefix", "explicit.gem",
+        "fractured.accuracy", "crafted.suffix", "implicit.area",
+    }
+    assert [row.stat_id for row in rows if row.stat_id in relevant] == [
+        "property.armour",
+        "crafted.prefix",
+        "explicit.gem",
+        "fractured.accuracy",
+        "crafted.suffix",
+        "implicit.area",
+    ]
+
+
+def test_pseudo_with_suffix_and_implicit_sources_uses_suffix_group():
+    item = _pseudo_test_item((
+        ItemModifier(
+            "+30% to Fire Resistance", (30,), kind="suffix", affix="suffix",
+            stat_id="explicit.fire", ref="+#% to Fire Resistance",
+        ),
+        ItemModifier(
+            "+10% to all Elemental Resistances", (10,), kind="implicit",
+            stat_id="implicit.all_res", ref="+#% to all Elemental Resistances",
+        ),
+        ItemModifier(
+            "Other implicit", (1,), kind="implicit",
+            stat_id="implicit.other", ref="Other implicit",
+        ),
+    ))
+    entries = ({"id": "implicit.other", "text": "Other implicit", "type": "implicit"},)
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        rows = resolve_trade_stat_filters(item)
+    ids = [row.stat_id for row in rows]
+    elemental = next(
+        row for row in rows
+        if row.stat_id == "pseudo.pseudo_total_elemental_resistance"
+    )
+    assert elemental.source_affixes == ("suffix", None)
+    assert ids.index(elemental.stat_id) < ids.index("implicit.other")
 
 
 def test_weapon_base_preset_shows_performance_properties_but_keeps_them_off():
@@ -709,10 +1738,16 @@ Cardinal Round Shield
         "property.energy_shield", "property.ward",
     }
     assert [row.stat_id for row in finished if row.stat_id in property_ids] == [
-        "property.block", "property.armour", "property.evasion",
-        "property.energy_shield",
+        "property.armour", "property.evasion", "property.energy_shield",
+        "property.block",
     ]
-    assert all(row.enabled for row in finished if row.stat_id in property_ids)
+    assert not next(
+        row for row in finished if row.stat_id == "property.block"
+    ).enabled
+    assert all(
+        row.enabled for row in finished
+        if row.stat_id in property_ids and row.stat_id != "property.block"
+    )
     assert not any(row.stat_id == "property.base_percentile" for row in finished)
 
     base_properties = [row for row in base if row.stat_id in property_ids]
@@ -723,7 +1758,7 @@ Cardinal Round Shield
     assert not any(row.enabled for row in base_properties)
 
 
-def test_normal_armour_dedicated_base_search_uses_base_defaults():
+def test_normal_armour_dedicated_base_search_uses_awakened_percentile_threshold():
     item = parse_item_text("""アイテムクラス: 盾
 レアリティ: ノーマル
 Cardinal Round Shield
@@ -736,10 +1771,32 @@ Cardinal Round Shield
 """)
     filters = resolve_trade_stat_filters(item, trade_base_type="Cardinal Round Shield")
     by_id = {row.stat_id: row for row in filters}
-    assert by_id["property.base_percentile"].enabled
+    assert by_id["property.base_percentile"].enabled is False
     assert not by_id["property.block"].enabled
     assert not by_id["property.armour"].enabled
     assert not by_id["property.evasion"].enabled
+
+
+def test_base_percentile_below_50_starts_off_in_base_preset():
+    item = parse_item_text("""アイテムクラス: 盾
+レアリティ: レア
+Test Guard
+Cardinal Round Shield
+--------
+ブロック率: 25%
+アーマー: 220
+回避力: 220
+--------
+アイテムレベル: 86
+""")
+    with patch("src.poetore.trade._base_defence_percentile", return_value=49.0):
+        filters = resolve_trade_stat_filters(
+            item, PRESET_BASE, trade_base_type="Cardinal Round Shield",
+        )
+    percentile = next(
+        row for row in filters if row.stat_id == "property.base_percentile"
+    )
+    assert percentile.enabled is False
 
 
 def test_quality_above_20_is_not_normalized_down():
@@ -938,6 +1995,218 @@ def test_base_percentile_removes_quality_and_local_increase_multiplicatively(tmp
     assert _base_defence_percentile(item, "Test Armour") == 50.0
 
 
+def test_unique_armour_uses_base_percentile_instead_of_redundant_fixed_defence(tmp_path, monkeypatch):
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(json.dumps({
+        "base_armour": {"test armour": {"ar": [100, 200]}}, "mods": [],
+    }), encoding="utf-8")
+    monkeypatch.setenv("POETORE_METADATA_PATH", str(metadata_path))
+    item = ParsedItem(
+        item_class="Body Armours", rarity="Unique", name="Test Unique",
+        base_type="Test Armour", category="armour", properties={"Armour": "150"},
+    )
+
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        rows = {row.stat_id: row for row in resolve_trade_stat_filters(
+            item, trade_base_type="Test Armour", trade_name="Test Unique",
+        )}
+
+    assert "property.armour" not in rows
+    assert rows["property.base_percentile"].read_value == 50.0
+    assert rows["property.base_percentile"].enabled is True
+    query = build_search_query(
+        item, "Test Armour", tuple(rows.values()), trade_name="Test Unique",
+    )["query"]
+    assert query["filters"]["armour_filters"]["filters"]["base_defence_percentile"] == {
+        "min": 45.0,
+    }
+
+
+def test_unique_variable_armour_uses_q20_base_bounds_and_hides_redundant_percentile(
+    tmp_path, monkeypatch,
+):
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(json.dumps({
+        "base_armour": {"test armour": {"ar": [100, 200]}}, "mods": [],
+    }), encoding="utf-8")
+    monkeypatch.setenv("POETORE_METADATA_PATH", str(metadata_path))
+    item = ParsedItem(
+        item_class="Body Armours", rarity="Unique", name="Test Unique",
+        base_type="Test Armour", category="armour", properties={"Armour": "225"},
+        modifiers=(ItemModifier(
+            "50% increased Armour", (50.0,), ref="#% increased Armour",
+            roll_min=40.0, roll_max=60.0,
+        ),),
+    )
+
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        rows = {row.stat_id: row for row in resolve_trade_stat_filters(
+            item, trade_base_type="Test Armour", trade_name="Test Unique",
+        )}
+
+    armour = rows["property.armour"]
+    assert armour.read_value == 270.0
+    assert armour.min_value == 243.0
+    assert (armour.roll_min, armour.roll_max) == (168.0, 384.0)
+    assert armour.enabled is True
+    assert "property.base_percentile" not in rows
+    query = build_search_query(
+        item, "Test Armour", tuple(rows.values()), trade_name="Test Unique",
+    )["query"]
+    assert query["filters"]["armour_filters"]["filters"]["ar"] == {"min": 243.0}
+
+
+def test_svalinn_keeps_armour_base_percentile_beside_variable_japanese_ward():
+    item = parse_item_text("""アイテムクラス: 盾
+レアリティ: ユニーク
+スヴァリン
+補強されたタワーシールド
+--------
+品質: +20% (augmented)
+ブロック率: 23%
+アーマー: 518 (augmented)
+ワード: 144 (augmented)
+--------
+アイテムレベル: 85
+--------
+{ 暗黙モッド — ライフ }
+最大ライフ +18(10-20)
+--------
+{ ユニークモッド }
+スペルブロック率が15(10-15)%
+{ ユニークモッド — 防御 }
+ワード +120(100-150)
+{ ユニークモッド }
+アタックブロック率の最大値 -10%
+{ ユニークモッド }
+スペルブロック率の最大値 -10%
+{ ユニークモッド }
+ブロック確率が幸運になる
+{ ユニークモッド — キャスター, ジェム }
+ブロック時にソケットされた元素スペルをトリガーする。クールダウンは0.25秒 — スケールできない値
+""")
+    ward_stat = next(modifier for modifier in item.modifiers if modifier.ref == "+# to Ward")
+    entries = ({
+        "id": ward_stat.stat_id,
+        "text": "+# to Ward",
+        "type": "explicit",
+    },)
+
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        rows = {row.stat_id: row for row in resolve_trade_stat_filters(
+            item, trade_base_type="Girded Tower Shield", trade_name="Svalinn",
+        )}
+
+    ward = rows["property.ward"]
+    assert ward.text == "ワード（品質20%換算）"
+    assert ward.read_value == 144.0
+    assert ward.min_value == 129.0
+    assert (ward.roll_min, ward.roll_max) == (120.0, 180.0)
+    assert ward.enabled is True
+    percentile = rows["property.base_percentile"]
+    assert percentile.read_value == 87.0
+    assert percentile.min_value == 78.0
+    assert percentile.enabled is True
+    assert ward_stat.stat_id not in rows
+
+    query = build_search_query(
+        item, "Girded Tower Shield", tuple(rows.values()), trade_name="Svalinn",
+    )["query"]["filters"]["armour_filters"]["filters"]
+    assert query["ward"] == {"min": 129.0}
+    assert query["base_defence_percentile"] == {"min": 78.0}
+    assert "ar" not in query
+
+
+def test_aegis_aurora_uses_variable_final_defences_without_base_percentile():
+    item = parse_item_text("""アイテムクラス: 盾
+レアリティ: ユニーク
+イージス・オーロラ
+チャンピオンカイトシールド
+--------
+ブロック率: 32% (augmented)
+アーマー: 1027 (augmented)
+エナジーシールド: 206 (augmented)
+--------
+アイテムレベル: 85
+--------
+{ ユニークモッド — 防御, アーマー, エナジーシールド }
+アーマーおよびエナジーシールドが321(300-400)%増加する
+{ ユニークモッド — 元素, 冷気, 耐性 }
+冷気耐性の最大値 +5%
+{ ユニークモッド — 元素, 耐性 }
+全ての元素耐性 +10%
+{ ユニークモッド — ダメージ, 元素, アタック }
+アタックスキルの元素ダメージが12(10-20)%増加する
+{ ユニークモッド }
+ブロック率 +6%
+{ ユニークモッド — 防御, エナジーシールド }
+ブロック時にアーマーの2%と同量のエナジーシールドを回復する
+""")
+
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        rows = {row.stat_id: row for row in resolve_trade_stat_filters(
+            item, trade_base_type="Champion Kite Shield", trade_name="Aegis Aurora",
+        )}
+
+    armour = rows["property.armour"]
+    energy_shield = rows["property.energy_shield"]
+    assert armour.text == "アーマー（品質20%換算）"
+    assert energy_shield.text == "エナジーシールド（品質20%換算）"
+    assert armour.read_value == pytest.approx(1232.4)
+    assert armour.min_value == 1109.0
+    assert (armour.roll_min, armour.roll_max) == (1032.0, 1482.0)
+    assert energy_shield.read_value == pytest.approx(247.2)
+    assert energy_shield.min_value == 222.0
+    assert (energy_shield.roll_min, energy_shield.roll_max) == (211.2, 300.0)
+    assert armour.enabled is energy_shield.enabled is True
+    assert "property.base_percentile" not in rows
+
+
+def test_quality_disabled_enchant_uses_zero_quality_for_defence_and_percentile(
+    tmp_path, monkeypatch,
+):
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(json.dumps({
+        "base_armour": {"test armour": {"ar": [100, 200]}}, "mods": [],
+    }), encoding="utf-8")
+    monkeypatch.setenv("POETORE_METADATA_PATH", str(metadata_path))
+    item = ParsedItem(
+        item_class="Body Armours", rarity="Rare", name="Test",
+        base_type="Test Armour", category="armour",
+        properties={"Armour": "150", "Quality": "+20%"},
+        modifiers=(ItemModifier(
+            "Quality does not increase Defences", kind="enchant",
+            ref="Quality does not increase Defences",
+            stat_id="enchant.stat_2677401098",
+        ),),
+    )
+
+    assert _base_defence_percentile(item, "Test Armour") == 50.0
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        armour = next(
+            row for row in resolve_trade_stat_filters(item)
+            if row.stat_id == "property.armour"
+        )
+    assert armour.read_value == 150.0
+    assert armour.min_value == 135.0
+
+
+def test_quality_disabled_enchant_does_not_inflate_physical_dps():
+    item = ParsedItem(
+        item_class="Two Hand Swords", rarity="Rare", name="Test",
+        base_type="Test Sword", category="weapon",
+        properties={
+            "Physical Damage": "100-200", "Attacks per Second": "1.00",
+            "Quality": "+10%",
+        },
+        modifiers=(ItemModifier(
+            "Quality does not increase Physical Damage", kind="enchant",
+            ref="Quality does not increase Physical Damage",
+        ),),
+    )
+    assert physical_dps_at_20_quality(item) == 150.0
+
+
 def test_cluster_jewel_item_level_is_normalized_to_awakened_bracket():
     item = parse_item_text("""Item Class: Cluster Jewels
 Rarity: Rare
@@ -953,6 +2222,176 @@ Item Level: 72
     assert (level.min_value, level.max_value) == (68.0, 74.0)
     query = build_search_query(item, "Large Cluster Jewel", filters, preset=PRESET_BASE)["query"]
     assert query["filters"]["misc_filters"]["filters"]["ilvl"] == {"min": 68.0, "max": 74.0}
+
+
+def test_cluster_base_option_enchant_does_not_treat_fixed_text_number_as_minimum():
+    item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: レア
+蛍光する石
+クラスタージュエル (中)
+--------
+アイテムレベル: 83
+--------
+パッシブスキルを4個追加する (enchant)
+ジュエルソケット1個がパッシブスキルに追加される (enchant)
+追加される通常パッシブスキルは付与: 範囲ダメージが10%増加する (enchant)
+""")
+    entries = ({
+        "id": "enchant.stat_3948993189|31",
+        "text": "追加される通常パッシブスキルは付与: 範囲ダメージが10%増加する",
+        "type": "enchant",
+    },)
+
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        filters = resolve_trade_stat_filters(
+            item, PRESET_BASE, "Medium Cluster Jewel",
+        )
+
+    area_damage = next(
+        row for row in filters
+        if row.stat_id == "enchant.stat_3948993189|31"
+    )
+    assert area_damage.enabled
+    assert area_damage.min_value is None
+    assert area_damage.max_value is None
+
+
+@pytest.mark.parametrize("percent", [0, 10, 20, 50])
+def test_cluster_base_passive_count_uses_cluster_rule_without_numeric_tolerance(percent):
+    item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: レア
+蛍光する石
+クラスタージュエル (中)
+--------
+アイテムレベル: 83
+--------
+パッシブスキルを4個追加する (enchant)
+ジュエルソケット1個がパッシブスキルに追加される (enchant)
+追加される通常パッシブスキルは付与: 範囲ダメージが10%増加する (enchant)
+""")
+
+    filters = resolve_trade_stat_filters(
+        item, PRESET_BASE, "Medium Cluster Jewel",
+    )
+    ranged = apply_search_range(filters, percent, item)
+    passive = next(
+        row for row in ranged
+        if row.stat_id == "enchant.stat_3086156145"
+    )
+
+    assert passive.ref == "Adds # Passive Skills"
+    assert (passive.min_value, passive.max_value, passive.enabled) == (
+        None, 5.0, True,
+    )
+    query = build_search_query(
+        item, "Medium Cluster Jewel", ranged, preset=PRESET_BASE,
+    )["query"]
+    sent = next(
+        row for group in query["stats"] for row in group["filters"]
+        if row["id"] == "enchant.stat_3086156145"
+    )
+    assert sent == {
+        "id": "enchant.stat_3086156145",
+        "value": {"max": 5.0},
+    }
+
+
+def test_rare_cluster_notables_are_visible_off_for_finished_and_absent_from_base():
+    item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: レア
+燦爛たる創傷
+クラスタージュエル (中)
+--------
+アイテムレベル: 83
+--------
+パッシブスキルを4個追加する (enchant)
+--------
+{ プレフィックスモッド「特殊な」 (ティア: 1) }
+パッシブスキルを1個追加: 優位の主張
+{ プレフィックスモッド「特殊な」 (ティア: 1) — ライフ }
+パッシブスキルを1個追加: 高くそびえる脅威
+""")
+
+    finished = resolve_trade_stat_filters(item, PRESET_FINISHED, "Medium Cluster Jewel")
+    notables = {
+        row.ref: row for row in finished
+        if row.ref in {
+            "1 Added Passive Skill is Assert Dominance",
+            "1 Added Passive Skill is Towering Threat",
+        }
+    }
+    assert set(notables) == {
+        "1 Added Passive Skill is Assert Dominance",
+        "1 Added Passive Skill is Towering Threat",
+    }
+    assert all(not row.enabled for row in notables.values())
+
+    base = resolve_trade_stat_filters(item, PRESET_BASE, "Medium Cluster Jewel")
+    assert not any(row.ref in notables for row in base)
+
+
+@pytest.mark.parametrize(("base_type", "trade_base_type", "passive_count"), [
+    ("クラスタージュエル (小)", "Small Cluster Jewel", 2),
+    ("クラスタージュエル (大)", "Large Cluster Jewel", 8),
+])
+def test_optimal_cluster_passive_count_does_not_include_next_integer(
+    base_type, trade_base_type, passive_count,
+):
+    item = parse_item_text(f"""アイテムクラス: ジュエル
+レアリティ: ノーマル
+{base_type}
+--------
+アイテムレベル: 84
+--------
+パッシブスキルを{passive_count}個追加する (enchant)
+""")
+    filters = resolve_trade_stat_filters(item)
+    passive = next(row for row in filters if row.ref == "Adds # Passive Skills")
+    assert (passive.min_value, passive.max_value, passive.enabled) == (
+        None, float(passive_count), True,
+    )
+
+    query = build_search_query(item, trade_base_type, filters)["query"]
+    sent = query["stats"][0]["filters"][0]
+    assert sent == {
+        "id": "enchant.stat_3086156145",
+        "value": {"max": float(passive_count)},
+    }
+
+    ranged = apply_search_range(filters, 2, item)
+    passive = next(row for row in ranged if row.ref == "Adds # Passive Skills")
+    assert (passive.min_value, passive.max_value) == (
+        None, float(passive_count),
+    )
+    ranged_query = build_search_query(item, trade_base_type, ranged)["query"]
+    assert ranged_query["stats"][0]["filters"][0] == {
+        "id": "enchant.stat_3086156145",
+        "value": {"max": float(passive_count)},
+    }
+
+
+def test_nine_passive_large_cluster_searches_nine_or_more():
+    item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: ノーマル
+クラスタージュエル (大)
+--------
+アイテムレベル: 84
+--------
+パッシブスキルを9個追加する (enchant)
+""")
+    filters = resolve_trade_stat_filters(item)
+    passive = next(row for row in filters if row.ref == "Adds # Passive Skills")
+    assert (passive.min_value, passive.max_value, passive.enabled) == (9.0, None, True)
+
+    query = build_search_query(item, "Large Cluster Jewel", filters)["query"]
+    assert query["stats"][0]["filters"][0] == {
+        "id": "enchant.stat_3086156145",
+        "value": {"min": 9.0},
+    }
+
+    ranged = apply_search_range(filters, 50, item)
+    passive = next(row for row in ranged if row.ref == "Adds # Passive Skills")
+    assert (passive.min_value, passive.max_value) == (9.0, None)
 
 
 @pytest.mark.parametrize(("base_type", "english_base"), [
@@ -1001,7 +2440,7 @@ def test_quality_sockets_and_item_states_are_added_to_finished_search():
 Kraken Pelt
 Sacred Chainmail
 --------
-品質: +30% (augmented)
+品質: +21% (augmented)
 アーマー: 2940 (augmented)
 ソケット: W-W-W-R-B-B
 --------
@@ -1014,18 +2453,17 @@ Sacred Chainmail
     with patch("src.poetore.trade._trade_stat_entries", return_value=()):
         filters = resolve_trade_stat_filters(item)
     details = {row.stat_id: (row.min_value, row.enabled) for row in filters}
-    assert details["property.quality"] == (30.0, True)
-    assert details["property.sockets"] == (6.0, True)
-    assert details["property.links"] == (6.0, True)
-    assert details["property.white_sockets"] == (3.0, True)
+    assert details["property.quality"] == (21.0, True)
+    assert "property.sockets" not in details
+    assert details["property.links"] == (6.0, False)
+    assert "property.white_sockets" not in details
     query = build_search_query(item, "Sacred Chainmail", filters)["query"]
     misc = query["filters"]["misc_filters"]["filters"]
-    assert misc["quality"] == {"min": 30.0}
+    assert misc["quality"] == {"min": 21.0}
     assert "mirrored" not in misc
     assert "corrupted" not in misc
     assert "split" not in misc
-    sockets = query["filters"]["socket_filters"]["filters"]
-    assert sockets == {"sockets": {"min": 6, "w": 3}, "links": {"min": 6}}
+    assert "socket_filters" not in query["filters"]
     assert query["stats"][0]["filters"] == []
 
     non_mirrored = build_search_query(
@@ -1160,7 +2598,7 @@ def test_split_uncorrupted_item_defaults_to_uncorrupted_and_includes_split():
     assert "split" not in misc
 
 
-def test_quality_20_and_non_six_socket_count_are_visible_but_not_preselected():
+def test_quality_20_and_non_six_link_count_is_visible_but_not_preselected():
     item = parse_item_text(ITEM.replace(
         "Physical Damage: 108-181 (augmented)",
         "Quality: +20% (augmented)\nSockets: R-G B\nPhysical Damage: 108-181 (augmented)",
@@ -1169,13 +2607,12 @@ def test_quality_20_and_non_six_socket_count_are_visible_but_not_preselected():
         filters = resolve_trade_stat_filters(item)
     details = {row.stat_id: row for row in filters}
     assert details["property.quality"].enabled is False
-    assert details["property.sockets"].min_value == 3.0
-    assert details["property.sockets"].enabled is False
+    assert "property.sockets" not in details
     assert details["property.links"].min_value == 2.0
-    assert details["property.links"].enabled is True
+    assert details["property.links"].enabled is False
 
 
-def test_armour_also_enables_general_life_pseudo():
+def test_armour_single_life_mod_enables_awakened_style_life_pseudo():
     item = parse_item_text(ITEM.replace("Two Hand Swords", "Body Armours").replace(
         "Physical Damage: 108-181 (augmented)\nAttacks per Second: 1.74 (augmented)",
         "Armour: 1000",
@@ -1186,7 +2623,27 @@ def test_armour_also_enables_general_life_pseudo():
     assert enabled["pseudo.pseudo_total_life"] == 72.0
 
 
-def test_accessory_enables_aggregated_life_and_resistance_pseudos():
+def test_weapon_strength_without_life_mod_does_not_create_life_pseudo():
+    item = parse_item_text("""アイテムクラス: 両手斧
+レアリティ: レア
+恐怖の分割
+ヴァールアックス
+--------
+物理ダメージ: 765-1316 (augmented)
+クリティカル率: 5.00%
+秒間アタック回数: 1.38 (augmented)
+--------
+アイテムレベル: 89
+--------
+{ サフィックスモッド 「結社の」 (ティア: 1) — アタック, 能力値 }
+筋力および器用さ +25(25-28)
+    """)
+    filters = {row.stat_id: row for row in resolve_trade_stat_filters(item)}
+    assert "pseudo.pseudo_total_life" not in filters
+    assert filters["property.physical_dps"].enabled is True
+
+
+def test_accessory_enables_awakened_style_primary_pseudos():
     item = parse_item_text("""Item Class: Rings
 Rarity: Rare
 Test Ring
@@ -1201,15 +2658,51 @@ Item Level: 85
 """)
     with patch("src.poetore.trade._trade_stat_entries", return_value=()):
         filters = resolve_trade_stat_filters(item)
-    enabled = {row.stat_id: row.min_value for row in filters if row.enabled}
-    assert enabled == {
-        "pseudo.pseudo_total_life": 63.0,
-        "pseudo.pseudo_total_elemental_resistance": 63.0,
-        "pseudo.pseudo_total_chaos_resistance": 9.0,
-    }
+    details = {row.stat_id: row for row in filters}
+    assert details["pseudo.pseudo_total_life"].enabled
+    assert details["pseudo.pseudo_total_chaos_resistance"].enabled
+    elemental = details["pseudo.pseudo_total_elemental_resistance"]
+    assert elemental.min_value == 63.0
+    assert elemental.enabled
+    assert elemental.source_contributions == (30.0, 40.0)
 
 
-def test_accessory_finished_filters_use_requested_awakened_based_order():
+def test_pseudo_source_contributions_include_attribute_conversion():
+    item = parse_item_text("""Item Class: Amulets
+Rarity: Rare
+Test Amulet
+Onyx Amulet
+--------
+Item Level: 85
+--------
++70 to maximum Life
++60 to Strength
+""")
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        rows = {row.stat_id: row for row in resolve_trade_stat_filters(item)}
+    life = rows["pseudo.pseudo_total_life"]
+    assert life.source_texts == ("+70 to maximum Life", "+60 to Strength")
+    assert life.source_contributions == (70.0, 30.0)
+
+
+def test_attributes_alone_do_not_create_life_or_mana_pseudos():
+    item = parse_item_text("""Item Class: Amulets
+Rarity: Rare
+Test Amulet
+Onyx Amulet
+--------
+Item Level: 85
+--------
++60 to Strength
++60 to Intelligence
+""")
+
+    rows = {row.stat_id: row for row in resolve_trade_stat_filters(item)}
+    assert "pseudo.pseudo_total_life" not in rows
+    assert "pseudo.pseudo_total_mana" not in rows
+
+
+def test_accessory_finished_filters_use_affix_groups_and_source_order():
     item = parse_item_text("""Item Class: Amulets
 Rarity: Rare
 Test Amulet
@@ -1227,22 +2720,12 @@ Item Level: 85
 """)
     filters = resolve_trade_stat_filters(item)
     ids = [row.stat_id for row in filters]
-    expected = [
-        "pseudo.pseudo_total_life",
-        "pseudo.pseudo_total_energy_shield",
-        "pseudo.pseudo_total_elemental_resistance",
-        "pseudo.pseudo_total_chaos_resistance",
-        "pseudo.pseudo_total_all_attributes",
-        "pseudo.pseudo_total_mana",
-        "pseudo.pseudo_total_cast_speed",
-    ]
+    # Plain copy has no affix headers, but Life/Mana are explicitly assigned to
+    # the Prefix group. Remaining pseudos stay in source order under Other.
+    expected = ["pseudo.pseudo_total_mana"]
     assert [stat_id for stat_id in ids if stat_id in expected] == expected
     enabled = {row.stat_id for row in filters if row.enabled}
-    assert enabled & set(expected) == {
-        "pseudo.pseudo_total_life",
-        "pseudo.pseudo_total_elemental_resistance",
-        "pseudo.pseudo_total_chaos_resistance",
-    }
+    assert not enabled & set(expected)
 
 
 def test_quiver_category_search_uses_all_quivers():
@@ -1278,23 +2761,10 @@ def test_pseudo_mods_cover_attributes_resources_speed_damage_crit_and_recovery()
 マナ自動回復レートが40%増加する
 """)
     filters = {row.stat_id: row for row in resolve_trade_stat_filters(item)}
-    expected = {
-        "pseudo.pseudo_total_all_attributes": 18.0,
-        "pseudo.pseudo_total_life": 9.0,
-        "pseudo.pseudo_total_mana": 63.0,
-        "pseudo.pseudo_total_energy_shield": 36.0,
-        "pseudo.pseudo_total_cast_speed": 10.0,
-        "pseudo.pseudo_increased_spell_damage": 27.0,
-        "pseudo.pseudo_increased_fire_damage": 22.0,
-        "pseudo.pseudo_global_critical_strike_multiplier": 31.0,
-        "pseudo.pseudo_increased_movement_speed": 9.0,
-        "pseudo.pseudo_total_life_regen": 13.0,
-        "pseudo.pseudo_increased_mana_regen": 36.0,
-    }
+    expected = {"pseudo.pseudo_total_mana": 63.0}
     assert {stat_id: filters[stat_id].min_value for stat_id in expected} == expected
-    assert filters["pseudo.pseudo_total_life"].enabled is True
-    assert all(not filters[stat_id].enabled for stat_id in expected if stat_id != "pseudo.pseudo_total_life")
-    assert all(row.kind == "pseudo" for row in filters.values())
+    assert "pseudo.pseudo_total_life" not in filters
+    assert all(not filters[stat_id].enabled for stat_id in expected)
 
 
 def _pseudo_test_item(modifiers, category="accessory"):
@@ -1302,6 +2772,27 @@ def _pseudo_test_item(modifiers, category="accessory"):
         item_class="Rings", rarity="Rare", name="Test", base_type="Ring",
         category=category, item_level=85, modifiers=tuple(modifiers),
     )
+
+
+def test_single_direct_attribute_mod_does_not_add_redundant_pseudo_in_poe1():
+    for ref, pseudo_id in (
+        ("+# to Strength", "pseudo.pseudo_total_strength"),
+        ("+# to Dexterity", "pseudo.pseudo_total_dexterity"),
+        ("+# to Intelligence", "pseudo.pseudo_total_intelligence"),
+    ):
+        item = _pseudo_test_item((ItemModifier("", (33,), ref=ref),))
+        assert pseudo_id not in {
+            row.stat_id for row in resolve_trade_stat_filters(item)
+        }
+
+
+def test_compound_attribute_source_keeps_useful_pseudo_in_poe1():
+    item = _pseudo_test_item((
+        ItemModifier("", (33,), ref="+# to Strength"),
+        ItemModifier("", (20,), ref="+# to all Attributes"),
+    ))
+    ids = {row.stat_id for row in resolve_trade_stat_filters(item)}
+    assert "pseudo.pseudo_total_strength" in ids
 
 
 def test_pseudo_replaces_more_general_damage_and_crit_groups():
@@ -1333,12 +2824,10 @@ def test_new_relational_pseudos_parse_from_japanese_detail_copy():
 燃焼ダメージが40%増加する
 """)
     rows = {row.stat_id: row for row in resolve_trade_stat_filters(item)}
-    assert rows["pseudo.pseudo_critical_strike_chance_for_spells"].min_value == 22.0
-    assert rows["pseudo.pseudo_increased_elemental_damage_with_attack_skills"].min_value == 27.0
-    assert rows["pseudo.pseudo_increased_burning_damage"].min_value == 36.0
+    assert not any(row.kind == "pseudo" for row in rows.values())
 
 
-def test_pseudo_group_output_is_independent_of_modifier_input_order():
+def test_pseudo_group_values_are_independent_of_modifier_input_order():
     modifiers = (
         ItemModifier("", (20,), ref="+#% to Fire Resistance"),
         ItemModifier("", (35,), ref="+#% to Cold Resistance"),
@@ -1349,14 +2838,17 @@ def test_pseudo_group_output_is_independent_of_modifier_input_order():
     )
     forward = resolve_trade_stat_filters(_pseudo_test_item(modifiers))
     backward = resolve_trade_stat_filters(_pseudo_test_item(reversed(modifiers)))
-    signature = lambda rows: tuple((row.stat_id, row.min_value, row.enabled) for row in rows)
+    signature = lambda rows: {
+        row.stat_id: (row.min_value, row.enabled) for row in rows
+    }
     assert signature(forward) == signature(backward)
     ids = {row.stat_id for row in forward}
-    assert ids & {
+    assert not ids & {
         "pseudo.pseudo_total_fire_resistance",
         "pseudo.pseudo_total_cold_resistance",
         "pseudo.pseudo_total_lightning_resistance",
-    } == {"pseudo.pseudo_total_cold_resistance"}
+    }
+    assert "pseudo.pseudo_total_elemental_resistance" in ids
     assert "pseudo.pseudo_total_intelligence" not in ids
 
 
@@ -1385,6 +2877,33 @@ def test_crafted_chaos_only_is_hidden_but_mixed_sources_are_aggregated():
     )}
     assert rows["pseudo.pseudo_total_chaos_resistance"].min_value == 32.0
     assert rows["pseudo.pseudo_total_chaos_resistance"].enabled is True
+
+
+def test_aggregated_resistances_keep_exact_read_values_from_item():
+    item = parse_item_text("""アイテムクラス: 鎧
+レアリティ: レア
+復讐の殻
+黄昏のレガリア
+--------
+アイテムレベル: 86
+--------
+{ サフィックスモッド 「雷の」 (ティア: 2) — 元素, 雷, 耐性 }
+雷耐性 +45(42-45)%
+{ サフィックスモッド 「排出の」 (ティア: 4) — 混沌, 耐性 }
+混沌耐性 +19(16-20)%
+{ マスタークラフト サフィックスモッド 「製作の」 — 元素, 冷気, 混沌, 耐性 }
+冷気と混沌耐性 +13(13-15)%
+""")
+    rows = {row.stat_id: row for row in resolve_trade_stat_filters(item)}
+
+    elemental = rows["pseudo.pseudo_total_elemental_resistance"]
+    chaos = rows["pseudo.pseudo_total_chaos_resistance"]
+    assert (elemental.min_value, elemental.read_value) == (52.0, 58.0)
+    assert (chaos.min_value, chaos.read_value) == (28.0, 32.0)
+
+    exact_rows = {row.stat_id: row for row in apply_search_range(tuple(rows.values()), 0, item)}
+    assert exact_rows["pseudo.pseudo_total_elemental_resistance"].min_value == 58.0
+    assert exact_rows["pseudo.pseudo_total_chaos_resistance"].min_value == 32.0
 
 
 def test_unresolved_modifier_does_not_remove_unrelated_pseudos():
@@ -1424,16 +2943,123 @@ Item Level: 70
     )
     with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
         filters = resolve_trade_stat_filters(item)
-    assert filters == (TradeStatFilter(
+    assert filters[0] == TradeStatFilter(
         "explicit.life", "+40(30-50) to maximum Life", 38.0, "explicit", True,
         selection_reason="ユニークの可変Modが3個以下のため自動選択",
-    ),)
+    )
+    assert filters[1].stat_id == "explicit.fire"
+    assert filters[1].hidden_reason == "ユニーク固定値のため初期非表示"
     query = build_search_query(item, "Gold Amulet", filters, trade_name="The Example")["query"]
     assert query["name"] == "The Example"
     assert query["type"] == "Gold Amulet"
     assert query["stats"][0]["filters"] == [
         {"id": "explicit.life", "value": {"min": 38.0}},
     ]
+
+
+def test_unique_weapon_shows_aggregated_performance_properties():
+    item = parse_item_text("""アイテムクラス: ルーンの短剣
+レアリティ: ユニーク
+ビノの包丁
+屠殺のナイフ
+--------
+ルーンの短剣
+物理ダメージ: 152-319 (augmented)
+クリティカル率: 12.32% (augmented)
+秒間アタック回数: 1.40
+武器攻撃距離：1 メートル
+--------
+装備要求:
+レベル: 65
+器用さ: 81 (unmet)
+知性: 117
+--------
+ソケット: W
+--------
+アイテムレベル: 84
+--------
+{ 暗黙モッド — クリティカル }
+グローバルクリティカル率が45(40-45)%増加する
+--------
+{ ユニークモッド — ダメージ, 物理, アタック }
+142(140-155)から233(210-235)の物理ダメージを追加する
+{ ユニークモッド — 混沌, 耐性 }
+混沌耐性 +29(17-29)%
+{ ユニークモッド — ダメージ, クリティカル }
+グローバルクリティカルダメージ倍率 +15(15-25)%
+{ ユニークモッド — アタック, クリティカル }
+クリティカル率が45(40-50)%増加する
+{ ユニークモッド — ライフ, 混沌, 状態異常 }
+毒状態の敵を倒すと3m以内の敵に毒を付与し
+3m以内のプレイヤーと味方は毒の持続時間の間毎秒400ライフを自動回復する
+--------
+それを毒と呼ぶことはそもそもそれが
+食べられるものだったということになる。
+""")
+    filters = resolve_trade_stat_filters(
+        item, trade_base_type="Slaughter Knife", trade_name="Bino's Kitchen Knife",
+    )
+    properties = {
+        row.stat_id: row for row in filters if row.kind == "property"
+    }
+
+    assert set(properties) >= {
+        "property.physical_dps", "property.aps", "property.crit",
+    }
+    assert properties["property.physical_dps"].enabled is True
+    assert properties["property.aps"].enabled is False
+    assert properties["property.crit"].enabled is False
+    # 品質表示がない武器は既存仕様どおり、比較可能な品質20%時へ正規化する。
+    assert properties["property.physical_dps"].read_value == pytest.approx(395.64)
+    assert not any(
+        row.text == "142(140-155)から233(210-235)の物理ダメージを追加する"
+        for row in filters
+    )
+
+    query = build_search_query(
+        item, "Slaughter Knife", filters, trade_name="Bino's Kitchen Knife",
+    )["query"]
+    assert query["filters"]["weapon_filters"]["filters"]["pdps"] == {
+        "min": properties["property.physical_dps"].min_value,
+    }
+
+
+def test_corrupted_unique_hidden_fixed_mutation_can_be_selected_exactly():
+    item = parse_item_text("""アイテムクラス: 盾
+レアリティ: ユニーク
+ラスピスの球体
+チタンスピリットシールド
+--------
+アイテムレベル: 83
+--------
+{ ユニークモッド — ダメージ, キャスター }
+プレイヤーの最大ライフ100ごとにスペルダメージが4(3)%増加する
+--------
+コラプト状態
+""")
+    filters = resolve_trade_stat_filters(
+        item, trade_base_type="Titanium Spirit Shield",
+        trade_name="Rathpith Globe",
+    )
+    spell_damage = next(
+        row for row in filters
+        if row.stat_id == "explicit.stat_3491815140"
+    )
+
+    assert spell_damage.hidden_reason == "ユニーク固定値のため初期非表示"
+    assert spell_damage.enabled is False
+    assert spell_damage.min_value == 4
+    assert spell_damage.max_value == 4
+
+    selected = replace(spell_damage, enabled=True)
+    query = build_search_query(
+        item, "Titanium Spirit Shield", (selected,),
+        trade_name="Rathpith Globe",
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": "explicit.stat_3491815140",
+        "value": {"min": 4, "max": 4},
+    }]
 
 
 def test_unique_with_more_than_three_variable_mods_does_not_preselect_all():
@@ -1459,6 +3085,162 @@ Item Level: 70
         filters = resolve_trade_stat_filters(item)
     assert len(filters) == 4
     assert not any(row.enabled for row in filters)
+
+
+def test_unique_pseudo_requires_two_explicit_sources_and_starts_off():
+    item = ParsedItem(
+        item_class="Rings", rarity="Unique", name="Test Unique",
+        base_type="Ring", category="accessory",
+        modifiers=(
+            ItemModifier("+30% to Fire Resistance", (30.0,), ref="+#% to Fire Resistance"),
+            ItemModifier(
+                "+20% to Cold and Lightning Resistances", (20.0,),
+                ref="+#% to Cold and Lightning Resistances",
+            ),
+        ),
+    )
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        rows = {row.stat_id: row for row in resolve_trade_stat_filters(item)}
+
+    elemental = rows["pseudo.pseudo_total_elemental_resistance"]
+    assert elemental.read_value == 70.0
+    assert elemental.enabled is False
+    assert len(elemental.source_indexes) == 2
+    default_query = build_search_query(
+        item, "Ring", tuple(rows.values()), trade_name="Test Unique",
+    )["query"]
+    assert default_query["stats"] == [{"type": "and", "filters": []}]
+    selected = tuple(
+        replace(row, enabled=row.stat_id == elemental.stat_id)
+        for row in rows.values()
+    )
+    selected_query = build_search_query(
+        item, "Ring", selected, trade_name="Test Unique",
+    )["query"]
+    assert selected_query["stats"][0]["filters"] == [{
+        "id": elemental.stat_id, "value": {"min": 63.0},
+    }]
+
+
+def test_corrupted_unique_pseudo_accepts_explicit_and_corrupted_implicit_sources():
+    modifiers = (
+        ItemModifier("+30% to Fire Resistance", (30.0,), ref="+#% to Fire Resistance"),
+        ItemModifier(
+            "+20% to Cold Resistance", (20.0,), kind="implicit",
+            ref="+#% to Cold Resistance", generation="corrupted",
+        ),
+    )
+    plain = ParsedItem(
+        item_class="Rings", rarity="Unique", name="Test Unique",
+        base_type="Ring", category="accessory", modifiers=modifiers,
+    )
+    corrupted = replace(plain, flags=("corrupted",))
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        plain_ids = {row.stat_id for row in resolve_trade_stat_filters(plain)}
+        rows = {row.stat_id: row for row in resolve_trade_stat_filters(corrupted)}
+
+    assert "pseudo.pseudo_total_elemental_resistance" not in plain_ids
+    assert rows["pseudo.pseudo_total_elemental_resistance"].enabled is False
+
+
+def test_unique_pseudo_keeps_compound_elemental_chaos_resistance_filter():
+    modifiers = (
+        ItemModifier(
+            "+20% to Fire and Chaos Resistances", (20.0,),
+            ref="+#% to Fire and Chaos Resistances", stat_id="explicit.compound",
+        ),
+        ItemModifier(
+            "+30% to Cold Resistance", (30.0,),
+            ref="+#% to Cold Resistance", stat_id="explicit.cold",
+        ),
+    )
+    item = ParsedItem(
+        item_class="Rings", rarity="Unique", name="Test Unique",
+        base_type="Ring", category="accessory", modifiers=modifiers,
+    )
+    entries = (
+        {"id": "explicit.compound", "text": "+#% to Fire and Chaos Resistances", "type": "explicit"},
+        {"id": "explicit.cold", "text": "+#% to Cold Resistance", "type": "explicit"},
+    )
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries), patch(
+        "src.poetore.trade.unique_fixed_stats", return_value=None,
+    ):
+        rows = {row.stat_id: row for row in resolve_trade_stat_filters(item)}
+
+    assert "pseudo.pseudo_total_elemental_resistance" in rows
+    assert "explicit.compound" in rows
+
+
+@pytest.mark.parametrize(("rarity", "flags", "properties", "expected_tag"), [
+    ("Unique", ("corrupted",), {}, "corrupted"),
+    ("Unique", (), {"Quality": "+20%"}, "catalyst"),
+    ("Rare", ("mirrored",), {}, "reflecting"),
+])
+def test_special_crafting_keeps_unique_numeric_stat_visible(
+    rarity, flags, properties, expected_tag,
+):
+    modifier = ItemModifier(
+        "+30% to Fire Resistance", (30.0,), ref="+#% to Fire Resistance",
+        stat_id="explicit.resistance", roll_min=20.0, roll_max=40.0,
+    )
+    item = ParsedItem(
+        item_class="Rings", rarity=rarity, name="Test Unique",
+        base_type="Ring", category="accessory", properties=properties,
+        modifiers=(modifier,), flags=flags,
+    )
+    entries = ({
+        "id": "explicit.resistance", "text": "+#% to Fire Resistance", "type": "explicit",
+    },)
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries), patch(
+        "src.poetore.trade.unique_fixed_stats", return_value=frozenset({modifier.ref}),
+    ):
+        row = next(row for row in resolve_trade_stat_filters(item) if row.stat_id == modifier.stat_id)
+
+    assert row.hidden_reason == ""
+    assert expected_tag in row.provenance_tags
+
+
+def test_detailed_catalyst_increase_reaches_exact_trade_query():
+    item = parse_item_text("""アイテムクラス: 指輪
+レアリティ: ユニーク
+ファウルボーン 皆を繋ぐもの
+鉄の指輪
+--------
+品質 (防御力モッド): +10% (augmented)
+--------
+アイテムレベル: 71
+--------
+{ ファウルボーンユニークモッド — 防御 - 10%増加 }
+グローバル防御力が25(10-30)%増加する
+""")
+    entry = {
+        "id": "explicit.stat_1389153006",
+        "text": "グローバル防御力が#%増加する",
+        "type": "explicit",
+    }
+    with patch("src.poetore.trade._trade_stat_entries", return_value=(entry,)):
+        filters = resolve_trade_stat_filters(
+            item, trade_base_type="Iron Ring", trade_name="Le Heup of All",
+        )
+
+    defence = next(row for row in filters if row.stat_id == entry["id"])
+    exact = apply_search_range((defence,), 0, item)
+    assert (
+        defence.read_value,
+        defence.roll_min,
+        defence.roll_max,
+        exact[0].min_value,
+    ) == (27, 11, 33, 27)
+    query = build_search_query(
+        item,
+        trade_base_type="Iron Ring",
+        trade_name="Le Heup of All",
+        stat_filters=exact,
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": entry["id"],
+        "value": {"min": 27},
+    }]
 
 
 def test_watchers_eye_uses_awakened_fixed_stats_and_keeps_unscalable_variant():
@@ -1498,7 +3280,8 @@ Prismatic Jewel
     ]
     assert filters[0].min_value == 6.0
     assert filters[1].min_value is None
-    assert all(row.enabled for row in filters)
+    assert all(row.enabled for row in filters if not row.hidden_reason)
+    assert all(not row.enabled for row in filters if row.hidden_reason)
 
 
 def test_unidentified_unique_query_requires_unidentified_state():
@@ -1530,6 +3313,49 @@ def test_unique_candidates_come_from_official_item_data():
         "src.poetore.trade._request_json", return_value=(payload, {}),
     ):
         assert unique_candidates("Gold Amulet") == ("Another Example", "The Example")
+
+
+def test_unique_candidate_details_include_official_icon_urls():
+    payload = {"result": [{"entries": [
+        {"name": "The Example", "type": "Gold Amulet", "flags": {"unique": True}},
+    ]}]}
+    with patch("src.poetore.trade._item_entries_cache", None), patch(
+        "src.poetore.trade._request_json", return_value=(payload, {}),
+    ), patch(
+        "src.poetore.trade.unique_icon_url",
+        return_value="https://web.poecdn.com/example.png",
+    ), patch(
+        "src.poetore.trade._japanese_trade_item_name",
+        return_value="日本語の例",
+    ):
+        assert unique_candidate_details("Gold Amulet") == (
+            UniqueCandidate(
+                "The Example",
+                "https://web.poecdn.com/example.png",
+                "日本語の例",
+            ),
+        )
+
+
+def test_unique_candidate_details_fall_back_to_wiki_icon_and_english_name():
+    payload = {"result": [{"entries": [
+        {"name": "The Example", "type": "Gold Amulet", "flags": {"unique": True}},
+    ]}]}
+    with patch("src.poetore.trade._item_entries_cache", None), patch(
+        "src.poetore.trade._request_json", return_value=(payload, {}),
+    ), patch(
+        "src.poetore.trade.unique_icon_url", return_value=None,
+    ), patch(
+        "src.poetore.trade._japanese_trade_item_name", return_value=None,
+    ):
+        assert unique_candidate_details("Gold Amulet") == (
+            UniqueCandidate(
+                "The Example",
+                "https://www.poewiki.net/wiki/Special:Redirect/file/"
+                "The_Example_inventory_icon.png",
+                "The Example",
+            ),
+        )
 
 
 def test_unique_variants_preserve_trade_discriminator():
@@ -1600,13 +3426,119 @@ Iron Ring
         "explicit.stat_3917489142",
         "explicit.stat_1389153006",
     }
-    assert all(row.enabled for row in filters)
+    assert all(row.enabled for row in filters if not row.hidden_reason)
+    assert all(not row.enabled for row in filters if row.hidden_reason)
     query = build_search_query(
         item, "Iron Ring", trade_name=item.name,
         stat_filters=filters,
     )["query"]
     assert query["name"] == "Le Heup of All"
     assert "foulborn_item" not in query["filters"]["misc_filters"]["filters"]
+
+
+def test_japanese_vestigial_unique_enables_implicit_and_uses_state_filter():
+    item = parse_item_text("""アイテムクラス: 靴
+レアリティ: ユニーク
+ララケシュの短気
+痕跡 リベットブーツ
+--------
+アーマー: 65
+エナジーシールド: 14
+--------
+装備要求:
+レベル: 40
+筋力: 35
+知性: 35
+--------
+ソケット: B
+--------
+アイテムレベル: 86
+--------
+{ 痕跡暗黙モッド — 元素, 火, 状態異常 }
+近くの敵は焦げ状態になる
+(Scorch: 焦げた敵は元素耐性が-10%される)
+--------
+{ ユニークモッド — 元素, 冷気, 耐性 }
+冷気耐性 +21(15-25)%
+{ ユニークモッド — 混沌, 耐性 }
+混沌耐性 +20(15-25)%
+{ ユニークモッド — スピード }
+移動スピードが18(15-25)%増加する
+{ ユニークモッド — 物理, 状態異常 }
+穢れた血を付与されることがない
+{ ユニークモッド }
+パワーチャージを最大数持っているとして見なされる
+--------
+不死者にとって、
+時代と瞬間に違いはあるのか？
+--------
+メモ: ~b/o 10 mirror
+""")
+    filters = resolve_trade_stat_filters(item)
+    scorch = next(
+        row for row in filters
+        if row.stat_id == "implicit.stat_3733114005"
+    )
+
+    assert item.base_type == "リベットブーツ"
+    assert scorch.generation == "vestigial"
+    assert scorch.enabled
+    query = build_search_query(
+        item, "Riveted Boots", trade_name="Ralakesh's Impatience",
+        stat_filters=filters,
+    )["query"]
+    assert query["name"] == "Ralakesh's Impatience"
+    misc = query["filters"]["misc_filters"]["filters"]
+    assert "vestigial" not in misc
+    assert next(
+        row for row in query["stats"][0]["filters"]
+        if row["id"] == "implicit.stat_3733114005"
+    )["value"] == {}
+
+    plain = parse_item_text(item.raw_text.replace("痕跡 リベットブーツ", "リベットブーツ"))
+    plain_misc = build_search_query(
+        plain, "Riveted Boots", trade_name="Ralakesh's Impatience",
+    )["query"]["filters"]["misc_filters"]["filters"]
+    assert plain_misc["vestigial"] == {"option": "false"}
+
+
+def test_foulborn_unique_keeps_fixed_replacement_mod_as_enabled_filter():
+    item = parse_item_text("""アイテムクラス: 鉤爪
+レアリティ: ユニーク
+ファウルボーン 思考と動作の手
+帝国の鉤爪
+--------
+アイテムレベル: 85
+--------
+{ ユニークモッド — 能力値 }
+知性が12(8-12)%増加する
+{ ユニークモッド — 能力値 }
+器用さが11(8-12)%増加する
+{ ファウルボーンユニークモッド }
+知性25ごとに命中力が3%増加する
+""")
+
+    filters = resolve_trade_stat_filters(item)
+    accuracy = next(
+        row for row in filters
+        if row.stat_id == "explicit.stat_4106889136"
+    )
+
+    assert accuracy.text == "知性25ごとに命中力が3%増加する"
+    assert accuracy.min_value == 3
+    assert accuracy.read_value == 3
+    assert accuracy.generation == "foulborn"
+    assert accuracy.enabled
+
+    query = build_search_query(
+        item, "Imperial Claw", trade_name="Hand of Thought and Motion",
+        stat_filters=filters,
+    )["query"]
+    query_filter = next(
+        row for row in query["stats"][0]["filters"]
+        if row["id"] == "explicit.stat_4106889136"
+    )
+    assert query_filter["value"] == {"min": 3}
 
 
 def test_foulborn_unique_localizes_name_for_japanese_trade_link():
@@ -1748,7 +3680,7 @@ Onyx Amulet
     assert by_query_id["explicit.stat_752930724"] == {"max": -7.0}
 
 
-def test_replica_dragonfang_flavour_text_is_not_an_unresolved_modifier():
+def test_replica_dragonfang_random_skill_is_visible_and_searchable():
     item = parse_item_text("""アイテムクラス: アミュレット
 レアリティ: ユニーク
 Replica Dragonfang's Flight
@@ -1757,7 +3689,7 @@ Onyx Amulet
 アイテムレベル: 83
 --------
 { ユニークモッド }
-全てのブライト(ファイヤーボール-ディバインブラスト)ジェムのレベル +3
+全てのブレードブラスト(ファイヤーボール-マナインフューズスタッフ)ジェムのレベル +3
 { ユニークモッド }
 スキルのリザーブ効率が6(5-10)%増加する
 --------
@@ -1765,9 +3697,131 @@ Onyx Amulet
 何かが起こると警告はされていましたが……」
 ―管理者クォトラ
 """)
-    assert unresolved_modifier_warnings(item) == (
-        "全てのブライト(ファイヤーボール-ディバインブラスト)ジェムのレベル +3",
+    filters = resolve_trade_stat_filters(item)
+    skill = next(
+        row for row in filters
+        if row.stat_id == "explicit.indexable_skill_217"
     )
+    assert skill.text.startswith("全てのブレードブラスト")
+    assert skill.read_value == 3
+    assert skill.min_value == 2
+    assert skill.enabled is True
+    assert skill.hidden_reason == ""
+    assert unresolved_modifier_warnings(item, filters) == ()
+
+    query = build_search_query(
+        item, "Onyx Amulet", trade_name="Replica Dragonfang's Flight",
+        stat_filters=filters,
+    )["query"]
+    query_filters = [
+        row for group in query["stats"] for row in group["filters"]
+    ]
+    assert {
+        "id": "explicit.indexable_skill_217",
+        "value": {"min": 2.0},
+    } in query_filters
+
+
+def test_forbidden_shako_random_supports_are_visible_and_searchable():
+    for name, trade_name in (
+        ("禁断のシャコー帽", "Forbidden Shako"),
+        ("禁断のシャコー帽（レプリカ）", "Replica Forbidden Shako"),
+    ):
+        item = parse_item_text(f"""アイテムクラス: 兜
+レアリティ: ユニーク
+{name}
+グレートクラウン
+--------
+アイテムレベル: 85
+--------
+{{ ユニークモッド }}
+ソケットされたジェムはレベル8(1-10)クリティカルダメージ増加によりサポートされる
+{{ ユニークモッド }}
+ソケットされたジェムはレベル29(25-35)ミニオンスピードによりサポートされる
+{{ ユニークモッド — 能力値 }}
+全ての能力値 +29(25-30)
+""")
+        filters = resolve_trade_stat_filters(item, trade_name=trade_name)
+        by_id = {row.stat_id: row for row in filters}
+
+        low = by_id["explicit.indexable_support_67"]
+        high = by_id["explicit.indexable_support_62"]
+        assert (low.read_value, low.min_value, low.enabled) == (8, 7, True), name
+        assert (high.read_value, high.min_value, high.enabled) == (29, 28, True), name
+        assert unresolved_modifier_warnings(item, filters) == (), name
+
+        query = build_search_query(
+            item, "Great Crown", trade_name=trade_name,
+            stat_filters=filters,
+        )["query"]
+        query_filters = [
+            row for group in query["stats"] for row in group["filters"]
+        ]
+        assert {
+            "id": "explicit.indexable_support_67",
+            "value": {"min": 7.0},
+        } in query_filters, name
+        assert {
+            "id": "explicit.indexable_support_62",
+            "value": {"min": 28.0},
+        } in query_filters, name
+
+
+def test_forbidden_shako_advanced_japanese_support_names_are_searchable():
+    item = parse_item_text("""アイテムクラス: 兜
+レアリティ: ユニーク
+禁断のシャコー帽
+グレートクラウン
+--------
+アイテムレベル: 85
+--------
+{ ユニークモッド — ジェム }
+ソケットされたジェムはレベル10(1-10)投射物追加(グレーター投射物追加-聖別)によりサポートされる
+{ ユニークモッド — ジェム }
+ソケットされたジェムはレベル25(25-35)元素伝染(グレーター投射物追加-聖別)によりサポートされる
+""")
+    filters = resolve_trade_stat_filters(item, trade_name="Forbidden Shako")
+    by_id = {row.stat_id: row for row in filters}
+
+    assert (by_id["explicit.indexable_support_55"].read_value,
+            by_id["explicit.indexable_support_55"].min_value,
+            by_id["explicit.indexable_support_55"].enabled) == (10, 10, True)
+    assert (by_id["explicit.indexable_support_89"].read_value,
+            by_id["explicit.indexable_support_89"].min_value,
+            by_id["explicit.indexable_support_89"].enabled) == (25, 24, True)
+    assert unresolved_modifier_warnings(item, filters) == ()
+
+    query = build_search_query(
+        item, "Great Crown", trade_name="Forbidden Shako",
+        stat_filters=filters,
+    )["query"]
+    query_filters = [
+        row for group in query["stats"] for row in group["filters"]
+    ]
+    assert {
+        "id": "explicit.indexable_support_55", "value": {"min": 10.0},
+    } in query_filters
+    assert {
+        "id": "explicit.indexable_support_89", "value": {"min": 24.0},
+    } in query_filters
+
+
+def test_embryonic_gift_uses_exact_search_without_unresolved_modifiers():
+    item = parse_item_text("""アイテムクラス: 母胎ギフト
+レアリティ: カレンシー
+古代の母胎ギフト
+--------
+アイテムレベル: 83
+1790のハイヴブラッドが必要
+--------
+創生の樹でユニークアイテムに成長させられる
+--------
+このアイテムを創生の樹の割り当て済みのユニークアイテムの母胎に配置する。右クリックで創生の樹から取り除ける。
+""")
+
+    assert uses_dedicated_exact_preset(item)
+    assert default_trade_currency(item) == "chaos_divine"
+    assert unresolved_modifier_warnings(item) == ()
 
 
 def test_svalinn_fixed_lucky_block_is_not_an_unresolved_modifier():
@@ -1808,7 +3862,42 @@ Girded Tower Shield
     assert unresolved_modifier_warnings(item, filters) == ()
 
 
-def test_crafted_affix_header_is_counted_for_exact_empty_slots():
+def test_dawnbreaker_shield_block_mod_uses_shield_specific_trade_stat():
+    item = parse_item_text("""アイテムクラス: 盾
+レアリティ: ユニーク
+ドーンブレイカー
+巨大なタワーシールド
+--------
+ブロック率: 45% (augmented)
+アーマー: 2003 (augmented)
+--------
+アイテムレベル: 86
+--------
+{ 暗黙モッド — ライフ }
+最大ライフ +17(10-20)
+--------
+{ ユニークモッド }
+ブロック率 +22(20-25)%
+""")
+    filters = resolve_trade_stat_filters(item, trade_name="Dawnbreaker")
+
+    block_modifier = next(
+        modifier for modifier in item.modifiers
+        if modifier.text == "ブロック率 +22(20-25)%"
+    )
+    assert block_modifier.stat_id == "explicit.stat_4253454700"
+    assert any(row.stat_id == "property.block" for row in filters)
+    block_filter = next(
+        row for row in filters
+        if row.stat_id == "explicit.stat_4253454700"
+    )
+    assert block_filter.text == "ブロック率 +22(20-25)%"
+    assert block_filter.min_value == 21
+    assert block_filter.hidden_reason == ""
+    assert unresolved_modifier_warnings(item, filters) == ()
+
+
+def test_sparse_item_with_crafted_affix_is_not_a_one_slot_finished_item():
     item = parse_item_text("""アイテムクラス: 指輪
 レアリティ: レア
 試作品
@@ -1822,10 +3911,49 @@ def test_crafted_affix_header_is_counted_for_exact_empty_slots():
 火耐性 +20%
 """)
     empty = {row.stat_id: row.text for row in resolve_trade_stat_filters(item) if row.kind == "craft"}
+    assert empty == {}
+
+
+def test_six_mod_item_with_crafted_suffix_offers_empty_suffix_like_awakened():
+    item = parse_item_text("""アイテムクラス: 指輪
+レアリティ: レア
+試作品
+ルビーの指輪
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「健康な」 (ティア: 1) }
+最大ライフ +100(90-100)
+{ プレフィックスモッド「強固な」 (ティア: 1) }
+最大エナジーシールド +50(40-50)
+{ プレフィックスモッド「頑丈な」 (ティア: 1) }
+アーマー +100(90-100)
+{ サフィックスモッド 「炎の」 (ティア: 1) }
+火耐性 +40(36-40)%
+{ サフィックスモッド 「氷の」 (ティア: 1) }
+冷気耐性 +40(36-40)%
+{ マスタークラフト サフィックスモッド「製作の」 }
+雷耐性 +20%
+""")
+    empty = {row.stat_id: row.text for row in resolve_trade_stat_filters(item) if row.kind == "craft"}
     assert empty == {
-        "pseudo.pseudo_number_of_empty_prefix_mods": "空きPrefix枠（現在2枠）",
-        "pseudo.pseudo_number_of_empty_suffix_mods": "空きSuffix枠（現在2枠）",
+        "pseudo.pseudo_number_of_empty_suffix_mods": "空きSuffix枠（現在1枠）",
     }
+
+
+def test_four_mod_item_without_craft_does_not_offer_empty_affix_like_awakened():
+    modifiers = tuple(
+        ItemModifier(f"Prefix {index}", kind="prefix", affix="prefix", group=index)
+        for index in range(2)
+    ) + tuple(
+        ItemModifier(f"Suffix {index}", kind="suffix", affix="suffix", group=100 + index)
+        for index in range(2)
+    )
+    item = ParsedItem(
+        item_class="Rings", rarity="Rare", name="Test", base_type="Ruby Ring",
+        category="accessory", modifiers=modifiers,
+    )
+    assert not any(row.kind == "craft" for row in resolve_trade_stat_filters(item))
 
 
 def test_rare_jewel_uses_two_prefix_and_two_suffix_limits():
@@ -1852,21 +3980,21 @@ Crimson Jewel
 
 
 @pytest.mark.parametrize(
-    ("category", "base_type", "prefixes", "suffixes", "expected"),
+    ("category", "base_type", "prefixes", "suffixes", "expected_stat"),
     (
-        ("accessory", "Cogwork Ring", 1, 2, (1, 2)),
-        ("accessory", "Geodesic Ring", 2, 1, (2, 1)),
-        ("accessory", "Manifold Ring", 2, 1, (2, 0)),
-        ("accessory", "Helical Ring", 1, 2, (0, 2)),
-        ("accessory", "Simplex Amulet", 1, 1, (0, 1)),
-        ("accessory", "Focused Amulet", 1, 1, (1, 0)),
-        ("abyss_jewel", "Ghastly Eye Jewel", 1, 1, (1, 1)),
-        ("cluster_jewel", "Large Cluster Jewel", 1, 1, (1, 1)),
-        ("map", "Strand Map", 1, 1, (2, 2)),
+        ("accessory", "Cogwork Ring", 1, 4, "pseudo.pseudo_number_of_empty_prefix_mods"),
+        ("accessory", "Geodesic Ring", 4, 1, "pseudo.pseudo_number_of_empty_suffix_mods"),
+        ("accessory", "Manifold Ring", 3, 1, "pseudo.pseudo_number_of_empty_prefix_mods"),
+        ("accessory", "Helical Ring", 1, 3, "pseudo.pseudo_number_of_empty_suffix_mods"),
+        ("accessory", "Simplex Amulet", 1, 1, "pseudo.pseudo_number_of_empty_suffix_mods"),
+        ("accessory", "Focused Amulet", 1, 1, "pseudo.pseudo_number_of_empty_prefix_mods"),
+        ("abyss_jewel", "Ghastly Eye Jewel", 2, 1, "pseudo.pseudo_number_of_empty_suffix_mods"),
+        ("cluster_jewel", "Large Cluster Jewel", 1, 2, "pseudo.pseudo_number_of_empty_prefix_mods"),
+        ("map", "Strand Map", 3, 2, "pseudo.pseudo_number_of_empty_suffix_mods"),
     ),
 )
 def test_empty_affixes_use_category_and_special_base_limits(
-    category, base_type, prefixes, suffixes, expected,
+    category, base_type, prefixes, suffixes, expected_stat,
 ):
     modifiers = tuple(
         ItemModifier(f"Prefix {index}", kind="prefix", affix="prefix", group=index)
@@ -1884,12 +4012,7 @@ def test_empty_affixes_use_category_and_special_base_limits(
         for row in resolve_trade_stat_filters(item, trade_base_type=base_type)
         if row.kind == "craft"
     }
-    expected_filters = {}
-    if expected[0]:
-        expected_filters["pseudo.pseudo_number_of_empty_prefix_mods"] = expected[0]
-    if expected[1]:
-        expected_filters["pseudo.pseudo_number_of_empty_suffix_mods"] = expected[1]
-    assert empty == expected_filters
+    assert empty == {expected_stat: 1}
 
 
 @pytest.mark.parametrize("flag", ("corrupted", "mirrored"))
@@ -2002,8 +4125,46 @@ Farric Lynx Alpha
 
     web_query = json.loads(parse_qs(urlsplit(result.web_url).query)["q"][0])["query"]
     assert web_query["type"] == "ファルウルのリンクス・アルファ"
-    assert web_query["filters"] == {}
+    assert web_query["filters"] == {
+        "trade_filters": {"filters": {"collapse": {"option": "true"}}},
+    }
     assert web_query["stats"] == [{"type": "and", "filters": []}]
+
+
+def test_itemised_spectre_corpse_uses_awakened_exact_identity_without_mod_warnings():
+    item = parse_item_text("""アイテムクラス: 死体
+レアリティ: カレンシー
+完全体のドルイド錬金術師
+--------
+死体レベル: 85
+モンスターカテゴリー: 人型
+--------
+アイテムレベル: 85
+--------
+ポイゾナスコンコクションを投げる
+フラスコの効果が200％増加する
+所有者は3秒ごとにライフフラスコのチャージを1得る
+--------
+このアイテムを右クリックしてこの死体を生成する。
+""")
+
+    assert item.category == "corpse"
+    assert uses_dedicated_exact_preset(item)
+    filters = resolve_trade_stat_filters(item)
+    assert [row.stat_id for row in filters] == ["property.item_level"]
+    assert unresolved_modifier_warnings(item, filters) == ()
+
+    query = build_search_query(
+        item, item.base_type, stat_filters=filters, item_level_min=85,
+    )["query"]
+    assert query["type"] == "完全体のドルイド錬金術師"
+    assert query["stats"] == [{"type": "and", "filters": []}]
+    assert query["filters"]["misc_filters"]["filters"]["ilvl"] == {"min": 85}
+
+    query_without_ilvl = build_search_query(
+        item, item.base_type, stat_filters=(), item_level_min=None,
+    )["query"]
+    assert "ilvl" not in query_without_ilvl["filters"]["misc_filters"]["filters"]
 
 
 def test_japanese_local_physical_modifier_is_not_duplicated_after_pdps_aggregation():
@@ -2078,7 +4239,86 @@ def test_price_result_calculates_median_per_currency():
     assert result.median_by_currency() == {"chaos": 5, "divine": 1}
 
 
+def test_same_seller_same_price_is_grouped_before_median():
+    grouped = _group_price_listings([
+        PriceListing(1, "chaos", "price-fixer"),
+        PriceListing(1, "chaos", "price-fixer"),
+        PriceListing(1, "chaos", "price-fixer"),
+        PriceListing(8, "chaos", "seller-a"),
+        PriceListing(10, "chaos", "seller-b"),
+    ])
+    assert [(row.amount, row.account, row.listed_times) for row in grouped] == [
+        (1, "price-fixer", 3),
+        (8, "seller-a", 1),
+        (10, "seller-b", 1),
+    ]
+    assert PriceResult("Mirage", "q", 5, grouped).median_by_currency() == {
+        "chaos": 8,
+    }
+
+
+def test_common_search_range_recalculates_from_read_value():
+    row = TradeStatFilter(
+        "explicit.life", "最大ライフ +100", 90, "explicit", True,
+        read_value=100,
+    )
+    assert apply_search_range((row,), 0)[0].min_value == 100
+    assert apply_search_range((row,), 20)[0].min_value == 80
+
+
+@pytest.mark.parametrize("rarity", ["rare", "レア", "magic", "マジック"])
+def test_non_unique_search_range_uses_current_value_not_tier_width(rarity):
+    item = ParsedItem("Spear", rarity, "Test", "Test Spear", "weapon")
+    row = TradeStatFilter(
+        "explicit.strength", "筋力 +33", 33, "explicit", True,
+        read_value=33, roll_min=31, roll_max=33,
+    )
+
+    assert apply_search_range((row,), 10, item)[0].min_value == 29
+
+
+@pytest.mark.parametrize("rarity", ["unique", "ユニーク"])
+def test_unique_search_range_keeps_variable_roll_width(rarity):
+    item = ParsedItem("Spear", rarity, "Test", "Test Spear", "weapon")
+    row = TradeStatFilter(
+        "explicit.strength", "筋力 +33", 33, "explicit", True,
+        read_value=33, roll_min=31, roll_max=33,
+    )
+
+    assert apply_search_range((row,), 10, item)[0].min_value == 32
+
+
+def test_search_range_does_not_reduce_discrete_link_count():
+    item = parse_item_text("""アイテムクラス: 両手斧
+レアリティ: レア
+魂の引き裂き
+ヴァールアックス
+--------
+ソケット: R-R-R-W-G W
+--------
+アイテムレベル: 85
+""")
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        filters = resolve_trade_stat_filters(item)
+    adjusted = {
+        row.stat_id: row
+        for row in apply_search_range(filters, 10, item)
+        if row.stat_id.startswith("property.")
+    }
+    assert "property.sockets" not in adjusted
+    assert adjusted["property.links"].min_value == 5
+    assert "property.white_sockets" not in adjusted
+
+
 def test_search_prices_keeps_item_and_seller_for_list_display():
+    class Trace:
+        def __init__(self):
+            self.events = []
+
+        def mark(self, event, **details):
+            self.events.append((event, details))
+
+    trace = Trace()
     _trade_response_cache.clear()
     search = ({"id": "query1", "result": ["item1"]}, {"X-Rate-Limit-Ip-State": "1:10:0"})
     fetch = ({"result": [{
@@ -2096,14 +4336,230 @@ def test_search_prices_keeps_item_and_seller_for_list_display():
             ],
         },
     }]}, {})
-    with patch("src.poetore.trade._request_json", side_effect=[search, fetch]):
-        result = search_prices(parse_item_text(ITEM), "Reaver Sword", "Mirage")
+    with patch(
+        "src.poetore.trade._request_json", side_effect=[search, fetch],
+    ), patch(
+        "src.poetore.trade._japanese_trade_item_type",
+        return_value="略奪者の剣",
+    ):
+        result = search_prices(
+            parse_item_text(ITEM), "Reaver Sword", "Mirage",
+            performance_trace=trace,
+        )
     assert result.listings == (
         PriceListing(
             4, "chaos", "seller", "Doom Sever", "Reaver Sword",
             "2026-07-22T09:21:00Z", 86, 20, 23, 3,
         ),
     )
+    events = [event for event, _details in trace.events]
+    assert events == [
+        "trade_worker_started",
+        "trade_identity_resolved",
+        "trade_query_built",
+        "trade_search_request_started",
+        "trade_search_response",
+        "trade_fetch_started",
+        "trade_fetch_response",
+        "trade_listings_built",
+        "trade_worker_completed",
+    ]
+    assert trace.events[4][1]["candidates"] == 1
+    assert trace.events[6][1]["rows"] == 1
+
+
+def test_search_query_collapses_same_seller_at_official_trade_api():
+    payload = build_search_query(
+        parse_item_text(ITEM), "Reaver Sword", trade_status="available",
+    )
+
+    assert payload["query"]["filters"]["trade_filters"]["filters"]["collapse"] == {
+        "option": "true",
+    }
+
+
+def test_search_and_japanese_trade_link_keep_seller_collapse_enabled():
+    _trade_response_cache.clear()
+    response = ({"id": "qid", "result": [], "total": 0}, {})
+    with patch("src.poetore.trade._request_json", return_value=response) as request:
+        result = search_prices(
+            parse_item_text(ITEM), "Reaver Sword", "Standard",
+        )
+
+    api_payload = request.call_args.args[1]
+    web_payload = json.loads(parse_qs(urlsplit(result.web_url).query)["q"][0])
+    expected = {"option": "true"}
+    assert api_payload["query"]["filters"]["trade_filters"]["filters"]["collapse"] == expected
+    assert web_payload["query"]["filters"]["trade_filters"]["filters"]["collapse"] == expected
+
+
+def test_search_prices_classifies_face_to_face_instant_and_unpriced_listings():
+    _trade_response_cache.clear()
+    search = (
+        {"id": "query1", "result": ["face", "instant", "unpriced"]},
+        {},
+    )
+    fetch = ({"result": [
+        {
+            "listing": {
+                "price": {"amount": 4, "currency": "chaos"},
+                "account": {"name": "face-seller"},
+            },
+            "item": {"baseType": "Reaver Sword", "note": "~price 4 chaos"},
+        },
+        {
+            "listing": {
+                "price": {"amount": 5, "currency": "chaos"},
+                "fee": 1,
+                "account": {"name": "instant-seller"},
+            },
+            "item": {"baseType": "Reaver Sword"},
+        },
+        {
+            "listing": {"account": {"name": "stash-seller"}},
+            "item": {"baseType": "Reaver Sword"},
+        },
+    ]}, {})
+    with patch(
+        "src.poetore.trade._request_json", side_effect=[search, fetch],
+    ), patch(
+        "src.poetore.trade._japanese_trade_item_type",
+        return_value="略奪者の剣",
+    ):
+        result = search_prices(parse_item_text(ITEM), "Reaver Sword", "Mirage")
+
+    assert [row.pricing_method for row in result.listings] == [
+        "face_to_face", "instant", "unpriced",
+    ]
+    assert result.median_by_currency() == {"chaos": 4.5}
+
+
+def test_search_prices_fetches_exactly_twenty_results():
+    _trade_response_cache.clear()
+    search = ({"id": "query1", "result": [f"item{i}" for i in range(30)]}, {})
+
+    def block(start):
+        return ({"result": [{
+            "listing": {
+                "price": {"amount": start + index + 1, "currency": "chaos"},
+                "account": {"name": f"seller-{start + index}"},
+            },
+            "item": {"baseType": "Reaver Sword"},
+        } for index in range(10)]}, {})
+
+    partial_results = []
+    with patch(
+        "src.poetore.trade._request_json",
+        side_effect=[search, block(0), block(10)],
+    ) as request, patch(
+        "src.poetore.trade._japanese_trade_item_type",
+        return_value="略奪者の剣",
+    ):
+        result = search_prices(
+            parse_item_text(ITEM), "Reaver Sword", "Mirage",
+            partial_result_callback=partial_results.append,
+        )
+
+    assert request.call_count == 3
+    assert len(partial_results) == 1
+    assert len(partial_results[0].listings) == 10
+    assert partial_results[0].web_url == ""
+    assert len(result.listings) == 20
+
+
+def test_search_prices_stops_at_twenty_even_when_sellers_are_grouped():
+    _trade_response_cache.clear()
+    search = ({"id": "query1", "result": [f"item{i}" for i in range(100)]}, {})
+
+    def block(start):
+        return ({"result": [{
+            "listing": {
+                "price": {"amount": 10, "currency": "divine"},
+                "account": {"name": "same-seller"},
+            },
+            "item": {"baseType": "Reaver Sword"},
+        } for _index in range(10)]}, {})
+
+    with patch(
+        "src.poetore.trade._request_json",
+        side_effect=[search, block(0), block(10)],
+    ) as request, patch(
+        "src.poetore.trade._japanese_trade_item_type",
+        return_value="略奪者の剣",
+    ):
+        result = search_prices(
+            parse_item_text(ITEM), "Reaver Sword", "Mirage",
+        )
+
+    assert request.call_count == 3
+    assert len(result.listings) == 1
+    assert result.listings[0].listed_times == 20
+
+
+def test_awakened_style_rate_limit_rejects_new_queue_without_sleeping():
+    _trade_rate_limiter.reset()
+    try:
+        _trade_rate_limiter.adjust("search", {
+            "X-Rate-Limit-Rules": "trade-search-request-limit",
+            "X-Rate-Limit-trade-search-request-limit": "1:10:60",
+            "X-Rate-Limit-trade-search-request-limit-State": "1:10:0",
+        })
+
+        with pytest.raises(TradeApiError, match=r"約12秒後"):
+            _prevent_trade_queue()
+    finally:
+        _trade_rate_limiter.reset()
+
+
+def test_awakened_style_rate_limit_does_not_delay_available_requests():
+    _trade_rate_limiter.reset()
+    response = SimpleNamespace(
+        status=200,
+        headers={
+            "X-Rate-Limit-Rules": "trade-search-request-limit",
+            "X-Rate-Limit-trade-search-request-limit": "10:10:60",
+            "X-Rate-Limit-trade-search-request-limit-State": "1:10:0",
+        },
+        data=b'{"id":"query1","result":[]}',
+    )
+    try:
+        with patch(
+            "src.poetore.trade._trade_http_pool.request",
+            return_value=response,
+        ), patch("src.poetore.trade.time.sleep") as sleep:
+            _request_json(
+                "https://www.pathofexile.com/api/trade/search/Standard",
+                {"query": {}},
+            )
+            _request_json(
+                "https://www.pathofexile.com/api/trade/search/Standard",
+                {"query": {}},
+            )
+        sleep.assert_not_called()
+    finally:
+        _trade_rate_limiter.reset()
+
+
+def test_trade2_rate_limit_is_separate_from_poe1_trade_limit():
+    _trade_rate_limiter.reset()
+    _trade2_rate_limiter.reset()
+    try:
+        _trade2_rate_limiter.adjust("search", {
+            "X-Rate-Limit-Rules": "trade2-search-request-limit",
+            "X-Rate-Limit-trade2-search-request-limit": "1:10:60",
+            "X-Rate-Limit-trade2-search-request-limit-State": "1:10:0",
+        })
+
+        _prevent_trade_queue(
+            "https://www.pathofexile.com/api/trade/search/Standard"
+        )
+        with pytest.raises(TradeApiError, match=r"約12秒後"):
+            _prevent_trade_queue(
+                "https://www.pathofexile.com/api/trade2/search/Standard"
+            )
+    finally:
+        _trade_rate_limiter.reset()
+        _trade2_rate_limiter.reset()
 
 
 def test_search_prices_logs_request_payload_and_response_summary(capsys):
@@ -2145,6 +4601,55 @@ def test_search_result_exposes_japanese_trade_url_and_reuses_cache():
     web_payload = json.loads(parse_qs(parsed_url.query)["q"][0])
     assert web_payload["query"]["type"] == "略奪者の剣"
     assert "qid" not in first.web_url
+
+
+@pytest.mark.parametrize(("english_name", "japanese_name"), (
+    ("Eternal Damnation", "永遠の破滅"),
+    ("Voll's Devotion", "ヴォールの献身"),
+))
+def test_unidentified_unique_candidate_is_kept_in_japanese_trade_url(
+    english_name, japanese_name,
+):
+    _trade_response_cache.clear()
+    item = parse_item_text("""アイテムクラス: アミュレット
+レアリティ: ユニーク
+瑪瑙のアミュレット
+--------
+アイテムレベル: 85
+--------
+未鑑定
+""")
+    response = ({"id": "qid", "result": [], "total": 0}, {})
+    with (
+        patch("src.poetore.trade._request_json", return_value=response),
+        patch(
+            "src.poetore.trade._english_trade_item_type",
+            return_value="Agate Amulet",
+        ),
+        patch(
+            "src.poetore.trade._japanese_trade_item_type",
+            return_value="瑪瑙のアミュレット",
+        ),
+        patch(
+            "src.poetore.trade._japanese_trade_item_name",
+            return_value=japanese_name,
+        ) as localize_name,
+    ):
+        result = search_prices(
+            item,
+            "Agate Amulet",
+            "Standard",
+            trade_name=english_name,
+            include_unidentified=True,
+        )
+
+    web_payload = json.loads(parse_qs(urlsplit(result.web_url).query)["q"][0])
+    assert web_payload["query"]["name"] == japanese_name
+    assert web_payload["query"]["type"] == "瑪瑙のアミュレット"
+    assert web_payload["query"]["filters"]["misc_filters"]["filters"]["identified"] == {
+        "option": "false",
+    }
+    localize_name.assert_called_with(english_name)
 
 
 def test_magic_base_jewel_web_url_does_not_add_affixed_name_as_type():
@@ -2267,7 +4772,7 @@ Tenacious Blood Sap Tincture of Battering
 """)
     filters = resolve_trade_stat_filters(item)
     mana_burn = next(row for row in filters if row.stat_id == "explicit.stat_116232170")
-    assert mana_burn.inverted is True
+    assert mana_burn.inverted is False
     assert unresolved_modifier_warnings(item, filters) == ()
     assert next(
         row for row in filters if row.stat_id == "property.item_level"
@@ -2291,7 +4796,60 @@ Tenacious Blood Sap Tincture of Battering
     assert web_query["type"] == "血の樹液のチンキ"
     assert web_query["stats"][0]["filters"] == [{
         "id": "explicit.stat_116232170",
-        "value": {"min": -20.0},
+        "value": {"min": 16.0},
+    }]
+
+
+def test_tincture_effect_uses_tincture_specific_duplicate_trade_stat():
+    item = parse_item_text("""アイテムクラス: チンキ
+レアリティ: マジック
+強い 液状化の 血の樹液のチンキ
+--------
+毎秒0.43 (augmented)のマナ燃焼を付与する
+不活性化時のクールダウン 6秒
+--------
+装備要求:
+レベル: 46
+--------
+アイテムレベル: 84
+--------
+{ 暗黙モッド — ダメージ, 物理, アタック, 状態異常 - 35%増加 }
+近接武器により20%の確率で出血を付与する
+近接武器による出血ダメージが85(60-90)%増加する
+--------
+{ プレフィックスモッド「強い」 (ティア: 3) - 35%増加 }
+効果が35%増加する
+マナ燃焼レートが48(47-51)%増加する
+{ サフィックスモッド 「液状化の」 (ティア: 3) — ダメージ, アタック - 35%増加 }
+近接武器によるアタックの継続ダメージ倍率 +23(19-23)%
+""")
+    duplicate_entries = (
+        {
+            "id": "explicit.stat_2448920197",
+            "text": "効果が#%増加する",
+            "type": "explicit",
+        },
+        {
+            "id": "explicit.stat_3529940209",
+            "text": "効果が#%増加する",
+            "type": "explicit",
+        },
+    )
+    with patch("src.poetore.trade._trade_stat_entries", return_value=duplicate_entries):
+        filters = resolve_trade_stat_filters(item)
+
+    effect = next(row for row in filters if row.text == "効果が35%増加する")
+    assert effect.stat_id == "explicit.stat_3529940209"
+    assert effect.min_value == 35
+    assert not any(row.stat_id == "explicit.stat_2448920197" for row in filters)
+
+    query = build_search_query(
+        item, "Blood Sap Tincture",
+        stat_filters=(replace(effect, enabled=True),),
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": "explicit.stat_3529940209",
+        "value": {"min": 35},
     }]
 
 
@@ -2317,6 +4875,35 @@ def test_transfigured_gem_web_url_uses_localized_base_type_with_discriminator():
     web_payload = json.loads(parse_qs(urlsplit(result.web_url).query)["q"][0])
     assert web_payload["query"]["type"] == {
         "option": "ミラーアロー",
+        "discriminator": "alt_x",
+    }
+
+
+def test_japanese_transfigured_gem_text_resolves_to_english_variant_identity():
+    item = _gem_item("動地のグラウンドスラム", level=20, quality=20)
+    aligned_items = ((
+        {
+            "type": "Ground Slam",
+            "text": "Ground Slam of Earthshaking",
+            "disc": "alt_x",
+        },
+        {
+            "type": "グラウンドスラム",
+            "text": "動地のグラウンドスラム",
+            "disc": "alt_x",
+        },
+    ),)
+    with patch(
+        "src.poetore.trade._aligned_trade_item_pairs",
+        return_value=iter(aligned_items),
+    ):
+        trade_type, trade_name = english_trade_identity(item)
+
+    assert trade_type == "Ground Slam of Earthshaking"
+    assert trade_name is None
+    query = build_search_query(item, trade_type)["query"]
+    assert query["type"] == {
+        "option": "Ground Slam",
         "discriminator": "alt_x",
     }
 
@@ -2351,6 +4938,58 @@ Corrupted
 
     web_payload = json.loads(parse_qs(urlsplit(result.web_url).query)["q"][0])
     assert web_payload["query"]["type"] == "ヴァールモルテンストライク"
+
+
+def test_scrying_orb_searches_the_official_map_area_variant():
+    item = parse_item_text("""アイテムクラス: スタック可能カレンシー
+レアリティ: カレンシー
+透視のオーブ
+--------
+マップエリア: 岸辺
+--------
+アトラス上のマップを透視する
+--------
+このアイテムを右クリックして、アトラス上のマップを左クリックする。
+--------
+メモ: ~b/o 4 chaos
+""")
+    aligned = ((
+        {"type": "10021", "text": "Scrying Orb (Strand)", "disc": "scrying_orb"},
+        {"type": "10021", "text": "透視のオーブ (岸辺)", "disc": "scrying_orb"},
+    ),)
+
+    with patch(
+        "src.poetore.trade._aligned_trade_item_pairs",
+        side_effect=lambda: iter(aligned),
+    ):
+        trade_type, trade_name = english_trade_identity(item)
+        query = build_search_query(item, trade_type)["query"]
+
+    assert trade_type == "10021"
+    assert trade_name is None
+    assert query["type"] == {"option": "10021", "discriminator": "scrying_orb"}
+
+
+def test_japanese_vaal_grace_copy_builds_a_vaal_grace_query():
+    item = parse_item_text("""アイテムクラス: スキルジェム
+レアリティ: ジェム
+グレース
+--------
+オーラ, スペル, 範囲効果, 持続時間, ヴァール
+レベル: 1
+--------
+ヴァールグレース
+--------
+使用ごとの必要ソウル: 50
+1回分保持可能
+--------
+コラプト状態
+""")
+
+    query = build_search_query(item, item.base_type)["query"]
+
+    assert item.base_type == "Vaal Grace"
+    assert query["type"] == "Vaal Grace"
 
 
 @pytest.mark.parametrize(
@@ -2422,6 +5061,131 @@ def test_query_supports_option_not_count_and_special_item_states():
     assert "veiled" not in without_veiled["filters"]["misc_filters"]["filters"]
 
 
+def test_eldritch_item_filters_can_be_disabled_independently():
+    item = replace(
+        parse_item_text(ITEM),
+        flags=parse_item_text(ITEM).flags + ("searing_item", "tangled_item"),
+    )
+
+    initial = build_search_query(item)["query"]
+    initial_misc = initial["filters"]["misc_filters"]["filters"]
+    assert initial_misc["searing_item"] == {"option": "true"}
+    assert initial_misc["tangled_item"] == {"option": "true"}
+
+    eater_disabled = build_search_query(
+        item, include_searing=True, include_tangled=False,
+    )["query"]
+    eater_disabled_misc = eater_disabled["filters"]["misc_filters"]["filters"]
+    assert eater_disabled_misc["searing_item"] == {"option": "true"}
+    assert "tangled_item" not in eater_disabled_misc
+
+    both_disabled = build_search_query(
+        item, include_searing=False, include_tangled=False,
+    )["query"]
+    both_disabled_misc = both_disabled["filters"]["misc_filters"]["filters"]
+    assert "searing_item" not in both_disabled_misc
+    assert "tangled_item" not in both_disabled_misc
+
+
+def test_option_stat_query_does_not_include_numeric_bounds():
+    item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: レア
+思案する瞳
+クラスタージュエル (小)
+--------
+アイテムレベル: 83
+--------
+パッシブスキルを2個追加する (enchant)
+追加される通常パッシブスキルは付与: 回避力が15%増加する (enchant)
+""")
+    filters = resolve_trade_stat_filters(
+        item, PRESET_FINISHED, "Small Cluster Jewel",
+    )
+    base_effect = next(
+        row for row in filters
+        if row.stat_id.split("|", 1)[0] == "enchant.stat_3948993189"
+    )
+    assert base_effect.option_value == 43
+    assert base_effect.min_value == 15
+
+    query = build_search_query(
+        item, stat_filters=(replace(base_effect, enabled=True),),
+    )["query"]
+    sent = query["stats"][0]["filters"][0]
+    assert sent == {
+        "id": "enchant.stat_3948993189",
+        "value": {"option": 43},
+    }
+
+
+def test_dark_monarch_holy_armaments_variant_is_enabled_and_sent_exactly():
+    item = parse_item_text("""アイテムクラス: 兜
+レアリティ: ユニーク
+闇の王
+リッチのサークレット
+--------
+エナジーシールド: 205 (augmented)
+--------
+アイテムレベル: 86
+--------
+{ ユニークモッド — 防御, エナジーシールド }
+最大エナジーシールド +76(50-100)
+{ ユニークモッド — ミニオン, ジェム }
+全てのミニオンスキルジェムのレベル +1
+{ ユニークモッド — 混沌, 耐性 }
+混沌耐性 +33(27-37)%
+{ ユニークモッド }
+光半径が50%減少する
+{ ユニークモッド }
+スケルトン召喚(アニメイトウェポン-ホーリーアーマメント)の最大数が二倍になる
+スケルトン召喚(アニメイトウェポン-ホーリーアーマメント)以外のミニオンを召喚できない
+""")
+
+    filters = resolve_trade_stat_filters(item, trade_name="The Dark Monarch")
+    variant = next(
+        row for row in filters
+        if row.stat_id == "explicit.stat_56473917|16"
+    )
+    assert variant.enabled
+    assert not variant.hidden_reason
+
+    query = build_search_query(
+        item, "Lich's Circlet", filters, trade_name="The Dark Monarch",
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": "explicit.stat_56473917|16",
+        "value": {},
+    }]
+
+
+def test_forbidden_flame_ascendancy_uses_trade_site_composite_stat_id():
+    item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: ユニーク
+禁じられた炎
+クリムゾンジュエル
+--------
+アイテムレベル: 86
+--------
+禁じられた炎に一致するモッドがあれば元素の要塞を割り当てる
+""")
+
+    filters = resolve_trade_stat_filters(item, trade_name="Forbidden Flame")
+    ascendancy = next(
+        row for row in filters
+        if row.stat_id == "explicit.stat_2460506030|4917"
+    )
+    assert ascendancy.enabled
+    assert ascendancy.option_value is None
+
+    query = build_search_query(
+        item, "Crimson Jewel", (ascendancy,), trade_name="Forbidden Flame",
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": "explicit.stat_2460506030|4917",
+        "value": {},
+    }]
+
+
 def test_veiled_chip_uses_matching_veiled_stat_ids_like_awakened():
     item = parse_item_text("""Item Class: Body Armours
 Rarity: Rare
@@ -2450,6 +5214,39 @@ Veiled Suffix
 
     disabled = build_search_query(item, include_veiled=False)["query"]
     assert disabled["stats"][0]["filters"] == []
+
+
+def test_veiled_item_starts_with_only_its_veiled_type_enabled():
+    item = ParsedItem(
+        "Body Armours", "Rare", "Test Mantle", "Vaal Regalia", "armour",
+        item_level=86, flags=("veiled",),
+        modifiers=(
+            ItemModifier(
+                "Catarina's Veiled", kind="veiled",
+                ref="Catarina's Veiled", stat_id="veiled.mod_63772",
+            ),
+            ItemModifier(
+                "+100 to maximum Life", (100,), kind="prefix", tier=1,
+                ref="+# to maximum Life", stat_id="explicit.life",
+            ),
+        ),
+    )
+    entries = ({
+        "id": "explicit.life", "text": "+# to maximum Life", "type": "explicit",
+    },)
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        filters = resolve_trade_stat_filters(item)
+    assert filters
+    assert not any(row.enabled for row in filters)
+
+    query = build_search_query(
+        item, "Vaal Regalia", filters,
+        include_veiled=True, preset=PRESET_FINISHED,
+    )["query"]
+    assert query["stats"][0]["filters"] == [{
+        "id": "veiled.mod_63772",
+        "value": {},
+    }]
 
 
 def test_japanese_veiled_header_resolves_its_specific_stat_id():
@@ -2709,6 +5506,115 @@ Valdo Map
     assert unresolved_modifier_warnings(item, filters) == ()
 
 
+CONQUEROR_CITADEL_STATS = (
+    (
+        "バラン",
+        "implicit.stat_2563183002|1",
+        "エリアにはバランの砦が出現する\n"
+        "アイテムの数量はその数値の20%がバランのドロップするアイテムの量を増加させる",
+    ),
+    (
+        "ヴェリタニア",
+        "implicit.stat_2563183002|2",
+        "エリアにはヴェリタニアの砦が出現する\n"
+        "アイテムの数量はその数値の20%がヴェリタニアのドロップするアイテムの量を増加させる",
+    ),
+    (
+        "アル・ヘズミン",
+        "implicit.stat_2563183002|3",
+        "エリアにはアル・ヘズミンの砦が出現する\n"
+        "アイテムの数量はその数値の20%がアル・ヘズミンのドロップするアイテムの量を増加させる",
+    ),
+    (
+        "ドロックス",
+        "implicit.stat_2563183002|4",
+        "エリアにはドロックスの砦が出現する\n"
+        "アイテムの数量はその数値の20%がドロックスのドロップするアイテムの量を増加させる",
+    ),
+)
+
+
+@pytest.mark.parametrize(("conqueror", "stat_id", "stat_text"), CONQUEROR_CITADEL_STATS)
+def test_conqueror_citadel_multiline_implicit_uses_single_official_filter(
+    conqueror, stat_id, stat_text,
+):
+    item = parse_item_text(f"""アイテムクラス: マップ
+レアリティ: レア
+悪夢の努力
+マップ (ティア 16)
+--------
+アイテム数量: +49% (augmented)
+アイテムレアリティ: +29% (augmented)
+モンスターパックサイズ: +19% (augmented)
+--------
+アイテムレベル: 83
+--------
+モンスターレベル：83
+--------
+{{ 暗黙モッド }}
+エリアには{conqueror}の砦が出現する
+アイテムの数量はその数値の20%が{conqueror}のドロップするアイテムの量を増加させる
+--------
+""")
+    entries = ({"id": stat_id, "text": stat_text, "type": "implicit"},)
+
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        filters = resolve_trade_stat_filters(item)
+
+    citadel = next(row for row in filters if row.stat_id == stat_id)
+    assert citadel.text == stat_text
+    assert citadel.enabled is True
+    assert citadel.min_value is None
+    assert citadel.max_value is None
+    assert unresolved_modifier_warnings(item, filters) == ()
+    query = build_search_query(item, stat_filters=filters)
+    query_filters = {
+        row["id"]: row
+        for group in query["query"]["stats"]
+        for row in group["filters"]
+    }
+    assert query_filters[stat_id]["value"] == {}
+
+
+def test_veritania_citadel_full_japanese_copy_has_no_unresolved_warning():
+    item = parse_item_text("""アイテムクラス: マップ
+レアリティ: レア
+悪夢の努力
+マップ (ティア 16)
+--------
+アイテム数量: +49% (augmented)
+アイテムレアリティ: +29% (augmented)
+モンスターパックサイズ: +19% (augmented)
+--------
+アイテムレベル: 83
+--------
+モンスターレベル：83
+--------
+{ 暗黙モッド }
+エリアにはヴェリタニアの砦が出現する
+アイテムの数量はその数値の20%がヴェリタニアのドロップするアイテムの量を増加させる
+--------
+{ プレフィックスモッド「鏡の」 (ティア: 1) — ダメージ, 元素 }
+レアモンスターは元素の棘を持ち1500の元素ダメージを反射する
+{ プレフィックスモッド「燃える」 (ティア: 1) — ダメージ, 物理, 元素, 火 }
+モンスターは物理ダメージの107(90-110)%を追加火ダメージとして与える
+{ プレフィックスモッド「力ある」 (ティア: 1) — 元素, 火, 冷気, 雷, 状態異常 }
+モンスターはヒット時に20%の確率で発火、凍結および感電を付与する
+{ サフィックスモッド 「均衡の」 (ティア: 1) — ダメージ, 元素 }
+プレイヤーは曝露を付与することができない
+--------
+自身のマップデバイスで使用することでこのティアまたはそれよりティアの低いマップに移動する。マップは一度のみ使用できる。
+""")
+    _, stat_id, stat_text = CONQUEROR_CITADEL_STATS[1]
+    entries = ({"id": stat_id, "text": stat_text, "type": "implicit"},)
+
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        filters = resolve_trade_stat_filters(item)
+
+    assert any(row.stat_id == stat_id and row.enabled for row in filters)
+    assert unresolved_modifier_warnings(item, filters) == ()
+
+
 def test_valdo_reward_uses_english_api_value_and_japanese_web_value():
     item = parse_item_text("""アイテムクラス: マップ
 レアリティ: レア
@@ -2766,6 +5672,50 @@ Map (Tier 16)
 
     assert "type" not in query
     assert query["filters"]["map_filters"]["filters"]["map_tier"] == {"min": 16.0}
+
+
+def test_unique_generic_map_matches_awakened_identity_and_ignores_rolls():
+    item = parse_item_text("""アイテムクラス: マップ
+レアリティ: ユニーク
+オバの呪われた財宝
+マップ (ティア 16)
+--------
+アイテム数量: +40% (augmented)
+--------
+アイテムレベル: 84
+--------
+モンスターレベル：83
+--------
+{ ユニークモッド — ライフ }
+モンスターのライフが42(40-50)%上昇する
+{ ユニークモッド — ダメージ }
+モンスターのダメージが35(30-40)%増加する
+{ ユニークモッド — ダメージ, 混沌 }
+エリアには冒涜領域がまだらに存在する
+{ ユニークモッド }
+エリアは時間が経つと致命的になる
+""")
+    filters = resolve_trade_stat_filters(item, trade_base_type="Map")
+    assert [
+        row.stat_id for row in filters if row.enabled
+    ] == ["property.map_tier"]
+
+    tier = next(row for row in filters if row.stat_id == "property.map_tier")
+    query = build_search_query(
+        item,
+        "Map",
+        (replace(tier, max_value=tier.min_value),),
+        trade_name="Oba's Cursed Trove",
+    )["query"]
+
+    exact_map = {"option": "Map", "discriminator": "map"}
+    exact_name = {"option": "Oba's Cursed Trove", "discriminator": "map"}
+    assert query["type"] == exact_map
+    assert query["name"] == exact_name
+    assert query["stats"] == [{"type": "and", "filters": []}]
+    assert query["filters"]["map_filters"]["filters"]["map_tier"] == {
+        "min": 16.0, "max": 16.0,
+    }
 
 
 @pytest.mark.parametrize("text", [
@@ -2850,6 +5800,87 @@ def test_awakened_supported_categories_use_dedicated_exact(category, rarity):
     assert uses_dedicated_exact_preset(item)
 
 
+def test_misc_map_boss_invitation_ignores_fixed_reward_quantity_implicit():
+    item = parse_item_text("""アイテムクラス: その他マップアイテム
+レアリティ: ノーマル
+極性の招待状
+--------
+アイテムレベル: 83
+--------
+{ 暗黙モッド }
+アイテムの数量のモッドはボスからドロップする報酬の量に影響する
+--------
+一度ブラック・スターに捕まれば、
+逃げ場はない。
+--------
+自身のマップデバイスで使用することで、極性の虚無へのポータルを開く。
+""")
+    filters = resolve_trade_stat_filters(item)
+
+    assert item.category == "invitation"
+    assert all(row.kind != "implicit" for row in filters)
+    assert unresolved_modifier_warnings(item, filters) == ()
+
+
+@pytest.mark.parametrize(("text", "stat_id", "expected_min"), [
+    (
+        "自身のアクションスピードは最低でも基礎値の90%となる",
+        "explicit.stat_179010262",
+        None,
+    ),
+    (
+        "プレイヤーにより凍結させられた敵が受けるダメージが20%増加する",
+        "explicit.stat_849085925",
+        None,
+    ),
+    (
+        "敵の蠢く虫は2秒ごとにスポーンする",
+        "explicit.stat_933024928",
+        None,
+    ),
+    (
+        "エルダーアイテムを4個装備していれば反射物理ダメージを受けることがない",
+        "explicit.stat_609019022",
+        None,
+    ),
+    (
+        "クリティカル時に混沌の力を4秒間獲得する",
+        "explicit.stat_1183009081",
+        4,
+    ),
+    (
+        "120m以内のレアおよびユニークの敵はミニマップアイコンを持つ",
+        "explicit.stat_2543266731",
+        120,
+    ),
+    (
+        "レアモンスターを倒すとそのモッドの全てを60秒間獲得する",
+        "explicit.stat_2913235441",
+        60,
+    ),
+])
+def test_only_api_verified_fixed_number_stats_omit_numeric_bounds(
+    text, stat_id, expected_min,
+):
+    item = parse_item_text(f"""アイテムクラス: 指輪
+レアリティ: ユニーク
+ファウルボーン テスト
+鉄の指輪
+--------
+アイテムレベル: 85
+--------
+{{ ファウルボーンユニークモッド }}
+{text}
+""")
+
+    row = next(
+        row for row in resolve_trade_stat_filters(item, trade_base_type="Iron Ring")
+        if row.stat_id == stat_id
+    )
+    assert row.min_value == expected_min
+    assert row.max_value is None
+
+
 @pytest.mark.parametrize("category", ["sentinel"])
 def test_product_exclusions_do_not_enter_dedicated_exact(category):
     item = ParsedItem("Test", "Rare", "Test", "Test", category)
@@ -2880,6 +5911,63 @@ def test_dedicated_exact_magic_flask_keeps_t1_t2_and_crafted_only():
     assert rows["property.item_level"].enabled is False
 
 
+def test_dedicated_exact_magic_flask_hides_instilling_enchantment():
+    item = parse_item_text("""アイテムクラス: ユーティリティフラスコ
+レアリティ: マジック
+検査者の 虹の シルバーフラスコ
+--------
+アイテムレベル: 85
+--------
+チャージがフルになった時に使用される (enchant)
+--------
+{ プレフィックスモッド「検査者の」 (ティア: 3) }
+持続時間が27(26-30)%増加する
+{ サフィックスモッド 「虹の」 (ティア: 1) }
+効果中は20(18-20)%の元素耐性が追加される
+""")
+
+    filters = resolve_trade_stat_filters(item)
+    rows = {row.stat_id: row for row in filters}
+    enchant = rows["enchant.stat_3287581721"]
+    assert enchant.text == "チャージがフルになった時に使用される (enchant)"
+    assert enchant.enabled is False
+    assert enchant.hidden_reason
+    assert enchant.min_value is None
+
+    query = build_search_query(
+        item, "Silver Flask", filters, preset=PRESET_FINISHED,
+    )["query"]
+    assert not any(
+        row["id"] == "enchant.stat_3287581721"
+        for row in query["stats"][0]["filters"]
+    )
+
+
+def test_dedicated_exact_magic_flask_keeps_enkindling_enchantment():
+    item = ParsedItem(
+        "Utility Flasks", "Magic", "Test", "Granite Flask", "flask",
+        item_level=84,
+        modifiers=(
+            ItemModifier(
+                "70% increased effect\nGains no Charges during Flask Effect",
+                (70,), kind="enchant",
+                ref="Gains no Charges during Flask Effect",
+                stat_id="enchant.enkindling",
+            ),
+        ),
+    )
+    entries = ({
+        "id": "enchant.enkindling",
+        "text": "#% increased effect\\nGains no Charges during Flask Effect",
+        "type": "enchant",
+    },)
+    with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
+        filters = resolve_trade_stat_filters(item)
+    enchant = next(row for row in filters if row.stat_id == "enchant.enkindling")
+    assert enchant.enabled is True
+    assert not enchant.hidden_reason
+
+
 def test_forbidden_tome_below_83_uses_exact_area_level_range():
     item = ParsedItem(
         item_class="Misc Map Items", rarity="Normal", name="Forbidden Tome",
@@ -2906,7 +5994,9 @@ def test_inscribed_ultimatum_uses_name_only_without_detail_filters():
     query = build_search_query(item, "Inscribed Ultimatum")["query"]
     assert query["type"] == "Inscribed Ultimatum"
     assert query["stats"] == [{"type": "and", "filters": []}]
-    assert query["filters"] == {}
+    assert query["filters"] == {
+        "trade_filters": {"filters": {"collapse": {"option": "true"}}},
+    }
 
 
 def test_heist_blueprint_contract_and_logbook_rules():
@@ -3103,6 +6193,26 @@ def test_flask_hybrid_cluster_and_special_area_rules():
         filters = resolve_trade_stat_filters(flask)
     hybrid = next(row for row in filters if row.kind == "flask hybrid")
     assert hybrid.group_type == "not" and hybrid.enabled
+    assert hybrid.text == "効果減少を含む複合Modを除外"
+
+    reduced_hybrid = parse_item_text("""アイテムクラス: ユーティリティフラスコ
+レアリティ: マジック
+割り当てられた ダイヤモンドフラスコ
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「割り当てられた」 (ティア: 2) }
+チャージ回復量が60(55-60)%増加する
+効果が25%減少する
+""")
+    reduced_filters = resolve_trade_stat_filters(reduced_hybrid)
+    reduced_effect = next(
+        row for row in reduced_filters
+        if row.stat_id == "explicit.stat_2448920197"
+    )
+    assert reduced_effect.inverted and reduced_effect.enabled
+    assert not any(row.kind == "flask hybrid" for row in reduced_filters)
+    assert unresolved_modifier_warnings(reduced_hybrid, reduced_filters) == ()
 
     cluster = parse_item_text("""Item Class: Cluster Jewels
 Rarity: Rare
@@ -3129,10 +6239,63 @@ Item Level: 72
     assert next(row for row in filters if row.stat_id == "property.area_level").min_value == 78
 
 
-def test_cluster_is_dedicated_and_flask_tincture_ilvl_is_initially_disabled():
+def test_atzoatl_room_rules_match_awakened_priorities_and_visibility():
+    def room(ref, option=1):
+        return TradeStatFilter(
+            f"pseudo.{ref}", ref, None, "pseudo", True,
+            ref=ref, option_value=option,
+        )
+
+    area = TradeStatFilter(
+        "property.area_level", "エリアレベル", 78, "special", True,
+    )
+    rows = _apply_atzoatl_room_rules([
+        area,
+        room("Has Room: Banquet Hall"),
+        room("Has Room: Corruption Chamber (Tier 1)"),
+        room("Has Room: Locus of Corruption (Tier 3)"),
+        room("Has Room: Wealth of the Vaal (Tier 3)"),
+        room("Has Room: Treasury (Tier 2)"),
+        room("Has Room: Vault (Tier 1)"),
+        room("Has Room: Storm of Corruption (Tier 3)"),
+    ])
+    by_ref = {row.ref: row for row in rows if row.ref}
+
+    assert area in rows
+    assert "Has Room: Banquet Hall" not in by_ref
+    assert "Has Room: Corruption Chamber (Tier 1)" not in by_ref
+    assert by_ref["Has Room: Locus of Corruption (Tier 3)"].enabled
+    assert by_ref["Has Room: Wealth of the Vaal (Tier 3)"].enabled
+    assert not by_ref["Has Room: Treasury (Tier 2)"].enabled
+    assert by_ref["Has Room: Vault (Tier 1)"].hidden_reason
+    assert by_ref["Has Room: Storm of Corruption (Tier 3)"].hidden_reason
+
+
+def test_atzoatl_obstructed_room_requires_open_explosives():
+    def room(ref, option):
+        return TradeStatFilter(
+            f"pseudo.{ref}", ref, None, "pseudo", True,
+            ref=ref, option_value=option,
+        )
+
+    obstructed = room("Has Room: Treasury (Tier 2)", 2)
+    assert _apply_atzoatl_room_rules([obstructed]) == []
+
+    rows = _apply_atzoatl_room_rules([
+        room("Has Room: Explosives Room (Tier 1)", 1),
+        obstructed,
+    ])
+    assert len(rows) == 1
+    assert rows[0].ref == "Has Room: Treasury (Tier 2)"
+    assert rows[0].option_value is None
+    assert rows[0].enabled is False
+
+
+def test_cluster_uses_finished_and_base_presets_and_flask_tincture_ilvl_is_disabled():
     cluster = ParsedItem("Cluster Jewels", "Rare", "Test", "Large Cluster Jewel",
                          "cluster_jewel", item_level=84)
-    assert uses_dedicated_exact_preset(cluster)
+    assert not uses_dedicated_exact_preset(cluster)
+    assert available_trade_presets(cluster) == (PRESET_FINISHED, PRESET_BASE)
     for category, item_class, base in (
         ("flask", "Utility Flasks", "Granite Flask"),
         ("tincture", "Tinctures", "Prismatic Tincture"),
@@ -3160,20 +6323,295 @@ def test_rare_jewel_mods_start_off_and_magic_affixes_start_on():
         assert next(row for row in rows if row.stat_id == "explicit.life").enabled is expected
 
 
-def test_map_tier_starts_on_but_quantity_and_map_mods_start_off():
+def test_exact_map_starts_with_tier_and_only_t1_t2_explicit_mods_on():
     item = ParsedItem(
         "Maps", "Rare", "Test", "Cemetery Map", "map",
         properties={"Map Tier": "16", "Item Quantity": "+100%"},
-        modifiers=(ItemModifier(
-            "Monsters deal 100% extra Damage", (100,), kind="explicit",
-            stat_id="explicit.map_damage",
-        ),),
+        modifiers=(
+            ItemModifier(
+                "T1 Map Mod", (100,), kind="prefix", tier=1,
+                stat_id="explicit.map_t1",
+            ),
+            ItemModifier(
+                "T2 Map Mod", (80,), kind="suffix", tier=2,
+                stat_id="explicit.map_t2",
+            ),
+            ItemModifier(
+                "T3 Map Mod", (60,), kind="explicit", tier=3,
+                stat_id="explicit.map_t3",
+            ),
+        ),
     )
-    entries = ({"id": "explicit.map_damage", "text": "Monsters deal #% extra Damage",
-                "type": "explicit"},)
+    entries = tuple(
+        {"id": f"explicit.map_t{tier}", "text": f"T{tier} Map Mod", "type": "explicit"}
+        for tier in (1, 2, 3)
+    )
     with patch("src.poetore.trade._trade_stat_entries", return_value=entries):
         rows = resolve_trade_stat_filters(item)
     by_id = {row.stat_id: row for row in rows}
     assert by_id["property.map_tier"].enabled is True
-    assert by_id["property.map_quantity"].enabled is False
-    assert by_id["explicit.map_damage"].enabled is False
+    assert by_id["property.map_quantity"].enabled is True
+    assert by_id["explicit.map_t1"].enabled is True
+    assert by_id["explicit.map_t2"].enabled is True
+    assert by_id["explicit.map_t3"].enabled is False
+    query = build_search_query(
+        item, "Cemetery Map", rows, preset=PRESET_FINISHED,
+    )["query"]
+    assert [row["id"] for row in query["stats"][0]["filters"]] == [
+        "explicit.map_t1", "explicit.map_t2",
+    ]
+    map_filters = query["filters"]["map_filters"]["filters"]
+    assert map_filters["map_blighted"] == {"option": "false"}
+    assert map_filters["map_uberblighted"] == {"option": "false"}
+
+
+def test_non_corrupted_japanese_map_keeps_value_properties_in_search():
+    item = parse_item_text("""アイテムクラス: マップ
+レアリティ: レア
+古臭い名残
+マップ (ティア 16)
+--------
+アイテム数量: +90% (augmented)
+アイテムレアリティ: +53% (augmented)
+モンスターパックサイズ: +34% (augmented)
+--------
+アイテムレベル: 85
+--------
+モンスターレベル：83
+--------
+{ プレフィックスモッド「双生の」 (ティア: 1) }
+エリアには2体のユニークボスがいる — スケールできない値
+{ プレフィックスモッド「揺るがぬ」 (ティア: 1) — ライフ }
+モンスターのライフが29(25-30)%上昇する
+モンスターはスタンを受けることがない — スケールできない値
+{ プレフィックスモッド「耐呪の」 (ティア: 1) — キャスター, 呪い }
+モンスターはヘックスプルーフを持つ — スケールできない値
+{ サフィックスモッド 「停滞の」 (ティア: 1) — ライフ, マナ, 防御, エナジーシールド }
+全てのプレイヤーはライフ、マナおよびエナジーシールドを自動回復することができない — スケールできない値
+{ サフィックスモッド 「弱体化の」 (ティア: 1) — キャスター, 呪い }
+プレイヤーはエンフィーブルの呪いを受ける
+(エンフィーブルの呪術の一種で、対象の命中力を10%、ダメージを15%(レアやユニーク相手の場合9%)減少させる。持続時間は8秒)
+{ サフィックスモッド 「巨人の」 (ティア: 1) }
+モンスターの効果範囲が100%増加する
+--------
+自身のマップデバイスで使用することでこのティアまたはそれよりティアの低いマップに移動する。マップは一度のみ使用できる。
+""")
+
+    rows = resolve_trade_stat_filters(item)
+    by_id = {row.stat_id: row for row in rows}
+    expected = {
+        "property.map_quantity": 90.0,
+        "property.map_rarity": 53.0,
+        "property.map_pack_size": 34.0,
+    }
+    for stat_id, value in expected.items():
+        assert by_id[stat_id].min_value == value
+        assert by_id[stat_id].enabled is True
+
+    query = build_search_query(item, item.base_type, rows)["query"]
+    map_filters = query["filters"]["map_filters"]["filters"]
+    assert map_filters["map_iiq"] == {"min": 90.0}
+    assert map_filters["map_iir"] == {"min": 53.0}
+    assert map_filters["map_packsize"] == {"min": 34.0}
+
+
+def test_corrupted_map_value_properties_start_on():
+    item = ParsedItem(
+        "Maps", "Rare", "Test", "Cemetery Map", "map",
+        properties={
+            "Map Tier": "16", "Item Quantity": "+100%",
+            "Item Rarity": "+55%", "Monster Pack Size": "+32%",
+        },
+        flags=("corrupted",),
+    )
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        rows = resolve_trade_stat_filters(item)
+    by_id = {row.stat_id: row for row in rows}
+    for stat_id in (
+        "property.map_quantity", "property.map_rarity",
+        "property.map_pack_size",
+    ):
+        assert by_id[stat_id].enabled is True
+
+
+def test_more_drops_map_keeps_value_pseudos_off_by_default():
+    item = ParsedItem(
+        "Maps", "Rare", "Test", "Cemetery Map", "map",
+        properties={
+            "Map Tier": "16", "Item Quantity": "+100%",
+            "Item Rarity": "+55%", "Monster Pack Size": "+32%",
+            "More Scarabs": "150%",
+        },
+    )
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        rows = resolve_trade_stat_filters(item)
+    by_id = {row.stat_id: row for row in rows}
+    assert by_id["property.map_quantity"].enabled is True
+    assert by_id["property.map_rarity"].enabled is False
+    assert by_id["property.map_pack_size"].enabled is True
+    assert by_id["pseudo.pseudo_map_more_scarab_drops"].enabled is False
+
+
+def test_japanese_nightmare_map_new_more_drop_labels_and_mods_resolve():
+    item = parse_item_text("""アイテムクラス: マップ
+レアリティ: レア
+黒焦げの覚悟
+ナイトメアマップ
+--------
+アイテム数量: +101% (augmented)
+アイテムレアリティ: +63% (augmented)
+モンスターパックサイズ: +53% (augmented)
+マップ量が上昇: +35% (augmented)
+スカラベ量が上昇: +88% (augmented)
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「不安定な」 (ティア: 1) }
+レアモンスターはボラタイルコアを持つ
+{ サフィックスモッド 「ぬかるみの」 (ティア: 1) }
+プレイヤーの防御力が30(30-25)%低下する
+(アーマー、回避力、エナジーシールドは標準的な防御力である)
+{ サフィックスモッド 「耐久力の」 }
+モンスターはヒット時にエンデュランスチャージを1個獲得する
+{ サフィックスモッド 「ぬかるみの」 — アタック }
+全てのプレイヤーはスペルダメージを抑制して防ぐダメージ割合が-20%される
+(抑制したヒットによるダメージとそのヒットが付与した
+状態異常によるダメージの40%を防ぐ)
+--------
+コラプト状態
+""")
+    rows = resolve_trade_stat_filters(item)
+    by_id = {row.stat_id: row for row in rows}
+
+    assert by_id["pseudo.pseudo_map_more_map_drops"].min_value == 35
+    assert by_id["pseudo.pseudo_map_more_map_drops"].text == "マップ量"
+    assert by_id["pseudo.pseudo_map_more_scarab_drops"].min_value == 88
+    assert by_id["pseudo.pseudo_map_more_scarab_drops"].text == "スカラベ量"
+    assert by_id["property.map_rarity"].enabled is False
+    assert by_id["explicit.stat_1706239920"].min_value == 100
+    assert by_id["explicit.stat_943960754"].min_value == 30
+    assert by_id["explicit.stat_943960754"].inverted is True
+    assert by_id["explicit.stat_687813731"].min_value == 100
+    assert by_id["explicit.stat_286947568"].min_value == -20
+    assert unresolved_modifier_warnings(item, rows) == ()
+    query = build_search_query(item, "Nightmare Map", rows)["query"]
+    api_rows = {
+        row["id"]: row.get("value", {})
+        for group in query["stats"] for row in group["filters"]
+    }
+    assert api_rows["explicit.stat_943960754"] == {"max": -30.0}
+
+
+def test_japanese_map_new_currency_and_divination_card_drop_labels_resolve():
+    item = parse_item_text("""アイテムクラス: マップ
+レアリティ: レア
+苦悩する中核
+マップ (ティア 16)
+--------
+アイテム数量: +80% (augmented)
+アイテムレアリティ: +41% (augmented)
+モンスターパックサイズ: +26% (augmented)
+カレンシー量が上昇: +139% (augmented)
+占いカード増加: +50% (augmented)
+品質 (占いカード): +20% (augmented)
+--------
+アイテムレベル: 85
+--------
+モンスターレベル：83
+--------
+{ 暗黙モッド }
+エリアはオリジネイターのメモリーインフルエンスを受けている
+--------
+コラプト状態
+""")
+    rows = resolve_trade_stat_filters(item)
+    by_id = {row.stat_id: row for row in rows}
+
+    currency = by_id["pseudo.pseudo_map_more_currency_drops"]
+    assert currency.text == "カレンシー量"
+    assert currency.min_value == 139
+    assert currency.enabled is False
+
+    cards = by_id["pseudo.pseudo_map_more_card_drops"]
+    assert cards.text == "占いカード量"
+    assert cards.min_value == 50
+    assert cards.enabled is False
+
+    query = build_search_query(item, item.base_type, rows)["query"]
+    api_rows = {
+        row["id"]: row.get("value", {})
+        for group in query["stats"] for row in group["filters"]
+    }
+    assert "pseudo.pseudo_map_more_currency_drops" not in api_rows
+    assert "pseudo.pseudo_map_more_card_drops" not in api_rows
+
+    selected = tuple(
+        replace(row, enabled=True)
+        if row.stat_id == "pseudo.pseudo_map_more_currency_drops" else row
+        for row in rows
+    )
+    selected_query = build_search_query(item, item.base_type, selected)["query"]
+    selected_rows = {
+        row["id"]: row.get("value", {})
+        for group in selected_query["stats"] for row in group["filters"]
+    }
+    assert selected_rows["pseudo.pseudo_map_more_currency_drops"] == {"min": 139.0}
+
+
+def test_corrupted_eight_mod_map_keeps_modifier_count_pseudo_off_by_default():
+    modifiers = tuple(
+        ItemModifier(
+            f"Map modifier {index}", (index,),
+            kind="prefix" if index < 4 else "suffix",
+        )
+        for index in range(8)
+    )
+    item = ParsedItem(
+        "Maps", "Rare", "Test", "Cemetery Map", "map",
+        properties={"Map Tier": "16", "Item Quantity": "+100%"},
+        modifiers=modifiers, flags=("corrupted",),
+    )
+    with patch("src.poetore.trade._trade_stat_entries", return_value=()):
+        rows = resolve_trade_stat_filters(item)
+    count = next(
+        row for row in rows
+        if row.stat_id == "pseudo.pseudo_number_of_affix_mods"
+    )
+    assert count.enabled is False
+    assert count.min_value == 8
+    assert count.max_value == 8
+    query = build_search_query(
+        item, "Cemetery Map", rows, preset=PRESET_FINISHED,
+    )["query"]
+    assert query["stats"][0]["filters"] == []
+
+
+def test_japanese_elegant_hubris_advanced_copy_uses_exact_caspiro_seed():
+    item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: ユニーク
+上品な慢心
+タイムレスジュエル
+--------
+アイテムレベル: 80
+--------
+カスピロの記念コインを18920個鋳造した (カディーロ-ヴィクタリオ)
+範囲内のパッシブスキルは永遠なる帝国により征服される
+--------
+パッシブツリーで割り当てられたジュエルソケットにはめる。右クリックしてソケットから取り外すことができる。
+""")
+
+    rows = resolve_trade_stat_filters(item, trade_name="Elegant Hubris")
+    caspiro = next(
+        row for row in rows
+        if row.stat_id == "explicit.pseudo_timeless_jewel_caspiro"
+    )
+    assert caspiro.enabled is True
+    assert caspiro.min_value == 18920
+    assert caspiro.max_value == 18920
+    assert unresolved_modifier_warnings(item, rows) == ()
+
+    query = build_search_query(item, "Timeless Jewel", rows)["query"]
+    assert {
+        "id": "explicit.pseudo_timeless_jewel_caspiro",
+        "value": {"min": 18920.0, "max": 18920.0},
+    } in query["stats"][0]["filters"]

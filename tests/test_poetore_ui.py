@@ -2,33 +2,223 @@ from unittest.mock import Mock, patch
 from dataclasses import replace
 from datetime import datetime, timezone
 import csv
+import math
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt
-from PySide6.QtGui import QPalette
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt, QTimer
+from PySide6.QtGui import QFontMetrics, QKeyEvent, QMouseEvent, QPalette, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QCheckBox, QComboBox, QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QTreeWidgetItem, QWidget
 import pytest
 
 from src.poetore.ui import (
-    PoetoreWindow, _UniqueRollSlider, _replace_filters_with_special_chips,
-    show_poetore_window,
+    PoetoreWindow, _ACTION_CLUSTER_HORIZONTAL_GAP, _ACTION_CLUSTER_VERTICAL_GAP,
+    _DISPLAY_SIZE_PROFILES,
+    _MOD_COLUMN_CHECK, _MOD_COLUMN_KIND, _MOD_COLUMN_MAX, _MOD_COLUMN_MIN, _MOD_COLUMN_TEXT,
+    _MOD_ROW_HEIGHT,
+    _UniqueRollSlider, _auto_mod_layout_sizes, _replace_filters_with_special_chips, prepare_poetore_window,
+    show_poetore_window, _price_currency_icon_filename,
 )
-from src.poetore.window_position import PlacementContext
+from src.utils.poe_version_data import POE1, POE2
+
+
+def test_obs_streaming_mode_keeps_one_window_and_collapses_instead_of_closing(qapp):
+    config = {"poetore": {"obs_streaming": {
+        "enabled": True, "title_bar_opacity": 35, "geometry": {},
+    }}}
+    saved = []
+    window = PoetoreWindow(app_config=config, save_config=lambda value: saved.append(value))
+    try:
+        expanded_height = window.height()
+        window.set_obs_streaming_mode(True)
+        qapp.processEvents()
+        obs_window_id = int(window.winId())
+
+        assert window.isVisible()
+        assert window.windowTitle() == "ぽえとれ - 検索結果ウィンドウ"
+        assert window.windowType() == Qt.Window
+        assert window.height() < expanded_height
+        assert window.height() == 30
+        assert window.windowOpacity() == pytest.approx(0.35, abs=0.005)
+        assert window._title_bar._obs_title_label.text() == "ぽえとれ検索ウィンドウ"
+        assert window._title_bar._obs_title_label.isVisible()
+        assert window._title_bar._expanded_controls.isHidden()
+        assert window._obs_content.isHidden()
+        assert not window.item_header.isVisible()
+        assert not window.trade_preset_combo.isVisible()
+        assert int(window.winId()) == obs_window_id
+
+        # ホットキー受付直後に毎回走る表示サイズ反映では、検索結果が完成する
+        # まで30pxの待機バーから拡大しない。
+        window.apply_result_display_size()
+        qapp.processEvents()
+        assert window.height() == 30
+        assert window._title_bar._obs_title_label.isVisible()
+        assert window._obs_content.isHidden()
+
+        # アイテム解析でMod行が組み上がり、高さが再計算されても待機バーの
+        # 実サイズは変えず、展開予定サイズだけを更新する。
+        window.mod_filter_tree.addTopLevelItem(QTreeWidgetItem(["", "", "Explicit", "Test mod"]))
+        window._adjust_window_height_to_mod_rows()
+        qapp.processEvents()
+        assert window.height() == 30
+        assert window._obs_expanded_size.height() > 30
+
+        window.show_at_context(activate=False)
+        qapp.processEvents()
+        assert window.height() == window._obs_expanded_size.height()
+        assert window.height() > 30
+        assert window.windowOpacity() == pytest.approx(1.0)
+        assert window._title_bar._obs_title_label.isHidden()
+        assert not window._title_bar._expanded_controls.isHidden()
+        assert not window._obs_content.isHidden()
+        assert window.item_header.isVisible()
+        assert window.trade_preset_combo.isVisible()
+        assert window.trade_league_combo.isVisible()
+        assert window.league_popup_button.isVisible()
+        assert window.poetore_close_button.isVisible()
+        assert int(window.winId()) == obs_window_id
+
+        window._dismiss_result()
+        qapp.processEvents()
+        assert window.isVisible()
+        assert window.height() < expanded_height
+        assert window.windowOpacity() == pytest.approx(0.35, abs=0.005)
+        assert saved
+    finally:
+        window.set_obs_streaming_mode(False)
+        window.close()
+
+
+def test_obs_expand_is_hidden_until_show_at_context_finishes(qapp):
+    window = PoetoreWindow(app_config={"poetore": {"obs_streaming": {"enabled": True}}})
+    try:
+        window.set_obs_streaming_mode(True)
+        qapp.processEvents()
+        assert window.isVisible()
+
+        window._expand_for_obs()
+        qapp.processEvents()
+        assert not window.isVisible()
+        assert not window._title_bar._expanded_controls.isHidden()
+        assert not window._obs_content.isHidden()
+
+        window.show_at_context(activate=False)
+        qapp.processEvents()
+        assert window.isVisible()
+        assert not window._obs_collapsed
+    finally:
+        window.set_obs_streaming_mode(False)
+        window.close()
+
+
+def test_obs_streaming_header_drags_and_expanded_result_dismisses(qapp):
+    window = PoetoreWindow(app_config={"poetore": {"obs_streaming": {"enabled": True}}})
+
+    def mouse_event(event_type, global_point, *, button=Qt.NoButton, buttons=Qt.NoButton):
+        return QMouseEvent(
+            event_type, QPointF(10, 10), QPointF(global_point),
+            button, buttons, Qt.NoModifier,
+        )
+
+    try:
+        window.set_obs_streaming_mode(True)
+        qapp.processEvents()
+        start = window.pos()
+        press_at = window.frameGeometry().topLeft() + QPoint(10, 10)
+        window._title_bar.mousePressEvent(
+            mouse_event(
+                QEvent.MouseButtonPress, press_at,
+                button=Qt.LeftButton, buttons=Qt.LeftButton,
+            )
+        )
+        window._title_bar.mouseMoveEvent(
+            mouse_event(
+                QEvent.MouseMove, press_at + QPoint(35, 20), buttons=Qt.LeftButton,
+            )
+        )
+        window._title_bar.mouseReleaseEvent(
+            mouse_event(
+                QEvent.MouseButtonRelease, press_at + QPoint(35, 20),
+                button=Qt.LeftButton,
+            )
+        )
+        assert window.pos() == start + QPoint(35, 20)
+
+        window.show_at_context(activate=True)
+        qapp.processEvents()
+        assert not window._obs_collapsed
+
+        escape = QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier)
+        assert window.eventFilter(window, escape)
+        qapp.processEvents()
+        assert window._obs_collapsed
+
+        window.show_at_context(activate=True)
+        outside = QWidget()
+        window._close_when_focus_leaves_panel(window.item_name_label, outside)
+        qapp.processEvents()
+        assert window._obs_collapsed
+
+        window.show_at_context(activate=True)
+        with patch.object(window, "_close_if_focus_is_still_outside") as close_outside:
+            QApplication.sendEvent(window, QEvent(QEvent.WindowDeactivate))
+            qapp.processEvents()
+            close_outside.assert_called_once_with()
+    finally:
+        window.set_obs_streaming_mode(False)
+        window.close()
+
+
+def test_obs_streaming_mode_restores_saved_position_and_expanded_size(qapp):
+    config = {"poetore": {"obs_streaming": {"enabled": True, "geometry": {
+        "x": 120, "y": 140, "width": 700, "height": 760,
+    }}}}
+    window = PoetoreWindow(app_config=config)
+    try:
+        window.set_obs_streaming_mode(True)
+        qapp.processEvents()
+        assert window.pos() == QPoint(120, 140)
+        assert window._obs_expanded_size == QSize(700, 760)
+        window.show_at_context(activate=False)
+        qapp.processEvents()
+        assert not window._obs_collapsed
+        assert window.height() > window._title_bar.height()
+    finally:
+        window.set_obs_streaming_mode(False)
+        window.close()
+from src.poetore.window_position import PlacementContext, position_for_context
 from src.poetore.trade import (
-    PRESET_FINISHED, PriceListing, PriceResult, TradeLeague, TradeStatFilter,
-    build_search_query, resolve_trade_stat_filters,
+    PRESET_BASE, PRESET_FINISHED, PriceListing, PriceResult, TradeLeague, TradeStatFilter,
+    UniqueCandidate, available_trade_presets, build_search_query, resolve_trade_stat_filters,
 )
 from src.poetore.parser import parse_item_text
+from src.poetore.poe2.parser import parse_item_text as parse_poe2_item_text
+from src.poetore.poe2.audit import _EQUIPMENT_FIXTURES, _RARITIES, _item as poe2_audit_item
+from src.poetore.poe2.trade import build_search_query as build_poe2_search_query, poe2_trade_filters
 from src.poetore.models import ItemModifier, ParsedItem
-from src.poetore.poe_ninja import PoeNinjaPrice
+from src.poetore.poe_ninja import PoeNinjaPrice, default_poe_ninja_service
+from src.poetore.official_exchange import (
+    CHAOS, DIVINE, EXALTED, ResolvedReferencePrice,
+)
 from src.ui.settings_dialog import SettingsDialog
+from src.ui.styles import Styles
 
 
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+@pytest.fixture
+def deterministic_global_cursor(monkeypatch):
+    """Keep listener-coordinate tests independent from the real CI cursor."""
+    monkeypatch.setattr(
+        PoetoreWindow,
+        "_global_cursor_point",
+        lambda _self, x, y: QPoint(x, y),
+    )
 
 
 def test_poetore_window_always_accepts_mouse_input(qapp):
@@ -60,13 +250,410 @@ def test_poetore_window_always_accepts_mouse_input(qapp):
         assert not hasattr(window, "disclaimer_label")
         assert window.trade_league_combo.currentData() == "auto"
         assert window._selected_trade_league() is None
-        assert window.width() == 720
-        assert window.minimumWidth() == 680
+        assert window.width() == 650
+        assert window.minimumWidth() == 610
         assert window.height() == 1039
         assert window.price_list.minimumHeight() == 434
         assert window.trade_url_button.text() == "公式トレード  ↗"
         assert window.trade_url_button.toolTip() == "日本語公式Tradeをブラウザで開く"
         assert all(button.text() != "貼り付け" for button in window.findChildren(QPushButton))
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("setting", "font_px", "width", "height", "minimum_width"),
+    (
+        ("small", 12, 560, 1039, 540),
+        ("medium", 14, 650, 1039, 610),
+        ("large", 16, 740, 1039, 680),
+    ),
+)
+def test_poetore_result_display_size_scales_window_and_controls(
+    qapp, setting, font_px, width, height, minimum_width,
+):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": setting}}
+    )
+    try:
+        assert window._result_font_size == setting
+        assert window.width() == width
+        assert window.height() == height
+        assert window.minimumWidth() == minimum_width
+        assert f"font-size: {font_px}px" in window.styleSheet()
+        assert window.trade_league_combo.width() == round(238 * font_px / 12)
+        assert window.league_refresh_button.width() == round(62 * font_px / 12)
+        assert window.mod_filter_tree.minimumHeight() > 0
+        assert window.price_list.minimumHeight() > 0
+    finally:
+        window.close()
+
+
+def test_poetore_result_display_size_can_change_on_existing_window(qapp):
+    config = {"poetore": {"result_font_size": "small"}}
+    window = PoetoreWindow(app_config=config)
+    try:
+        config["poetore"]["result_font_size"] = "large"
+        window.apply_result_display_size()
+
+        assert window._result_font_size == "large"
+        assert window.width() == 740
+        assert window.height() == 1039
+        assert "font-size: 16px" in window.styleSheet()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("setting", "compact_font", "search_button_width"),
+    (
+        ("small", 11, 105),
+        ("medium", 12, 122),
+        ("large", 14, 140),
+    ),
+)
+def test_trade_action_row_uses_compact_fonts_and_fits_window(
+    qapp, setting, compact_font, search_button_width,
+):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": setting}}
+    )
+    try:
+        window.show()
+        qapp.processEvents()
+        controls = (
+            window.trade_status_combo,
+            window.trade_currency_combo,
+            window.listed_within_combo,
+            window.trade_url_button,
+        )
+        assert all(control.property("compactAction") for control in controls)
+        assert (
+            f"font-size: {compact_font}px;\n                padding: 2px 1px;"
+            in window.styleSheet()
+        )
+        assert controls[-1].geometry().right() < window._panel.width()
+        assert all(combo.minimumWidth() == combo.maximumWidth() for combo in controls[:3])
+        assert window.price_button.width() == search_button_width
+        assert window.trade_action_layout.alignment() == Qt.AlignLeft
+        assert (
+            window.search_range_combo.minimumWidth()
+            == window.search_range_combo.maximumWidth()
+        )
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("setting", ("small", "medium", "large"))
+def test_action_cluster_uses_consistent_spacing_at_every_display_size(
+    qapp, setting,
+):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": setting}}
+    )
+    try:
+        window.show()
+        qapp.processEvents()
+        zero_margins = (0, 0, 0, 0)
+
+        assert _ACTION_CLUSTER_HORIZONTAL_GAP == 6
+        assert _ACTION_CLUSTER_VERTICAL_GAP == 10
+        assert window.action_cluster_layout.spacing() == _ACTION_CLUSTER_VERTICAL_GAP
+        assert window.mod_conditions_actions_layout.spacing() == _ACTION_CLUSTER_HORIZONTAL_GAP
+        assert window.mercenary_supports_actions_layout.spacing() == _ACTION_CLUSTER_HORIZONTAL_GAP
+        assert window.trade_action_layout.spacing() == _ACTION_CLUSTER_HORIZONTAL_GAP
+        assert window.action_cluster_layout.getContentsMargins() == zero_margins
+        assert window.mod_conditions_actions_layout.getContentsMargins() == zero_margins
+        assert window.mercenary_supports_actions_layout.getContentsMargins() == zero_margins
+        assert window.trade_action_layout.getContentsMargins() == zero_margins
+        assert "QLabel#priceStatus { color: #98A39F; padding: 1px 0; }" in window.styleSheet()
+    finally:
+        window.close()
+
+
+def test_selected_controls_use_dark_variant_of_current_accent(qapp):
+    window = PoetoreWindow()
+    try:
+        style = window.styleSheet()
+        assert "#65FFCA" in style
+        assert "rgba(37, 122, 100, 225)" in style
+        assert "rgba(35, 118, 100" not in style
+    finally:
+        window.close()
+
+
+def test_capture_error_dialog_uses_readable_dark_theme(qapp):
+    window = PoetoreWindow()
+    try:
+        dialog = window._build_capture_error_dialog()
+        style = dialog.styleSheet()
+
+        assert dialog.icon() == QMessageBox.Icon.Warning
+        assert dialog.text() == (
+            "アイテムを取得できませんでした。\n"
+            "PoEがアクティブでない可能性があります。\n"
+            "PoEを前面にしてアイテムへカーソルを合わせ、\n"
+            "もう一度 Alt + D を押してください。"
+        )
+        assert "background-color: #111111" in style
+        assert "color: #E6ECEA" in style
+        assert "color: #65FFCA" in style
+        assert "min-width: 290px" not in style
+        assert dialog.standardButtons() == QMessageBox.StandardButton.Ok
+        dialog.ensurePolished()
+        dialog.adjustSize()
+        assert dialog.sizeHint().width() < 450
+    finally:
+        window.close()
+
+
+def test_capture_error_dialog_uses_configured_interactive_hotkey(qapp):
+    window = PoetoreWindow(
+        app_config={"hotkeys": {"poetore_capture": "ctrl+shift+p"}}
+    )
+    try:
+        dialog = window._build_capture_error_dialog()
+
+        assert dialog.text().endswith(
+            "もう一度 Ctrl + Shift + P を押してください。"
+        )
+    finally:
+        window.close()
+
+
+def test_capture_failure_opens_the_dark_error_dialog_when_enabled(qapp):
+    window = PoetoreWindow(
+        app_config={
+            "poetore": {"capture_error_notification_enabled": True}
+        }
+    )
+    dialog = Mock()
+    try:
+        with patch(
+            "src.poetore.ui.read_item_clipboard",
+            return_value="",
+        ), patch.object(
+            window,
+            "_build_capture_error_dialog",
+            return_value=dialog,
+        ) as build:
+            window._capture_item_copy()
+
+        build.assert_called_once()
+        assert build.call_args.args == ()
+        dialog.exec.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_capture_failure_can_suppress_only_the_capture_error_dialog(qapp):
+    window = PoetoreWindow(
+        app_config={
+            "poetore": {"capture_error_notification_enabled": False}
+        }
+    )
+    try:
+        with patch(
+            "src.poetore.ui.read_item_clipboard",
+            return_value="",
+        ), patch.object(window, "_build_capture_error_dialog") as build:
+            window._capture_item_copy()
+
+        build.assert_not_called()
+        assert window._last_capture_parse_error
+    finally:
+        window.close()
+
+
+def test_capture_failure_notification_is_disabled_by_default(qapp):
+    window = PoetoreWindow()
+    try:
+        with patch(
+            "src.poetore.ui.read_item_clipboard",
+            return_value="",
+        ), patch.object(window, "_build_capture_error_dialog") as build:
+            window._capture_item_copy()
+
+        build.assert_not_called()
+    finally:
+        window.close()
+
+
+def test_capture_failure_preserves_parser_reason_for_diagnostics(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    dialog = Mock()
+    try:
+        with patch("src.poetore.ui.read_item_clipboard", return_value="not an item"), patch.object(
+            window, "_build_capture_error_dialog", return_value=dialog
+        ):
+            window._capture_item_copy()
+
+        assert "rarity未取得" in window._last_capture_parse_error
+    finally:
+        window.close()
+
+
+def test_poe2_alt_d_capture_accepts_meta_gem_with_windows_bidi_marker(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    copied = """\u202aレアリティ: ジェム
+ブラスファミー
+--------
+バフ, 永続, 範囲効果, オーラ, メタ
+レベル: 10
+--------
+装備条件：レベル 36, 65 知性
+--------
+ソケット: G G
+--------
+ソケットされたすべての呪いスキルを凶悪なオーラに変化させる。
+"""
+    try:
+        with patch("src.poetore.ui.read_item_clipboard", return_value=copied), patch.object(
+            window, "_build_capture_error_dialog"
+        ) as error_dialog:
+            window._capture_item_copy()
+
+        error_dialog.assert_not_called()
+        assert window._parsed_item.category == "meta_gem"
+        assert window._parsed_item.base_type == "Blasphemy"
+        assert window._parsed_item.properties["ソケット"] == "G G"
+    finally:
+        window.close()
+
+
+def test_capture_from_poe_remembers_the_verified_game_window(qapp):
+    window = PoetoreWindow()
+    try:
+        with patch("src.poetore.ui.get_foreground_window", return_value=1234), patch(
+            "src.poetore.ui.is_path_of_exile_window", return_value=True,
+        ) as verify, patch("pynput.keyboard.Controller"), patch.object(
+            QTimer, "singleShot",
+        ):
+            window.capture_from_poe()
+
+        verify.assert_called_once_with(1234)
+        assert window._poe_window_hwnd == 1234
+    finally:
+        window.close()
+
+
+def test_auto_hide_capture_remembers_mode_and_cursor_origin(qapp):
+    window = PoetoreWindow()
+    context = PlacementContext(QRect(0, 0, 1920, 1080), QPoint(500, 400))
+    try:
+        controller = Mock()
+        with patch("src.poetore.ui.capture_placement_context", return_value=context), patch(
+            "pynput.keyboard.Controller", return_value=controller,
+        ), patch.object(QTimer, "singleShot") as single_shot:
+            window.capture_from_poe(
+                auto_hide=True, capture_hotkey="ctrl+d",
+            )
+
+        assert window._capture_auto_hide is True
+        assert window._auto_hide_hotkey_released is False
+        assert window._auto_hide_origin == QPoint(500, 400)
+        assert window._capture_copy_keys == ("c",)
+        controller.release.assert_called_once_with("d")
+        assert [call.args[0] for call in single_shot.call_args_list] == [30, 250]
+    finally:
+        window.close()
+
+
+def test_alt_auto_hide_copy_uses_ctrl_c_without_changing_the_alt_hold_key(qapp):
+    window = PoetoreWindow()
+    try:
+        with patch("pynput.keyboard.Controller"), patch.object(QTimer, "singleShot"):
+            window.capture_from_poe(auto_hide=True, capture_hotkey="alt+q")
+
+        assert window._capture_copy_keys[1] == "c"
+        assert len(window._capture_copy_keys) == 2
+    finally:
+        window.close()
+
+
+def test_capture_copy_starts_as_soon_as_hotkey_is_fully_released(qapp):
+    window = PoetoreWindow()
+    try:
+        with patch("pynput.keyboard.Controller"), patch.object(
+            QTimer, "singleShot",
+        ) as single_shot, patch.object(window, "_send_copy") as send_copy:
+            window.capture_from_poe()
+            window.capture_hotkey_released()
+
+        assert single_shot.call_args.args[0] == 250
+        send_copy.assert_called_once_with(window._capture_copy_keys, window._capture_item_copy)
+    finally:
+        window.close()
+
+
+def test_capture_copy_timeout_preserves_previous_250ms_fallback(qapp):
+    window = PoetoreWindow()
+    scheduled = []
+    try:
+        with patch("pynput.keyboard.Controller"), patch.object(
+            QTimer, "singleShot", side_effect=lambda delay, fn: scheduled.append((delay, fn)),
+        ), patch.object(window, "_send_copy") as send_copy:
+            window.capture_from_poe()
+            assert scheduled[0][0] == 250
+            scheduled[0][1]()
+            window.capture_hotkey_released()
+
+        send_copy.assert_called_once_with(window._capture_copy_keys, window._capture_item_copy)
+    finally:
+        window.close()
+
+
+def test_copy_continues_immediately_when_clipboard_generation_changes(qapp):
+    window = PoetoreWindow()
+    window._capture_keyboard = Mock()
+    callback = Mock()
+    try:
+        with patch(
+            "src.poetore.ui.clipboard_change_token",
+            side_effect=[("windows", 10), ("windows", 11)],
+        ), patch.object(QTimer, "singleShot") as single_shot:
+            window._send_copy(("ctrl", "c"), callback)
+
+        callback.assert_called_once_with()
+        single_shot.assert_not_called()
+    finally:
+        window.close()
+
+
+def test_copy_polls_until_clipboard_generation_changes(qapp):
+    window = PoetoreWindow()
+    window._clipboard_wait_generation = 1
+    callback = Mock()
+    scheduled = []
+    try:
+        with patch(
+            "src.poetore.ui.clipboard_change_token",
+            side_effect=[("windows", 10), ("windows", 11)],
+        ), patch.object(
+            QTimer, "singleShot", side_effect=lambda delay, fn: scheduled.append((delay, fn)),
+        ):
+            window._wait_for_clipboard_update(("windows", 10), callback, 1, 0)
+            callback.assert_not_called()
+            assert scheduled[0][0] == 10
+            scheduled.pop(0)[1]()
+
+        callback.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_copy_uses_existing_capture_after_clipboard_timeout(qapp):
+    window = PoetoreWindow()
+    window._clipboard_wait_generation = 1
+    callback = Mock()
+    try:
+        with patch(
+            "src.poetore.ui.clipboard_change_token", return_value=("windows", 10),
+        ), patch.object(QTimer, "singleShot") as single_shot:
+            window._wait_for_clipboard_update(("windows", 10), callback, 1, 300)
+
+        callback.assert_called_once_with()
+        single_shot.assert_not_called()
     finally:
         window.close()
 
@@ -99,6 +686,139 @@ def test_show_poetore_window_is_independent_from_owner(qapp):
         window.close()
 
 
+def test_prepare_poetore_window_has_no_trade_api_side_effect(qapp):
+    owner = Mock()
+    owner._poetore_window = None
+    owner.config = {}
+    with patch.object(PoetoreWindow, "refresh_trade_leagues") as refresh, patch(
+        "src.poetore.trade._request_json",
+    ) as request_json:
+        window = prepare_poetore_window(owner)
+    try:
+        assert owner._poetore_window is window
+        assert not window.isVisible()
+        refresh.assert_not_called()
+        request_json.assert_not_called()
+    finally:
+        window.close()
+
+
+def test_poetore_window_refreshes_owner_hwnd_each_time_it_is_shown(qapp):
+    owner = Mock()
+    owner._poetore_window = None
+    owner.config = {}
+    window = prepare_poetore_window(owner)
+    try:
+        owner._poetore_result_hwnd = -1
+        window.show()
+        qapp.processEvents()
+        assert owner._poetore_result_hwnd == int(window.winId())
+
+        owner._poetore_result_hwnd = -1
+        window.hide()
+        window.show()
+        qapp.processEvents()
+        assert owner._poetore_result_hwnd == int(window.winId())
+    finally:
+        window.close()
+
+
+def test_329_single_copy_is_parsed_without_normal_and_detailed_merge(qapp):
+    copied = """アイテムクラス: 靴
+レアリティ: ユニーク
+破滅の軌跡
+メッシュブーツ
+--------
+アイテムレベル: 41
+--------
+{ ユニークモッド — スピード }
+移動スピードが15%増加する
+"""
+    window = PoetoreWindow()
+    qapp.clipboard().setText(copied)
+    window._placement_context = PlacementContext(
+        QRect(0, 0, 1920, 1080), QPoint(100, 100),
+    )
+    parsed = ParsedItem("Boots", "Unique", "破滅の軌跡", "メッシュブーツ", "armour", raw_text=copied)
+    try:
+        with patch(
+            "src.poetore.ui.read_item_clipboard",
+            return_value=copied,
+        ), patch(
+            "src.poetore.ui.parse_item_text",
+            return_value=parsed,
+        ), patch(
+            "src.poetore.ui.english_trade_identity",
+            return_value=("Mesh Boots", "Wake of Destruction"),
+        ), patch.object(window, "parse_current_text") as parse, patch.object(
+            window, "show_at_context",
+        ) as show, patch.object(window, "search_current_item") as search:
+            window._capture_item_copy()
+
+        assert window.input_edit.toPlainText() == copied
+        assert window._trade_base_type == "Mesh Boots"
+        assert window._trade_item_name == "Wake of Destruction"
+        parse.assert_called_once_with()
+        show.assert_called_once_with(window._placement_context, activate=True)
+        search.assert_called_once_with()
+        assert not hasattr(window, "_normal_copy_text")
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("poe_version", "rarity", "category", "deferred"),
+    [
+        ("poe2", "rare", "boots", True),
+        ("poe2", "レア", "amulet", True),
+        ("poe2", "unique", "belt", False),
+        ("poe2", "currency", "currency", False),
+        ("poe1", "rare", "boots", False),
+    ],
+)
+def test_only_poe2_rare_equipment_defers_hotkey_initial_search(
+    qapp, poe_version, rarity, category, deferred,
+):
+    window = PoetoreWindow(app_config={"poe_version": poe_version})
+    copied = "test item"
+    item = ParsedItem(
+        "Boots", rarity, "Test Item", "Test Base", category, raw_text=copied,
+    )
+    window._placement_context = PlacementContext(
+        QRect(0, 0, 1920, 1080), QPoint(100, 100),
+    )
+    try:
+        window._show_price_result(PriceResult(
+            "Mirage", "old-query", 1, (PriceListing(300, "exalted"),),
+            web_url="https://example.invalid/old-trade",
+        ))
+        assert window.price_list.topLevelItemCount() == 1
+        with patch(
+            "src.poetore.ui.read_item_clipboard", return_value=copied,
+        ), patch.object(
+            window, "_parse_item_text", return_value=item,
+        ), patch.object(
+            window, "parse_current_text",
+        ), patch.object(
+            window, "show_at_context",
+        ), patch.object(window, "search_current_item") as search:
+            window._capture_item_copy()
+
+        if deferred:
+            search.assert_not_called()
+            assert window.price_status.text() == "検索条件を確認して「検索」を押してください。"
+            assert window.price_button.isEnabled()
+            assert window.price_list.topLevelItemCount() == 0
+            assert window._last_price_result is None
+            assert window._last_trade_url == ""
+            assert not window.trade_url_button.isEnabled()
+            assert window.additional_results_button.isHidden()
+        else:
+            search.assert_called_once_with()
+    finally:
+        window.close()
+
+
 def test_show_at_context_places_window_inward_from_cursor_side(qapp):
     window = PoetoreWindow()
     try:
@@ -107,7 +827,7 @@ def test_show_at_context_places_window_inward_from_cursor_side(qapp):
             window, "activateWindow"
         ):
             window.show_at_context(context)
-        assert window.pos() == QPoint(634, 50)
+        assert window.pos() == QPoint(704, 50)
     finally:
         window.close()
 
@@ -143,7 +863,21 @@ def test_show_at_context_can_display_without_activating(qapp):
         window.close()
 
 
-def test_passive_hotkey_display_closes_only_for_outside_click(qapp):
+def test_show_at_context_interactive_starts_outside_click_listener(qapp):
+    window = PoetoreWindow()
+    try:
+        context = PlacementContext(QRect(0, 0, 1920, 1080), QPoint(500, 400))
+        with patch.object(window, "show"), patch.object(window, "raise_"), patch.object(
+            window, "_start_outside_click_listener",
+        ) as start_listener:
+            window.show_at_context(context, activate=True)
+
+        start_listener.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_passive_hotkey_display_closes_only_for_outside_click(qapp, deterministic_global_cursor):
     window = PoetoreWindow()
     try:
         window.setGeometry(100, 100, 720, 1039)
@@ -160,6 +894,142 @@ def test_passive_hotkey_display_closes_only_for_outside_click(qapp):
         window.close()
 
 
+def test_interactive_display_also_closes_for_outside_global_click(
+    qapp, deterministic_global_cursor,
+):
+    window = PoetoreWindow()
+    try:
+        window.setGeometry(100, 100, 720, 1039)
+        window.show()
+        window._passive_hotkey_display = False
+        qapp.processEvents()
+
+        window._handle_global_mouse_press(200, 200)
+        assert window.isVisible()
+
+        window._handle_global_mouse_press(50, 50)
+        assert not window.isVisible()
+    finally:
+        window.close()
+
+
+def test_auto_hide_closes_only_after_release_and_mouse_threshold(qapp, deterministic_global_cursor):
+    window = PoetoreWindow()
+    try:
+        window.setGeometry(1000, 100, 720, 1039)
+        window.show()
+        window._passive_hotkey_display = True
+        window._capture_auto_hide = True
+        window._auto_hide_origin = QPoint(500, 400)
+        qapp.processEvents()
+
+        window._handle_global_mouse_move(550, 400)
+        assert window.isVisible()
+
+        window.capture_hotkey_released()
+        window._handle_global_mouse_move(520, 400)
+        assert window.isVisible()
+        window._handle_global_mouse_move(541, 400)
+        assert not window.isVisible()
+    finally:
+        window.close()
+
+
+def test_auto_hide_can_become_interactive_while_hotkey_is_held(qapp, deterministic_global_cursor):
+    window = PoetoreWindow()
+    try:
+        window.setGeometry(100, 100, 720, 1039)
+        window.show()
+        window._passive_hotkey_display = True
+        window._capture_auto_hide = True
+        window._auto_hide_hotkey_released = False
+        qapp.processEvents()
+
+        with patch.object(window, "_stop_outside_click_listener") as stop, patch.object(
+            window, "activateWindow"
+        ) as activate:
+            window._handle_global_mouse_move(200, 200)
+
+        assert window._passive_hotkey_display is False
+        assert window._auto_hide_interactive is True
+        stop.assert_not_called()
+        activate.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_auto_hide_interactive_returns_to_poe_after_pointer_leaves(qapp, deterministic_global_cursor):
+    window = PoetoreWindow()
+    try:
+        window.setGeometry(100, 100, 720, 1039)
+        window.show()
+        window._capture_auto_hide = True
+        window._auto_hide_interactive = True
+        window._poe_window_hwnd = 1234
+        qapp.processEvents()
+
+        with patch.object(window, "_stop_outside_click_listener") as stop, patch.object(
+            window, "_close_and_return_to_poe"
+        ) as close_and_return:
+            window._handle_global_mouse_move(200, 200)
+            close_and_return.assert_not_called()
+            window._handle_global_mouse_move(50, 50)
+
+        stop.assert_called_once_with()
+        close_and_return.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_auto_hide_click_inside_enters_interactive_mode(qapp, deterministic_global_cursor):
+    window = PoetoreWindow()
+    try:
+        window.setGeometry(100, 100, 720, 1039)
+        window.show()
+        window._passive_hotkey_display = True
+        window._capture_auto_hide = True
+        qapp.processEvents()
+
+        with patch.object(window, "activateWindow") as activate:
+            window._handle_global_mouse_press(200, 200)
+
+        assert window.isVisible()
+        assert window._passive_hotkey_display is False
+        assert window._auto_hide_interactive is True
+        activate.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_auto_hide_treats_combo_popup_as_interactive_area(qapp):
+    window = PoetoreWindow()
+    try:
+        window.show()
+        window.trade_league_combo.showPopup()
+        qapp.processEvents()
+        popup = qapp.activePopupWidget()
+
+        assert popup is not None
+        assert window._widget_belongs_to_panel(popup)
+        assert window._auto_hide_area_contains(
+            popup.window().frameGeometry().center()
+        )
+    finally:
+        window.trade_league_combo.hidePopup()
+        window.close()
+
+
+def test_auto_hide_uses_qt_cursor_coordinates_on_windows(qapp):
+    window = PoetoreWindow()
+    try:
+        with patch("src.poetore.ui.sys.platform", "win32"), patch(
+            "src.poetore.ui.QCursor.pos", return_value=QPoint(321, 654)
+        ):
+            assert window._global_cursor_point(999, 888) == QPoint(321, 654)
+    finally:
+        window.close()
+
+
 @pytest.mark.parametrize("key,modifiers", [
     (Qt.Key_Escape, Qt.NoModifier),
     (Qt.Key_W, Qt.AltModifier),
@@ -172,6 +1042,23 @@ def test_poetore_close_shortcuts_apply_to_child_widgets(qapp, key, modifiers):
         QTest.keyClick(window.input_edit, key, modifiers)
         qapp.processEvents()
         assert not window.isVisible()
+    finally:
+        window.close()
+
+
+def test_poetore_close_shortcut_returns_focus_to_captured_poe(qapp):
+    window = PoetoreWindow()
+    try:
+        window._poe_window_hwnd = 1234
+        window.show()
+        window.input_edit.setFocus()
+        with patch("src.poetore.ui.focus_window") as focus:
+            QTest.keyClick(window.input_edit, Qt.Key_Escape)
+            qapp.processEvents()
+
+        assert not window.isVisible()
+        assert window._poe_window_hwnd is None
+        focus.assert_called_once_with(1234)
     finally:
         window.close()
 
@@ -216,10 +1103,14 @@ def test_poetore_combo_popups_are_treated_as_inside_panel(qapp, combo_name):
 def test_poetore_title_bar_keeps_close_button(qapp):
     window = PoetoreWindow()
     try:
-        assert window.trade_league_combo.parentWidget().objectName() == "poetoreTitleBar"
-        assert window.trade_league_combo.width() == 290
+        assert window.trade_league_combo.parentWidget() is window._title_bar._expanded_controls
+        assert window._title_bar._expanded_controls.parentWidget().objectName() == "poetoreTitleBar"
+        assert window.trade_league_combo.width() == 278
         assert window.league_popup_button.text() == "▼"
         assert window.league_popup_button.toolTip() == "リーグ一覧を開く"
+        assert window.league_refresh_button.text() == "再取得"
+        assert window.league_refresh_button.toolTip() == "公式サイトからリーグ一覧を再取得"
+        assert window.league_refresh_button.parentWidget() is window._title_bar._expanded_controls
         close_buttons = [
             button for button in window.findChildren(QPushButton)
             if button.toolTip() == "閉じる" and button.text() == "×"
@@ -228,6 +1119,54 @@ def test_poetore_title_bar_keeps_close_button(qapp):
         window.show()
         close_buttons[0].click()
         assert not window.isVisible()
+    finally:
+        window.close()
+
+
+def test_poetore_restores_only_the_saved_position_for_search_side(qapp):
+    config = {
+        "poetore": {
+            "result_positions": {
+                "stash": {"x_ratio": 0.25, "y_ratio": 0.5},
+            }
+        }
+    }
+    window = PoetoreWindow(app_config=config)
+    target = QRect(100, 50, 1920, 1080)
+    try:
+        stash_context = PlacementContext(target, QPoint(300, 400))
+        window.show_at_context(stash_context)
+        expected_x = target.left() + round((target.width() - window.width()) * 0.25)
+        expected_y = target.top() + round((target.height() - window.height()) * 0.5)
+        assert window.pos() == QPoint(expected_x, expected_y)
+
+        inventory_context = PlacementContext(target, QPoint(1700, 400))
+        window.show_at_context(inventory_context)
+        assert window.pos() == position_for_context(inventory_context, window.size())
+    finally:
+        window.close()
+
+
+def test_poetore_saves_position_only_when_title_bar_drag_finishes(qapp):
+    config = {"poetore": {}}
+    save_config = Mock()
+    window = PoetoreWindow(app_config=config, save_config=save_config)
+    context = PlacementContext(QRect(100, 50, 1920, 1080), QPoint(300, 400))
+    title_bar = window.findChild(QWidget, "poetoreTitleBar")
+    try:
+        window.show_at_context(context)
+        save_config.assert_not_called()
+
+        title_bar._drag_offset = QPoint(5, 5)
+        title_bar._drag_start_position = window.pos()
+        window.move(window.x() + 120, window.y() + 80)
+        QTest.mouseRelease(title_bar, Qt.LeftButton, pos=QPoint(10, 10))
+
+        saved = config["poetore"]["result_positions"]
+        assert set(saved) == {"stash"}
+        assert 0 <= saved["stash"]["x_ratio"] <= 1
+        assert 0 <= saved["stash"]["y_ratio"] <= 1
+        save_config.assert_called_once_with(config)
     finally:
         window.close()
 
@@ -261,6 +1200,82 @@ def test_search_condition_change_clears_stale_results_and_waits(qapp):
         window.close()
 
 
+def test_mod_filter_checkbox_uses_muted_teal_checked_color(qapp):
+    window = PoetoreWindow()
+    try:
+        window._populate_stat_filters((
+            TradeStatFilter("explicit.stat_1", "+# to maximum Life", 70, "explicit"),
+        ))
+        checkbox = window.mod_filter_tree.itemWidget(
+            window.mod_filter_tree.topLevelItem(0), 0,
+        ).findChild(QCheckBox, "modFilterCheckbox")
+
+        style = checkbox.styleSheet().lower()
+        assert "poenavi_check_257a64.png" in style
+        assert "border: 2px solid #257a64" in style
+        assert "width: 18px; height: 18px" in style
+        assert "border-radius: 3px" in style
+    finally:
+        window.close()
+
+
+def test_search_error_replaces_searching_status_and_reenables_button(qapp):
+    window = PoetoreWindow()
+    try:
+        window._search_generation = 3
+        window.price_button.setEnabled(False)
+        window.price_status.setText("検索中…")
+
+        message = (
+            "検索回数が多いため、PoE Trade APIの利用制限に達しました。"
+            " 約10分後に、もう一度検索してください。"
+        )
+        window._show_price_error(message, 3)
+
+        assert window.price_status.text() == message
+        assert window.price_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_complex_query_error_is_localized_for_normal_item(qapp):
+    window = PoetoreWindow()
+    try:
+        window._search_generation = 4
+        window._parsed_item = ParsedItem(
+            "指輪", "レア", "", "アメジストの指輪", "accessory",
+        )
+        window._show_price_error(
+            "PoE Trade APIが検索条件を受理しませんでした: HTTP 400"
+            "（Query is too complex. Please reduce the amount of filters used.）",
+            4,
+        )
+        assert window.price_status.text() == (
+            "検索条件が多すぎます。条件を減らして、もう一度検索してください。"
+        )
+    finally:
+        window.close()
+
+
+def test_complex_query_error_is_localized_for_mercenary_warrant(qapp):
+    window = PoetoreWindow()
+    try:
+        window._search_generation = 5
+        window._parsed_item = ParsedItem(
+            "マップフラグメント", "ノーマル", "傭兵の召喚状", "", "invitation",
+        )
+        window._show_price_error(
+            "PoE Trade APIが検索条件を受理しませんでした: HTTP 400"
+            "（検索条件が複雑過ぎます。使用フィルターの量を減らしてください。）",
+            5,
+        )
+        assert window.price_status.text() == (
+            "検索条件が多すぎます。条件を減らして、もう一度検索してください。"
+        )
+    finally:
+        window.close()
+
+
 def test_enter_in_changed_mod_value_researches(qapp):
     window = PoetoreWindow()
     try:
@@ -275,6 +1290,7 @@ def test_enter_in_changed_mod_value_researches(qapp):
         editor = window.mod_filter_tree.itemWidget(
             window.mod_filter_tree.topLevelItem(0), 4,
         )
+        editor = editor.findChild(QLineEdit)
         editor.setFocus()
         QTest.keyClicks(editor, "8")
         assert window._search_dirty is True
@@ -283,6 +1299,106 @@ def test_enter_in_changed_mod_value_researches(qapp):
             QTest.keyClick(editor, Qt.Key_Return)
 
         search.assert_called_once_with()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "start", "delta", "expected"),
+    (
+        (_MOD_COLUMN_MIN, "779", 120, "780"),
+        (_MOD_COLUMN_MAX, "20", -120, "19"),
+        (_MOD_COLUMN_MIN, "1.5", 120, "2.5"),
+        (_MOD_COLUMN_MAX, "", 120, ""),
+    ),
+)
+def test_mod_value_mouse_wheel_changes_nonempty_value_by_one(
+    qapp, column, start, delta, expected,
+):
+    window = PoetoreWindow()
+    try:
+        window._parsed_item = ParsedItem(
+            "Rings", "Rare", "Test Ring", "Ruby Ring", "accessory",
+            raw_text="test-ring",
+        )
+        window._has_searched_current_item = True
+        window._populate_stat_filters((
+            TradeStatFilter(
+                "explicit.stat_1", "+# to maximum Life", 70, "explicit",
+                max_value=100,
+            ),
+        ))
+        row = window.mod_filter_tree.topLevelItem(0)
+        editor = window.mod_filter_tree.itemWidget(row, column).findChild(QLineEdit)
+        editor.setText(start)
+        window._search_dirty = False
+        event = QWheelEvent(
+            QPointF(1, 1), QPointF(1, 1), QPoint(0, 0), QPoint(0, delta),
+            Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False,
+        )
+
+        handled = window.eventFilter(editor, event)
+
+        assert editor.text() == expected
+        assert handled is bool(start)
+        assert window._search_dirty is bool(start)
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    "editor_path",
+    (
+        "links_edit",
+        "item_level_edit",
+        "gem_level_edit",
+        "gem_quality_edit",
+        "gem_socket_edit",
+        "map_tier_chip.minimum_edit",
+        "base_percentile_chip.minimum_edit",
+        "area_level_chip.minimum_edit",
+        "heist_wings_chip.minimum_edit",
+        "heist_job_chip.minimum_edit",
+        "cluster_passives_chip.minimum_edit",
+    ),
+)
+def test_search_chip_numeric_editors_support_mouse_wheel(qapp, editor_path):
+    window = PoetoreWindow()
+    try:
+        window._parsed_item = ParsedItem(
+            "Rings", "Rare", "Test Ring", "Ruby Ring", "accessory",
+            raw_text="test-ring",
+        )
+        window._has_searched_current_item = True
+        editor = window
+        for attribute in editor_path.split("."):
+            editor = getattr(editor, attribute)
+        editor.setText("2")
+        window._search_dirty = False
+        event = QWheelEvent(
+            QPointF(1, 1), QPointF(1, 1), QPoint(0, 0), QPoint(0, 120),
+            Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False,
+        )
+
+        assert window.eventFilter(editor, event)
+        assert editor.text() == "3"
+        assert window._search_dirty
+    finally:
+        window.close()
+
+
+def test_search_chip_mouse_wheel_respects_numeric_editor_limits(qapp):
+    window = PoetoreWindow()
+    try:
+        editor = window.links_edit
+        editor.setText("6")
+        event = QWheelEvent(
+            QPointF(1, 1), QPointF(1, 1), QPoint(0, 0), QPoint(0, 120),
+            Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False,
+        )
+
+        assert window.eventFilter(editor, event)
+        assert editor.text() == "6"
     finally:
         window.close()
 
@@ -300,6 +1416,68 @@ def test_hovering_search_button_researches_when_conditions_changed(qapp):
             QApplication.sendEvent(window.price_button, QEvent(QEvent.Enter))
 
         search.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_hovering_search_button_runs_deferred_poe2_rare_equipment_search(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window._parsed_item = ParsedItem(
+            "Amulets", "rare", "Test Amulet", "Gold Amulet", "amulet",
+            raw_text="poe2-rare-amulet",
+        )
+        window._has_searched_current_item = False
+        window._search_dirty = False
+
+        with patch.object(window, "search_current_item") as search:
+            QApplication.sendEvent(window.price_button, QEvent(QEvent.Enter))
+
+        search.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_recapturing_same_poe2_rare_allows_hover_search_again(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    item = ParsedItem(
+        "Helmets", "rare", "Test Helmet", "Great Helmet", "helmet",
+        raw_text="same-poe2-rare-helmet",
+    )
+    try:
+        with patch(
+            "src.poetore.ui.read_item_clipboard",
+            return_value="same-poe2-rare-helmet",
+        ), patch.object(
+            window, "_parse_item_text", return_value=item,
+        ), patch.object(window, "show_at_context"):
+            window._capture_item_copy()
+            window._has_searched_current_item = True
+            window._capture_item_copy()
+
+        assert not window._has_searched_current_item
+        assert not window._search_dirty
+        with patch.object(window, "search_current_item") as search:
+            QApplication.sendEvent(window.price_button, QEvent(QEvent.Enter))
+        search.assert_called_once_with()
+    finally:
+        window.close()
+
+
+def test_hovering_search_button_does_not_start_unrelated_clean_initial_item(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window._parsed_item = ParsedItem(
+            "Belts", "unique", "Mageblood", "Heavy Belt", "belt",
+            raw_text="poe2-unique-belt",
+        )
+        window._has_searched_current_item = False
+        window._search_dirty = False
+
+        with patch.object(window, "search_current_item") as search:
+            QApplication.sendEvent(window.price_button, QEvent(QEvent.Enter))
+
+        search.assert_not_called()
     finally:
         window.close()
 
@@ -335,11 +1513,108 @@ def test_filter_kind_column_is_japanese_and_marks_foulborn_generation(qapp):
                 generation="foulborn",
             ),
             TradeStatFilter("pseudo.test", "疑似Mod", 10, "pseudo"),
+            TradeStatFilter("pseudo.map", "マップ量", 35, "map pseudo"),
         ))
         assert [
             window.mod_filter_tree.topLevelItem(index).text(1)
             for index in range(window.mod_filter_tree.topLevelItemCount())
-        ] == ["明示", "ファウルボーン", "疑似"]
+        ] == ["明示", "ファウルボーン", "疑似", "マップ"]
+    finally:
+        window.close()
+
+
+def test_filter_kind_column_marks_essence_and_infamous_generations(qapp):
+    window = PoetoreWindow()
+    try:
+        window._populate_stat_filters((
+            TradeStatFilter(
+                "explicit.stat_1", "Essence Mod", 10, "explicit",
+                generation="essence",
+            ),
+            TradeStatFilter(
+                "explicit.stat_2", "Infamous Mod", 10, "explicit",
+                generation="infamous",
+            ),
+        ))
+        assert [
+            window.mod_filter_tree.topLevelItem(index).text(1)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ] == ["エッセンス", "悪名高い"]
+    finally:
+        window.close()
+
+
+def test_filter_kind_column_marks_awakened_source_generations(qapp):
+    window = PoetoreWindow()
+    try:
+        generations = (
+            ("corrupted", "コラプト"),
+            ("eldritch", "エルドリッチ"),
+            ("synthesised", "シンセシス"),
+            ("delve", "デルブ"),
+            ("incursion", "インカージョン"),
+            ("shaper", "シェイパー"),
+        )
+        window._populate_stat_filters(tuple(
+            TradeStatFilter(
+                f"explicit.stat_{index}", generation, 10, "explicit",
+                generation=generation,
+            )
+            for index, (generation, _) in enumerate(generations)
+        ))
+
+        assert [
+            window.mod_filter_tree.topLevelItem(index).text(1)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ] == [label for _, label in generations]
+    finally:
+        window.close()
+
+
+def test_reported_infamous_helmet_resolves_and_is_labelled_in_real_panel(qapp):
+    text = """アイテムクラス: 兜
+レアリティ: レア
+恐ろしい堅塁
+征服者のヘルメット
+--------
+アーマー: 615 (augmented)
+--------
+装備要求:
+レベル: 78
+筋力: 194
+--------
+ソケット: W-W-W-W
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「悪名高い」 (ティア: 1) }
+憤怒の固有効果による喪失が20%遅くなる
+(この効果は直近にヒット受けていないか憤怒を獲得していない時の憤怒の減少にのみ影響を与える)
+{ プレフィックスモッド「雲丹の」 (ティア: 2) — ライフ, 防御, アーマー }
+アーマー +46(33-48)
+最大ライフ +28(24-28)
+{ プレフィックスモッド「頑健な」 (ティア: 5) — ライフ }
+最大ライフ +72(70-84)
+{ サフィックスモッド 「碩学の」 (ティア: 4) — 能力値 }
+知性 +39(38-42)
+--------
+メモ: ~b/o 1 chaos
+"""
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        rows = [
+            window.mod_filter_tree.topLevelItem(index)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        infamous = next(
+            row for row in rows
+            if row.text(3) == "憤怒の固有効果による喪失が20%遅くなる"
+        )
+        assert infamous.text(1) == "悪名高い"
+        assert window.mod_warning.isHidden()
     finally:
         window.close()
 
@@ -381,23 +1656,366 @@ def test_foulborn_unique_uses_normal_name_and_enables_variable_mods_in_real_pane
         window.close()
 
 
+def test_foulborn_catalyst_quality_shows_only_on_affected_mod_in_real_panel(qapp):
+    window = PoetoreWindow()
+    try:
+        window.search_range_combo.setCurrentIndex(
+            window.search_range_combo.findData(0)
+        )
+        window._trade_base_type = "Iron Ring"
+        window._trade_item_name = "Le Heup of All"
+        window.input_edit.setPlainText("""アイテムクラス: 指輪
+レアリティ: ユニーク
+ファウルボーン 皆を繋ぐもの
+鉄の指輪
+--------
+品質 (防御力モッド): +10% (augmented)
+--------
+装備要求:
+レベル: 24
+--------
+アイテムレベル: 71
+--------
+{ 暗黙モッド — ダメージ, 物理, アタック }
+1から4の物理ダメージをアタックに追加する
+--------
+{ ユニークモッド — 能力値 }
+全ての能力値 +13(10-30)
+(Attribute: 能力値は筋力、器用さ、知性)
+{ ユニークモッド — 元素, 耐性 }
+全ての元素耐性 +22(10-30)%
+{ ファウルボーンユニークモッド — 防御 - 10%増加 }
+グローバル防御力が25(10-30)%増加する
+(アーマー、回避力、エナジーシールドは標準的な防御力である)
+{ ファウルボーンユニークモッド — ダメージ, クリティカル }
+グローバルクリティカルダメージ倍率 +22(10-30)%
+""")
+        window.parse_current_text()
+
+        rows = {
+            window.mod_filter_tree.topLevelItem(index).text(3):
+            window.mod_filter_tree.topLevelItem(index)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        }
+        assert rows["グローバル防御力が25(10-30)%増加する"].text(1) == (
+            "ファウルボーン／カタリスト"
+        )
+        defence_minimum = window.mod_filter_tree.itemWidget(
+            rows["グローバル防御力が25(10-30)%増加する"], 4,
+        ).findChild(QLineEdit)
+        assert defence_minimum.text() == "27"
+        assert rows["グローバルクリティカルダメージ倍率 +22(10-30)%"].text(1) == (
+            "ファウルボーン"
+        )
+        assert rows["全ての能力値 +13(10-30)"].text(1) == "明示"
+        assert rows["全ての元素耐性 +22(10-30)%"].text(1) == "明示"
+    finally:
+        window.close()
+
+
+def test_japanese_vestigial_unique_shows_enabled_implicit_in_real_panel(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Riveted Boots"
+        window._trade_item_name = "Ralakesh's Impatience"
+        window.input_edit.setPlainText("""アイテムクラス: 靴
+レアリティ: ユニーク
+ララケシュの短気
+痕跡 リベットブーツ
+--------
+アーマー: 65
+エナジーシールド: 14
+--------
+装備要求:
+レベル: 40
+筋力: 35
+知性: 35
+--------
+ソケット: B
+--------
+アイテムレベル: 86
+--------
+{ 痕跡暗黙モッド — 元素, 火, 状態異常 }
+近くの敵は焦げ状態になる
+(Scorch: 焦げた敵は元素耐性が-10%される)
+--------
+{ ユニークモッド — 元素, 冷気, 耐性 }
+冷気耐性 +21(15-25)%
+{ ユニークモッド — 混沌, 耐性 }
+混沌耐性 +20(15-25)%
+{ ユニークモッド — スピード }
+移動スピードが18(15-25)%増加する
+{ ユニークモッド — 物理, 状態異常 }
+穢れた血を付与されることがない
+{ ユニークモッド }
+パワーチャージを最大数持っているとして見なされる
+--------
+不死者にとって、
+時代と瞬間に違いはあるのか？
+--------
+メモ: ~b/o 10 mirror
+""")
+        window.parse_current_text()
+
+        assert window._parsed_item.base_type == "リベットブーツ"
+        rows = [
+            window.mod_filter_tree.topLevelItem(index)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        scorch = next(row for row in rows if row.text(3) == "近くの敵は焦げ状態になる")
+        checkbox = window.mod_filter_tree.itemWidget(
+            scorch, 0,
+        ).findChild(QCheckBox, "modFilterCheckbox")
+        assert scorch.text(1) == "痕跡"
+        assert checkbox.isChecked()
+        assert not window.mod_warning.isVisible()
+    finally:
+        window.close()
+
+
+def test_foulborn_fixed_replacement_mod_is_enabled_in_real_panel(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Imperial Claw"
+        window._trade_item_name = "Hand of Thought and Motion"
+        window.input_edit.setPlainText("""アイテムクラス: 鉤爪
+レアリティ: ユニーク
+ファウルボーン 思考と動作の手
+帝国の鉤爪
+--------
+アイテムレベル: 85
+--------
+{ ユニークモッド — 能力値 }
+知性が12(8-12)%増加する
+{ ユニークモッド — 能力値 }
+器用さが11(8-12)%増加する
+{ ファウルボーンユニークモッド }
+知性25ごとに命中力が3%増加する
+""")
+        window.parse_current_text()
+
+        rows = [
+            window.mod_filter_tree.topLevelItem(index)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        accuracy = next(
+            row for row in rows
+            if row.text(3) == "知性25ごとに命中力が3%増加する"
+        )
+        checkbox = window.mod_filter_tree.itemWidget(
+            accuracy, 0
+        ).findChild(QCheckBox, "modFilterCheckbox")
+
+        assert accuracy.text(1) == "ファウルボーン"
+        assert checkbox.isChecked()
+        selected = window._selected_stat_filters()
+        assert selected[rows.index(accuracy)].min_value == 3
+        assert not window.mod_warning.isVisible()
+    finally:
+        window.close()
+
+
+def test_foulborn_tulborn_fixed_number_mod_builds_valueless_trade_filter(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Opal Wand"
+        window._trade_item_name = "Tulborn"
+        window.input_edit.setPlainText("""アイテムクラス: ワンド
+レアリティ: ユニーク
+ファウルボーン トゥルボーン
+オパールのワンド
+--------
+ワンド
+物理ダメージ: 30-56
+クリティカル率: 8.00%
+秒間アタック回数: 1.45
+--------
+装備要求:
+レベル: 62
+知性: 212
+--------
+ソケット: W-W-W
+--------
+アイテムレベル: 85
+--------
+{ 暗黙モッド — ダメージ, キャスター }
+スペルダメージが35(31-35)%増加する
+--------
+{ ユニークモッド }
+付与した冷気の曝露は冷気耐性を追加で-12%させる
+{ ユニークモッド — ダメージ, 元素, 冷気, キャスター }
+122(120-140)から168(150-170)の冷気ダメージをスペルに追加する
+{ ユニークモッド — マナ }
+凍結状態の敵を倒した時に+25(20-25)のマナを獲得する
+{ ファウルボーンユニークモッド }
+マナを合計200消費した後にパワーチャージを1個獲得する
+""")
+        window.parse_current_text()
+
+        selected = next(
+            row for row in window._selected_stat_filters()
+            if row.stat_id == "explicit.stat_3269060224"
+        )
+        assert selected.enabled
+        assert selected.min_value is None
+        assert selected.max_value is None
+
+        query = build_search_query(
+            window._parsed_item,
+            window._trade_base_type,
+            (selected,),
+            trade_status="offline",
+            trade_name=window._trade_item_name,
+        )["query"]
+        assert query["stats"][0]["filters"] == [{
+            "id": "explicit.stat_3269060224",
+            "value": {},
+        }]
+    finally:
+        window.close()
+
+
+def test_foulborn_xoph_uses_mutated_unique_returning_projectiles_stat(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Citadel Bow"
+        window._trade_item_name = "Xoph's Inception"
+        window.input_edit.setPlainText("""アイテムクラス: 弓
+レアリティ: ユニーク
+ファウルボーン ゾフの発端
+シタデルボウ
+--------
+弓
+物理ダメージ: 97-389 (augmented)
+クリティカル率: 6.00%
+秒間アタック回数: 1.25
+--------
+装備要求:
+レベル: 58
+器用さ: 185 (unmet)
+--------
+ソケット: W-W
+--------
+アイテムレベル: 85
+--------
+{ ユニークモッド — ダメージ, 物理, アタック }
+物理ダメージが170(160-190)%増加する
+{ ユニークモッド — ダメージ, 物理, 元素, 火 }
+物理ダメージの20%を追加火ダメージとして獲得する
+{ ユニークモッド — 元素, 火, 状態異常 }
+10%の確率で敵を発火させる
+(Ignite: 発火は、スキルの基礎火ダメージに基づいて火継続ダメージを与える。持続時間は4秒)
+{ ユニークモッド — ライフ }
+発火状態の敵を倒した時に298(200-300)のライフを獲得する
+{ ユニークモッド }
+矢は貫通した回数1回ごとに30から50の火ダメージを追加する
+{ ファウルボーンユニークモッド }
+ソケットされたジェムはレベル20投射物回帰によりサポートされる
+--------
+赤き火葬壇の上に我らは生まれる。
+
+このアイテムはゾフの祝福によって変化させることができる
+""")
+        returning_projectiles = (
+            {
+                "id": "explicit.indexable_support_149", "type": "explicit",
+                "text": "ソケットされたジェムはレベル#投射物回帰によりサポートされる",
+            },
+            {
+                "id": "explicit.stat_1549219417", "type": "explicit",
+                "text": "ソケットされたジェムはレベル#投射物回帰によりサポートされる",
+            },
+            {
+                "id": "explicit.stat_52197415", "type": "explicit",
+                "text": "ソケットされたジェムはレベル#投射物回帰によりサポートされる",
+            },
+        )
+        with patch(
+            "src.poetore.trade._trade_stat_entries",
+            return_value=returning_projectiles,
+        ):
+            window.parse_current_text()
+
+        parsed = next(
+            modifier for modifier in window._parsed_item.modifiers
+            if "投射物回帰" in modifier.text
+        )
+        assert parsed.stat_id == "explicit.stat_1549219417"
+        selected = [
+            row for row in window._selected_stat_filters()
+            if "投射物回帰" in row.text
+        ]
+        assert len(selected) == 1
+        assert selected[0].stat_id == "explicit.stat_1549219417"
+        assert selected[0].min_value == 20
+
+        query = build_search_query(
+            window._parsed_item,
+            window._trade_base_type,
+            selected,
+            trade_status="offline",
+            trade_name=window._trade_item_name,
+        )["query"]
+        assert query["stats"][0]["filters"] == [{
+            "id": "explicit.stat_1549219417",
+            "value": {"min": 20},
+        }]
+    finally:
+        window.close()
+
+
 def test_poetore_uses_wide_poena_theme_and_hides_debug_parse_area(qapp):
     window = PoetoreWindow()
     try:
-        assert window.size().width() == 720
+        assert window.size().width() == 650
         assert window._panel.objectName() == "poetorePanel"
         assert not window._debug_parse_area.isVisible()
-        assert window.mod_filter_tree.isColumnHidden(6)
-        assert window.mod_filter_tree.columnCount() == 7
+        assert window.mod_filter_tree.columnCount() == 6
         assert window.mod_filter_tree.header().isHidden()
         assert window.mod_filter_tree.headerItem().text(2) == "ティア"
-        assert window.mod_filter_tree.headerItem().text(6) == "詳細"
         assert "論理" not in [
             window.mod_filter_tree.headerItem().text(index)
             for index in range(window.mod_filter_tree.columnCount())
         ]
-        assert "rgba(14, 14, 14, 246)" in window.styleSheet()
-        assert "#b0ff7b" in window.styleSheet()
+        assert "rgba(17, 20, 22, 246)" in window.styleSheet()
+        assert "#343B3E" in window.styleSheet()
+        assert "#65FFCA" in window.styleSheet()
+        assert "QFrame#itemHeader {\n                background: rgba(20, 24, 26, 220);\n                border: none;" in window.styleSheet()
+        assert "QPushButton {\n                background: rgba(26, 31, 33, 225);\n                color: #E6ECEA;\n                border: none;" in window.styleSheet()
+        assert "QPushButton#secondaryActionButton" in window.styleSheet()
+        assert "QComboBox#filterControl" in window.styleSheet()
+        assert window.mod_conditions_toggle.objectName() == "secondaryActionButton"
+        assert window.clear_mod_conditions_button.objectName() == "secondaryActionButton"
+        assert window.hidden_mods_toggle.objectName() == "secondaryActionButton"
+        assert window.mod_sources_toggle.objectName() == "secondaryActionButton"
+        assert window.mercenary_supports_toggle.objectName() == "secondaryActionButton"
+        assert window.mercenary_supports_toggle.property("mutedText") is True
+        assert window.search_range_combo.objectName() == "filterControl"
+        assert window.trade_status_combo.objectName() == "filterControl"
+        assert window.trade_currency_combo.objectName() == "filterControl"
+        assert window.listed_within_combo.objectName() == "filterControl"
+        assert window.trade_url_button.objectName() == "filterActionButton"
+        assert all(
+            label.text() != "ぽえとれ"
+            for label in window.findChildren(QLabel)
+        )
+        muted_controls = (
+            window.mod_conditions_toggle,
+            window.clear_mod_conditions_button,
+            window.hidden_mods_toggle,
+            window.mod_sources_toggle,
+            window.trade_status_combo,
+            window.trade_currency_combo,
+            window.listed_within_combo,
+            window.trade_url_button,
+        )
+        assert all(control.property("mutedText") is True for control in muted_controls)
+        assert 'QPushButton[mutedText="true"]' in window.styleSheet()
+        assert "color: #98A39F;" in window.styleSheet()
+        assert "QTreeWidget {\n                background: rgba(17, 20, 22, 235);" in window.styleSheet()
+        assert "QTreeWidget {\n                background: rgba(17, 20, 22, 235);\n                alternate-background-color: rgba(25, 30, 32, 205);\n                color: #D5DDDA;\n                border: none;" in window.styleSheet()
+        assert "#DB86EF" not in window.styleSheet().upper()
+        assert "#b0ff7b" not in window.styleSheet()
     finally:
         window.close()
 
@@ -422,6 +2040,8 @@ Item Level: 83
         assert window.base_scope_toggle.itemText(0) == "Spine Bow"
         assert window.base_scope_toggle.itemText(1) == "すべての弓"
         assert window.weapon_property_label.text() == "武器性能・検索Mod"
+        assert window.weapon_dps_label.text() == "pDPS：137.7（品質20%換算）"
+        assert not window.weapon_dps_label.isHidden()
         filter_ids = {
             window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole)
             for index in range(window.mod_filter_tree.topLevelItemCount())
@@ -429,6 +2049,86 @@ Item Level: 83
         assert "property.physical_dps" in filter_ids
         assert "property.aps" in filter_ids
         assert "property.crit" in filter_ids
+    finally:
+        window.close()
+
+
+def test_poe1_armour_property_rows_show_quality_20_conversion(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 盾
+レアリティ: ユニーク
+イージス・オーロラ
+チャンピオンカイトシールド
+--------
+ブロック率: 32% (augmented)
+アーマー: 914 (augmented)
+エナジーシールド: 188 (augmented)
+--------
+アイテムレベル: 83
+--------
+{ ユニークモッド — 防御, アーマー, エナジーシールド }
+アーマーおよびエナジーシールドが301(300-400)%増加する
+""")
+        window.parse_current_text()
+
+        labels = {
+            window.mod_filter_tree.topLevelItem(index).text(_MOD_COLUMN_TEXT)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        }
+        assert "アーマー（品質20%換算）" in labels
+        assert "エナジーシールド（品質20%換算）" in labels
+    finally:
+        window.close()
+
+
+def test_weapon_header_shows_total_pdps_and_edps_but_hides_summary_for_non_weapon(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 両手剣
+レアリティ: レア
+混沌の刃
+略奪者の剣
+--------
+品質: +20% (augmented)
+物理ダメージ: 100-200 (augmented)
+元素ダメージ: 20-40 (augmented)
+秒間アタック回数: 1.50 (augmented)
+--------
+アイテムレベル: 84
+""")
+        window.parse_current_text()
+        assert window.weapon_dps_label.text() == (
+            "合計DPS：270.0（pDPS 225.0 / eDPS 45.0、pDPSは品質20%換算）"
+        )
+        assert not window.weapon_dps_label.isHidden()
+
+        elemental = parse_item_text("""Item Class: Wands
+Rarity: Rare
+Elemental Wand
+Imbued Wand
+--------
+Elemental Damage: 20-40, 30-60, 10-20
+Attacks per Second: 1.50
+--------
+Item Level: 84
+""")
+        window._update_item_header(elemental)
+        assert window.weapon_dps_label.text() == "eDPS：135.0"
+        assert not window.weapon_dps_label.isHidden()
+
+        armour = parse_item_text("""Item Class: Body Armours
+Rarity: Rare
+Test Armour
+Sacred Chainmail
+--------
+Armour: 1000
+--------
+Item Level: 84
+""")
+        window._update_item_header(armour)
+        assert window.weapon_dps_label.text() == ""
+        assert window.weapon_dps_label.isHidden()
     finally:
         window.close()
 
@@ -460,6 +2160,509 @@ def test_poetore_league_choices_include_sc_hc_and_persist(qapp):
         window.close()
 
 
+def test_poe2_title_bar_refresh_button_forces_a_fresh_league_request(qapp, monkeypatch):
+    requested = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr("src.poetore.ui.threading.Thread", ImmediateThread)
+    monkeypatch.setattr(
+        "src.poetore.poe2.trade.available_pc_leagues",
+        lambda *, force_refresh=False: (
+            requested.append(force_refresh) or (TradeLeague("Fresh League"),)
+        ),
+    )
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.league_refresh_button.click()
+
+        assert requested == [True]
+        assert window.trade_league_combo.itemText(0) == "自動（現行SC: Fresh League）"
+        assert window.league_refresh_button.isEnabled()
+        assert window.league_refresh_button.text() == "再取得"
+    finally:
+        window.close()
+
+
+def test_poe2_window_starts_with_current_leagues_and_reported_mageblood_is_resolved(qapp):
+    config = {"poe_version": "poe2", "poetore": {"league_poe2": "auto"}}
+    window = PoetoreWindow(app_config=config)
+    try:
+        assert window.trade_league_combo.itemText(0) == "自動（現行SC: Forbidden Rites）"
+        assert [
+            window.trade_league_combo.itemData(index)
+            for index in range(window.trade_league_combo.count())
+        ] == [
+            "auto", "Forbidden Rites", "HC Forbidden Rites", "Runes of Aldur",
+            "HC Runes of Aldur", "Standard", "Hardcore",
+        ]
+
+        text = (Path(__file__).parent / "fixtures" / "poe2" / "mageblood_ja.txt").read_text(
+            encoding="utf-8"
+        )
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        assert window._parsed_item.name == "Mageblood"
+        assert window.mod_filter_tree.topLevelItemCount() == 7
+        assert window.mod_warning.isHidden()
+        selected = window._selected_stat_filters()
+        assert len(selected) == 7
+        assert [row.stat_id for row in selected if "264262054" in row.stat_id] == [
+            "explicit.stat_264262054|3", "explicit.stat_264262054|11",
+            "explicit.stat_264262054|4", "explicit.stat_264262054|8",
+        ]
+    finally:
+        window.close()
+
+
+def test_reported_poe2_rare_gloves_show_chaos_resistance_without_warning(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_gloves_ja.txt").read_text(
+            encoding="utf-8"
+        )
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        assert window.mod_filter_tree.topLevelItemCount() == 10
+        assert window.mod_warning.isHidden()
+        selected = window._selected_stat_filters()
+        direct = next(row for row in selected if row.stat_id == "explicit.stat_2923486259")
+        assert not direct.enabled
+        assert direct.min_value == 13
+        chaos = next(
+            row for row in selected
+            if row.stat_id == "pseudo.pseudo_total_chaos_resistance"
+        )
+        assert chaos.enabled
+        assert any(row.stat_id == "property.evasion" for row in selected)
+        assert any(row.stat_id == "property.augment_sockets" for row in selected)
+        assert not any(
+            row.stat_id == "property.state.desecrated" for row in selected
+        )
+    finally:
+        window.close()
+
+
+def test_poe2_exceptional_item_enables_augment_socket_row_by_default(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 手袋
+レアリティ: ノーマル
+規格外の 磨かれた弓籠手
+--------
+回避力: 170
+--------
+装備条件：レベル 80, 101 器用さ
+--------
+ソケット: S S
+--------
+アイテムレベル: 82""")
+        window.parse_current_text()
+
+        row = next(
+            row for row in window._selected_stat_filters()
+            if row.stat_id == "property.augment_sockets"
+        )
+        assert row.enabled
+        assert row.min_value == 2
+    finally:
+        window.close()
+
+
+def test_poe2_high_quality_exceptional_selects_quality_instead_of_sockets(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 手袋
+レアリティ: ノーマル
+規格外の 磨かれた弓籠手
+--------
+品質: +25%
+回避力: 170
+--------
+装備条件：レベル 80, 101 器用さ
+--------
+ソケット: S
+--------
+アイテムレベル: 82""")
+        window.parse_current_text()
+
+        row = next(
+            row for row in window._selected_stat_filters()
+            if row.stat_id == "property.augment_sockets"
+        )
+        assert not row.enabled
+        assert window._selected_quality() == 25
+    finally:
+        window.close()
+
+
+def test_reported_poe2_rare_body_armour_shows_local_evasion_filter(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_body_armour_ja.txt").read_text(
+            encoding="utf-8"
+        )
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        selected = window._selected_stat_filters()
+        evasion = [row for row in selected if row.text.startswith("回避力が")]
+        assert [(row.stat_id, row.min_value) for row in evasion] == [
+            ("explicit.stat_124859000", 94),
+            ("explicit.stat_124859000", 36),
+        ]
+        assert all(not row.alternative_stat_ids for row in evasion)
+        assert window.mod_warning.isHidden()
+    finally:
+        window.close()
+
+
+def test_poetore_search_range_is_persisted(qapp):
+    config = {"poetore": {"search_stat_range": 20}}
+    saved = Mock()
+    window = PoetoreWindow(app_config=config, save_config=saved)
+    try:
+        assert window.search_range_combo.currentData() == 20
+        assert window.search_range_combo.currentText() == "Mod数値：-20%まで許容"
+        assert "読取値100・-10%まで許容 → 最小値90で検索" in (
+            window.search_range_combo.toolTip()
+        )
+        window.search_range_combo.setCurrentIndex(
+            window.search_range_combo.findData(5)
+        )
+        assert config["poetore"]["search_stat_range"] == 5
+        assert saved.called
+    finally:
+        window.close()
+
+
+def test_poe2_search_range_applies_ee2_rules_through_ui(qapp):
+    window = PoetoreWindow(
+        app_config={
+            "poe_version": "poe2",
+            "poetore": {"search_stat_range": 20},
+        }
+    )
+    try:
+        from src.poetore.poe2.parser import parse_item_text as parse_poe2_item_text
+
+        text = (
+            Path(__file__).parent / "fixtures" / "poe2" / "mageblood_ja.txt"
+        ).read_text(encoding="utf-8")
+        item = parse_poe2_item_text(text)
+        filters = window._resolved_trade_filters(item, PRESET_FINISHED)
+        charm_slots = next(row for row in filters if row.ref == "Has # Charm Slot")
+        mage_effect = next(
+            row for row in filters
+            if row.ref
+            == "All Mage's Legacies have #% increased effect per duplicate Mage's Legacy you have"
+        )
+
+        assert (charm_slots.min_value, charm_slots.max_value) == (2, None)
+        assert mage_effect.min_value == 38
+    finally:
+        window.close()
+
+
+def test_search_range_change_keeps_checkboxes_but_recalculates_edited_values(qapp):
+    window = PoetoreWindow(
+        app_config={"poetore": {"search_stat_range": 0}}
+    )
+    try:
+        original = TradeStatFilter(
+            "explicit.stat_fire_resistance", "+40% to Fire Resistance", 40,
+            "explicit", enabled=True, read_value=40,
+            ref="+#% to Fire Resistance",
+        )
+        window._populate_stat_filters((original,))
+        checkbox = window.mod_filter_tree.itemWidget(
+            window.mod_filter_tree.topLevelItem(0), _MOD_COLUMN_CHECK
+        ).findChild(QCheckBox, "modFilterCheckbox")
+        minimum = window.mod_filter_tree.itemWidget(
+            window.mod_filter_tree.topLevelItem(0), _MOD_COLUMN_MIN
+        ).findChild(QLineEdit)
+        checkbox.setChecked(False)
+        minimum.setText("30")
+
+        window._parsed_item = ParsedItem(
+            "Rings", "Rare", "Test Ring", "Ruby Ring", "accessory.ring"
+        )
+        window._resolved_trade_filters = Mock(return_value=(
+            replace(original, min_value=36),
+        ))
+        window.search_range_combo.setCurrentIndex(
+            window.search_range_combo.findData(10)
+        )
+
+        selected = window._selected_stat_filters()[0]
+        assert not selected.enabled
+        assert selected.min_value == 36
+        window._resolved_trade_filters.assert_called_once_with(
+            window._parsed_item, PRESET_FINISHED
+        )
+    finally:
+        window.close()
+
+
+def test_hidden_candidates_and_pseudo_sources_can_be_toggled(qapp):
+    window = PoetoreWindow()
+    try:
+        assert window.mod_sources_toggle.text() == "計算元Modを表示"
+        assert "価格比較に影響しないため" in window.hidden_mods_toggle.toolTip()
+        assert "影響しにくい" not in window.hidden_mods_toggle.toolTip()
+        assert "Pseudo" not in window.mod_sources_toggle.toolTip()
+        assert "複数の数値をまとめた検索条件" in (
+            window.mod_sources_toggle.toolTip()
+        )
+        assert "計算に使われた元のMod文章" in (
+            window.mod_sources_toggle.toolTip()
+        )
+        window._populate_stat_filters((
+            TradeStatFilter(
+                "pseudo.life", "最大ライフ合計", 90, "pseudo", True,
+                read_value=100,
+                source_texts=("最大ライフ +70", "筋力 +60"),
+                source_contributions=(70, 30),
+                source_headings=("プレフィックス (T1)", "サフィックス (T2)"),
+            ),
+            TradeStatFilter(
+                "explicit.fixed", "固定Mod", 10, "explicit", False,
+                hidden_reason="ユニーク固定値のため初期非表示",
+            ),
+        ))
+        assert not window.hidden_mods_toggle.isHidden()
+        normal = window.mod_filter_tree.topLevelItem(0)
+        hidden = window.mod_filter_tree.topLevelItem(1)
+        assert not normal.isHidden()
+        assert hidden.isHidden()
+        assert normal.childCount() == 1
+        source_row = normal.child(0)
+        source_widget = window.mod_filter_tree.itemWidget(source_row, 0)
+        labels = [label.text() for label in source_widget.findChildren(QLabel)]
+        assert "プレフィックス (T1)" in labels
+        assert "最大ライフ +70" in labels
+        assert "サフィックス (T2)" in labels
+        assert "筋力 +60" in labels
+        assert "+70" not in labels
+        assert "+30" not in labels
+        assert not any("pseudo" in text.casefold() for text in labels)
+        assert not any("主要" in text for text in labels)
+        assert not normal.isExpanded()
+
+        window.hidden_mods_toggle.setChecked(True)
+        assert normal.isHidden()
+        assert not hidden.isHidden()
+
+        window.mod_sources_toggle.setChecked(True)
+        assert window.mod_sources_toggle.text() == "計算元Modを隠す"
+        assert normal.isExpanded()
+        window.mod_sources_toggle.setChecked(False)
+        assert window.mod_sources_toggle.text() == "計算元Modを表示"
+        assert not normal.isExpanded()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("poe_version", (POE1, POE2))
+def test_hidden_candidates_toggle_is_hidden_when_no_candidates(qapp, poe_version):
+    window = PoetoreWindow(app_config={"poe_version": poe_version})
+    try:
+        window.show()
+        window._populate_stat_filters((
+            TradeStatFilter(
+                "explicit.variable", "可変Mod", 10, "explicit", True,
+            ),
+        ))
+
+        assert window.hidden_mods_toggle.isHidden()
+        assert not window.hidden_mods_toggle.isChecked()
+
+        window._populate_stat_filters((
+            TradeStatFilter(
+                "explicit.fixed", "固定Mod", 10, "explicit", False,
+                hidden_reason="ユニーク固定値のため初期非表示",
+            ),
+        ))
+
+        assert not window.hidden_mods_toggle.isHidden()
+    finally:
+        window.close()
+
+
+def test_auto_mod_layout_expands_until_available_height():
+    assert _auto_mod_layout_sizes(
+        profile_height=900,
+        profile_mod_height=250,
+        profile_price_height=300,
+        minimum_price_height=120,
+        content_height=430,
+        available_height=1200,
+        minimum_height=620,
+    ) == (430, 300, 1080)
+    assert _auto_mod_layout_sizes(
+        profile_height=900,
+        profile_mod_height=250,
+        profile_price_height=300,
+        minimum_price_height=120,
+        content_height=600,
+        available_height=1000,
+        minimum_height=620,
+    ) == (514, 120, 984)
+
+
+def test_auto_mod_layout_borrows_height_from_price_results_on_fhd():
+    assert _auto_mod_layout_sizes(
+        profile_height=1039,
+        profile_mod_height=250,
+        profile_price_height=434,
+        minimum_price_height=120,
+        content_height=330,
+        available_height=1040,
+        minimum_height=620,
+    ) == (330, 339, 1024)
+
+
+def test_auto_mod_layout_keeps_related_items_budget_on_fhd():
+    assert _auto_mod_layout_sizes(
+        profile_height=1039,
+        profile_mod_height=250,
+        profile_price_height=254,
+        minimum_price_height=120,
+        content_height=330,
+        available_height=1040,
+        minimum_height=620,
+    ) == (330, 159, 1024)
+
+def test_checked_hidden_unique_mutation_is_sent_as_exact_filter(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Titanium Spirit Shield"
+        window._trade_item_name = "Rathpith Globe"
+        window.input_edit.setPlainText("""アイテムクラス: 盾
+レアリティ: ユニーク
+ラスピスの球体
+チタンスピリットシールド
+--------
+アイテムレベル: 83
+--------
+{ ユニークモッド — ダメージ, キャスター }
+プレイヤーの最大ライフ100ごとにスペルダメージが4(3)%増加する
+--------
+コラプト状態
+""")
+        window.parse_current_text()
+        window.hidden_mods_toggle.setChecked(True)
+
+        target = next(
+            window.mod_filter_tree.topLevelItem(index)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+            if window.mod_filter_tree.topLevelItem(index).data(
+                0, Qt.UserRole + 4
+            ).stat_id == "explicit.stat_3491815140"
+        )
+        checkbox = window.mod_filter_tree.itemWidget(
+            target, 0
+        ).findChild(QCheckBox, "modFilterCheckbox")
+        checkbox.setChecked(True)
+
+        selected = tuple(
+            row for row in window._selected_stat_filters() if row.enabled
+        )
+        spell_damage = next(
+            row for row in selected
+            if row.stat_id == "explicit.stat_3491815140"
+        )
+        assert spell_damage.min_value == 4
+        assert spell_damage.max_value == 4
+
+        query = build_search_query(
+            window._parsed_item, "Titanium Spirit Shield", selected,
+            trade_name="Rathpith Globe",
+        )["query"]
+        assert query["stats"][0]["filters"] == [{
+            "id": "explicit.stat_3491815140",
+            "value": {"min": 4, "max": 4},
+        }]
+    finally:
+        window.close()
+
+def test_search_keeps_checked_hidden_unique_mutation_visible(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 鎧
+レアリティ: ユニーク
+カオムの心臓
+栄光のプレート
+--------
+品質: +20% (augmented)
+アーマー: 944 (augmented)
+--------
+装備要求:
+レベル: 68
+筋力: 191
+--------
+アイテムレベル: 80
+--------
+{ ユニークモッド — ライフ }
+最大ライフ +1080(1000)
+{ ユニークモッド }
+ソケットを持たない
+--------
+コラプト状態
+""")
+        window.parse_current_text()
+        window._populate_stat_filters((
+            TradeStatFilter(
+                "explicit.normal", "通常候補", 10, "explicit", False,
+            ),
+            TradeStatFilter(
+                "explicit.hidden", "最大ライフ +1080(1000)", 1080,
+                "explicit", False, max_value=1080,
+                hidden_reason="ユニーク固定値のため初期非表示",
+            ),
+        ))
+        window.hidden_mods_toggle.setChecked(True)
+        hidden = window.mod_filter_tree.topLevelItem(1)
+        checkbox = window.mod_filter_tree.itemWidget(
+            hidden, 0
+        ).findChild(QCheckBox, "modFilterCheckbox")
+        checkbox.setChecked(True)
+
+        result = PriceResult("Standard", "qid", 0, ())
+        with patch("src.poetore.ui.search_prices", return_value=result) as search:
+            window.search_current_item()
+            for _ in range(50):
+                qapp.processEvents()
+                if search.called:
+                    break
+                QTest.qWait(10)
+
+        assert search.called
+        assert not window.hidden_mods_toggle.isChecked()
+        assert window.hidden_mods_toggle.text() == "隠し候補を表示"
+        assert not window.mod_filter_tree.topLevelItem(0).isHidden()
+        assert not window.mod_filter_tree.topLevelItem(1).isHidden()
+        sent = search.call_args.kwargs["stat_filters"]
+        assert any(
+            row.stat_id == "explicit.hidden"
+            and row.enabled
+            and row.min_value == 1080
+            and row.max_value == 1080
+            for row in sent
+        )
+        checkbox.setChecked(False)
+        assert window.mod_filter_tree.topLevelItem(1).isHidden()
+    finally:
+        window.close()
+
+
 def test_poetore_private_league_is_kept_and_ended_public_league_falls_back(qapp):
     private = PoetoreWindow(app_config={"poetore": {"league": "My League (PL12345)"}})
     ended = PoetoreWindow(app_config={"poetore": {"league": "Old Challenge"}})
@@ -478,6 +2681,9 @@ def test_poetore_private_league_is_kept_and_ended_public_league_falls_back(qapp)
 
 def test_price_result_is_rendered_in_japanese(qapp):
     window = PoetoreWindow()
+    window.trade_status_combo.setCurrentIndex(
+        window.trade_status_combo.findData("available")
+    )
     window._parsed_item = ParsedItem(
         "剣", "レア", "Doom Sever", "Reaver Sword", "weapon", item_level=86,
     )
@@ -492,13 +2698,350 @@ def test_price_result_is_rendered_in_japanese(qapp):
     )))
     assert "Mirage" in window.price_status.text()
     assert "候補42件" in window.price_status.text()
-    assert "中央値 5 chaos" in window.price_status.text()
+    assert window.price_status.text() == "Mirage: 候補42件 / 取得2件"
+    assert "中央値" not in window.price_status.text()
+    assert "安値例" not in window.price_status.text()
     assert window.price_list.topLevelItemCount() == 2
-    assert [window.price_list.headerItem().text(i) for i in range(3)] == ["価格", "ilvl", "出品日時"]
-    assert window.price_list.topLevelItem(0).text(0) == "4 chaos"
+    assert [window.price_list.headerItem().text(i) for i in range(4)] == [
+        "価格", "ilvl", "出品日時", "取引方式",
+    ]
+    first_price = window.price_list.itemWidget(
+        window.price_list.topLevelItem(0), 0,
+    )
+    assert first_price.findChild(QLabel, "priceCurrencyAmount").text() == "4"
+    assert first_price.findChild(QLabel, "priceCurrencyMultiplier").text() == "×"
+    chaos_icon = first_price.findChild(QLabel, "priceCurrencyIcon-chaos")
+    assert chaos_icon is not None and not chaos_icon.pixmap().isNull()
     assert window.price_list.topLevelItem(0).text(1) == "86"
     assert window.price_list.topLevelItem(0).text(2).endswith("前")
+    assert window.price_list.topLevelItem(0).text(3) == "対面"
+    header = window.price_list.header()
+    assert header.sectionResizeMode(0) == QHeaderView.ResizeToContents
+    assert header.sectionResizeMode(1) == QHeaderView.ResizeToContents
+    assert header.sectionResizeMode(2) == QHeaderView.ResizeToContents
+    assert header.sectionResizeMode(3) == QHeaderView.Stretch
+    assert window.price_list.objectName() == "priceList"
+    assert "QTreeWidget#priceList::item { padding: 4px 7px; }" in window.styleSheet()
+    assert (
+        "QTreeWidget#priceList QHeaderView::section { padding: 5px 7px; }"
+        in window.styleSheet()
+    )
+    window._show_price_result(PriceResult(
+        "Mirage", "q", 42, (
+            PriceListing(4, "chaos"), PriceListing(6, "chaos"),
+        ), cached=True,
+    ))
+    assert window.price_status.text() == "Mirage: 候補42件 / 取得2件 / キャッシュ"
     window.close()
+
+
+def test_price_status_layout_keeps_trade_link_visible_and_defaults_to_guidance(qapp):
+    window = PoetoreWindow()
+    try:
+        assert window.remember_trade_options_checkbox.isHidden()
+        assert window.trade_action_layout.indexOf(window.trade_url_button) >= 0
+        assert window.price_status_layout.indexOf(window.trade_url_button) < 0
+
+        window._show_price_result(PriceResult(
+            "Mirage", "q", 1, (PriceListing(4, "chaos"),),
+        ))
+        assert not window.remember_trade_options_checkbox.isHidden()
+        assert window.trade_action_layout.indexOf(window.trade_url_button) < 0
+        assert window.price_status_layout.indexOf(window.trade_url_button) >= 0
+
+        window._search_generation = 7
+        window._show_price_error("temporary failure", 7)
+        assert window.remember_trade_options_checkbox.isHidden()
+        assert window.trade_action_layout.indexOf(window.trade_url_button) >= 0
+        assert window.price_status_layout.indexOf(window.trade_url_button) < 0
+
+        window._clear_displayed_trade_result()
+        assert not window.remember_trade_options_checkbox.isHidden()
+        assert window.trade_action_layout.indexOf(window.trade_url_button) < 0
+        assert window.price_status_layout.indexOf(window.trade_url_button) >= 0
+
+        window._set_price_status("将来追加された案内")
+        assert window.remember_trade_options_checkbox.isHidden()
+        assert window.trade_action_layout.indexOf(window.trade_url_button) >= 0
+        assert window.price_status_layout.indexOf(window.trade_url_button) < 0
+    finally:
+        window.close()
+
+
+def test_partial_and_empty_price_results_use_full_width_guidance(qapp):
+    window = PoetoreWindow()
+    try:
+        window._show_price_result(PriceResult(
+            "Mirage", "q", 10, (PriceListing(4, "chaos"),),
+        ), partial=True)
+        assert window.remember_trade_options_checkbox.isHidden()
+        assert window.trade_action_layout.indexOf(window.trade_url_button) >= 0
+
+        window._show_price_result(PriceResult("Mirage", "q", 0, ()))
+        assert window.remember_trade_options_checkbox.isHidden()
+        assert window.trade_action_layout.indexOf(window.trade_url_button) >= 0
+    finally:
+        window.close()
+
+
+def test_price_status_writes_stay_behind_safe_layout_helper():
+    source = (
+        Path(__file__).parents[1] / "src" / "poetore" / "ui.py"
+    ).read_text(encoding="utf-8")
+    assert source.count("self.price_status.setText(") == 1
+    assert source.count("self.price_status.clear(") == 1
+
+
+def test_poe2_augment_estimates_render_compactly_below_results(qapp):
+    from src.poetore.poe2.augment_pricing import (
+        InstalledAugmentRecovery, VirtualAugmentCost,
+    )
+
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        window._search_generation = 7
+        window._show_augment_values({
+            "virtual": VirtualAugmentCost("Adept Rune", 2, 9.2),
+            "recovery": InstalledAugmentRecovery(
+                ("Adept Rune",), 13, 2, 11, 6,
+            ),
+        }, 7)
+        assert window.virtual_augment_cost_label.text() == (
+            "仮挿入オーグメントの参考費用　9.2 ex"
+        )
+        assert "カレンシー交換の直近価格を優先" in (
+            window.virtual_augment_cost_label.toolTip()
+        )
+        assert window.installed_augment_recovery_value.text() == (
+            "装着済みオーグメントの回収参考価値　11 ex"
+        )
+        assert window.installed_augment_recovery_comparison.text() == (
+            "出品最安 6 ex より +5 ex（素材 13 − 抽出 2）"
+        )
+        assert "カレンシー交換の直近価格を優先" in (
+            window.installed_augment_recovery_panel.toolTip()
+        )
+        assert not window.installed_augment_recovery_hint.isHidden()
+        layout = window.price_list.parentWidget().layout()
+        additional_results_index = next(
+            index for index in range(layout.count())
+            if layout.itemAt(index).layout() is window.additional_results_layout
+        )
+        assert (
+            layout.indexOf(window.price_list)
+            < layout.indexOf(window.virtual_augment_cost_label)
+            < additional_results_index
+            < layout.indexOf(window.installed_augment_recovery_panel)
+        )
+    finally:
+        window.close()
+
+
+def test_augment_values_skip_ninja_when_official_prices_resolve(qapp, monkeypatch):
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr("src.poetore.ui.threading.Thread", ImmediateThread)
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    official = ResolvedReferencePrice(
+        "Adept Rune", 7.5, 7.5, "exalted", "official",
+    )
+    divine = ResolvedReferencePrice(
+        "Divine Orb", 490, 490, "exalted", "official",
+    )
+
+    def resolved(_version, _league, entries, **_kwargs):
+        return {key: official for key, _names, _fallback in entries}
+
+    try:
+        window._auto_league = "Forbidden Rites"
+        window._parsed_item = ParsedItem(
+            "Body Armours", "normal", "", "Expert Mail", "body_armour",
+            properties={"ソケット": "S S"},
+        )
+        window._search_generation = 4
+        window._configure_virtual_augments(window._parsed_item)
+        window.virtual_augment_combo.setCurrentIndex(
+            window.virtual_augment_combo.findData("Adept Rune")
+        )
+        window.virtual_augment_count_combo.setCurrentIndex(
+            window.virtual_augment_count_combo.findData(2)
+        )
+        result = PriceResult("Forbidden Rites", "qid", 0, ())
+        assert window.poe_version == POE2
+        assert not window.virtual_augment_combo.isHidden()
+        assert window.virtual_augment_combo.currentData() == "Adept Rune"
+        assert not window.virtual_augment_count_combo.isHidden()
+        assert window.virtual_augment_count_combo.currentData() == 2
+
+        with (
+            patch.object(
+                window, "_selected_trade_league", return_value="Forbidden Rites",
+            ),
+            patch("src.poetore.ui.resolve_reference_prices", side_effect=resolved),
+            patch("src.poetore.ui.resolve_divine_rate", return_value=divine),
+            patch.object(
+                default_poe_ninja_service, "lookup_poe2_augments",
+                side_effect=AssertionError("poe.ninja must not be fetched"),
+            ) as augments,
+            patch.object(
+                default_poe_ninja_service, "lookup_poe2_identities",
+                side_effect=AssertionError("poe.ninja must not be fetched"),
+            ) as identities,
+            patch.object(
+                default_poe_ninja_service, "divine_exalted_rate",
+                side_effect=AssertionError("poe.ninja must not be fetched"),
+            ) as divine_rate,
+            patch.object(
+                default_poe_ninja_service, "exalted_chaos_rate",
+                side_effect=AssertionError("poe.ninja must not be fetched"),
+            ) as exalted_rate,
+        ):
+            window._queue_augment_values(result, 4)
+            qapp.processEvents()
+
+        augments.assert_not_called()
+        identities.assert_not_called()
+        divine_rate.assert_not_called()
+        exalted_rate.assert_not_called()
+        assert window.virtual_augment_cost_label.text().endswith("15 ex")
+    finally:
+        window.close()
+
+
+def test_augment_recovery_uses_official_chaos_to_exalted_rate(qapp, monkeypatch):
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr("src.poetore.ui.threading.Thread", ImmediateThread)
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    material = ResolvedReferencePrice(
+        "Adept Rune", 7.5, 7.5, "exalted", "official",
+    )
+    extraction = ResolvedReferencePrice(
+        "Orb of Extraction", 200, 200, "exalted", "official",
+    )
+    chaos = ResolvedReferencePrice(
+        "Chaos Orb", 70, 70, "exalted", "official",
+    )
+
+    def resolved(_version, _league, entries, **_kwargs):
+        keys = tuple(key for key, _names, _fallback in entries)
+        if keys == ("Chaos Orb",):
+            return {"Chaos Orb": chaos}
+        return {
+            key: extraction if key == "Orb of Extraction" else material
+            for key in keys
+        }
+
+    try:
+        window._auto_league = "Forbidden Rites"
+        window._parsed_item = ParsedItem(
+            "Body Armours", "normal", "", "Expert Mail", "body_armour",
+        )
+        window._search_generation = 4
+        result = PriceResult(
+            "Forbidden Rites", "qid", 1, (PriceListing(2, "chaos"),),
+        )
+        with (
+            patch.object(
+                window, "_selected_trade_league", return_value="Forbidden Rites",
+            ),
+            patch(
+                "src.poetore.poe2.augment_pricing.installed_augment_refs",
+                return_value=("Adept Rune",),
+            ),
+            patch("src.poetore.ui.resolve_reference_prices", side_effect=resolved),
+            patch(
+                "src.poetore.poe2.augment_pricing.installed_augment_recovery",
+                return_value=None,
+            ) as recovery,
+            patch.object(
+                default_poe_ninja_service, "exalted_chaos_rate",
+                side_effect=AssertionError("poe.ninja must not be fetched"),
+            ) as ninja_rate,
+        ):
+            window._queue_augment_values(result, 4)
+            qapp.processEvents()
+
+        ninja_rate.assert_not_called()
+        assert recovery.call_args.kwargs["exalted_chaos"] == pytest.approx(1 / 70)
+    finally:
+        window.close()
+
+
+def test_poe2_augment_recovery_hides_hint_when_listing_is_better(qapp):
+    from src.poetore.poe2.augment_pricing import InstalledAugmentRecovery
+
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        window._search_generation = 3
+        window._show_augment_values({
+            "recovery": InstalledAugmentRecovery(
+                ("Adept Rune",), 8, 2, 6, 10,
+            ),
+        }, 3)
+        assert window.installed_augment_recovery_comparison.text() == (
+            "出品最安 10 ex より −4 ex（素材 8 − 抽出 2）"
+        )
+        assert window.installed_augment_recovery_hint.isHidden()
+        assert not window.installed_augment_recovery_panel.isHidden()
+    finally:
+        window.close()
+
+
+def test_partial_price_result_is_shown_without_finishing_search(qapp):
+    window = PoetoreWindow()
+    window._search_generation = 7
+    window.price_button.setEnabled(False)
+    window.trade_url_button.setEnabled(False)
+    result = PriceResult("Mirage", "q", 42, (
+        PriceListing(4, "chaos", "seller1", "", "Reaver Sword", ""),
+    ))
+    try:
+        window._search_partially_completed(result, 7)
+
+        assert "取得中" in window.price_status.text()
+        assert window.price_list.topLevelItemCount() == 1
+        assert not window.price_button.isEnabled()
+        assert not window.trade_url_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_next_ten_button_is_shown_only_for_poe2_results(qapp):
+    poe1 = PoetoreWindow(app_config={"poe_version": "PoE1"})
+    poe2 = PoetoreWindow(app_config={"poe_version": POE2})
+    result = PriceResult(
+        "Standard", "query-id", 30, (PriceListing(1, "divine"),),
+        next_result_ids=tuple(f"listing-{index}" for index in range(10, 20)),
+        fetched_count=10,
+    )
+    try:
+        poe1._show_price_result(result)
+        poe2._show_price_result(result)
+
+        assert poe1.additional_results_button.isHidden()
+        assert not poe2.additional_results_button.isHidden()
+        assert poe2.additional_results_button.text() == "次の10件を取得"
+        assert poe2.price_status.text() == "Standard: 候補30件 / 取得10件"
+
+        poe2._additional_results_completed(replace(
+            result, next_result_ids=(), fetched_count=20,
+        ), poe2._search_generation)
+        assert poe2.additional_results_button.isHidden()
+        assert poe2.price_status.text() == "Standard: 候補30件 / 取得20件"
+    finally:
+        poe1.close()
+        poe2.close()
 
 
 def test_relative_listing_time_is_shown_without_online_status(qapp):
@@ -508,15 +3051,114 @@ def test_relative_listing_time_is_shown_without_online_status(qapp):
     assert PoetoreWindow._relative_listing_time("", now) == "-"
 
 
+def test_price_result_shows_pricing_method_in_rightmost_column(qapp):
+    window = PoetoreWindow()
+    try:
+        window.trade_status_combo.setCurrentIndex(
+            window.trade_status_combo.findData("available")
+        )
+        window._show_price_result(PriceResult("Mirage", "q", 3, (
+            PriceListing(4, "chaos", pricing_method="face_to_face"),
+            PriceListing(5, "chaos", pricing_method="instant"),
+            PriceListing(0, "", pricing_method="unpriced"),
+        )))
+        last_column = window.price_list.columnCount() - 1
+        assert window.price_list.headerItem().text(last_column) == "取引方式"
+        assert [
+            window.price_list.topLevelItem(index).text(last_column)
+            for index in range(3)
+        ] == ["対面", "インスタント", "値段なし"]
+        assert window.price_list.topLevelItem(2).text(0) == "値段なし"
+        assert window.price_status.text() == "Mirage: 候補3件 / 取得3件"
+    finally:
+        window.close()
+
+
+def test_price_result_uses_currency_icons_and_keeps_text_fallback(qapp):
+    window = PoetoreWindow()
+    try:
+        window._show_price_result(PriceResult("Mirage", "q", 4, (
+            PriceListing(50, "chaos"),
+            PriceListing(1, "divine", listed_times=3),
+            PriceListing(2, "mirror"),
+            PriceListing(0, "", pricing_method="unpriced"),
+        )))
+
+        chaos_row = window.price_list.topLevelItem(0)
+        divine_row = window.price_list.topLevelItem(1)
+        chaos_cell = window.price_list.itemWidget(chaos_row, 0)
+        divine_cell = window.price_list.itemWidget(divine_row, 0)
+        assert chaos_cell.findChild(QLabel, "priceCurrencyAmount").text() == "50"
+        assert not chaos_cell.findChild(QLabel, "priceCurrencyIcon-chaos").pixmap().isNull()
+        assert divine_cell.findChild(QLabel, "priceCurrencyAmount").text() == "1"
+        assert not divine_cell.findChild(QLabel, "priceCurrencyIcon-divine").pixmap().isNull()
+        assert divine_cell.findChild(QLabel, "priceListingCount").text() == "×3"
+        assert window.price_list.itemWidget(window.price_list.topLevelItem(2), 0) is None
+        assert window.price_list.topLevelItem(2).text(0) == "2 mirror"
+        assert window.price_list.itemWidget(window.price_list.topLevelItem(3), 0) is None
+        assert window.price_list.topLevelItem(3).text(0) == "値段なし"
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("currency", "filename", "tooltip"),
+    [
+        ("mirror", "MirrorofKalandra2.png", "Mirror of Kalandra"),
+        ("alch", "OrbofAlchemy2.png", "Orb of Alchemy"),
+        ("aug", "OrbofAugmentation2.png", "Orb of Augmentation"),
+        ("chance", "OrbofChance2.png", "Orb of Chance"),
+        ("transmute", "OrbofTransmutation2.png", "Orb of Transmutation"),
+        ("regal", "RegalOrb2.png", "Regal Orb"),
+        ("vaal", "VaalOrb2.png", "Vaal Orb"),
+    ],
+)
+def test_poe2_price_result_uses_extra_currency_icons(
+    qapp, currency, filename, tooltip,
+):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        window._show_price_result(PriceResult(
+            "Forbidden Rites", "q", 1, (PriceListing(2, currency),),
+        ))
+        row = window.price_list.topLevelItem(0)
+        cell = window.price_list.itemWidget(row, 0)
+        icon = cell.findChild(QLabel, f"priceCurrencyIcon-{currency}")
+        expected = QPixmap(str(
+            Path(__file__).resolve().parents[1] / "assets" / "icons" / filename
+        )).scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        assert cell.findChild(QLabel, "priceCurrencyAmount").text() == "2"
+        assert icon.toolTip() == tooltip
+        assert icon.pixmap().toImage() == expected.toImage()
+    finally:
+        window.close()
+
+
+def test_currency_icon_price_column_reserves_30_percent_more_width(qapp):
+    window = PoetoreWindow()
+    try:
+        listing = PriceListing(1234, "chaos")
+        window._show_price_result(PriceResult("Mirage", "q", 1, (listing,)))
+        row = window.price_list.topLevelItem(0)
+        widget = window.price_list.itemWidget(row, 0)
+        assert row.sizeHint(0).width() >= math.ceil(widget.sizeHint().width() * 1.3)
+    finally:
+        window.close()
+
+
 def test_gem_result_adds_gem_level_and_quality_columns(qapp):
     window = PoetoreWindow()
     window._parsed_item = ParsedItem("ジェム", "ジェム", "Arc", "Arc", "gem")
     try:
+        window.trade_status_combo.setCurrentIndex(
+            window.trade_status_combo.findData("available")
+        )
         window._show_price_result(PriceResult("Mirage", "q", 1, (
             PriceListing(2, "chaos", indexed="2026-07-22T09:21:00Z", gem_level=20, quality=23),
         )))
-        assert [window.price_list.headerItem().text(i) for i in range(4)] == [
-            "価格", "ジェムLv", "品質", "出品日時",
+        assert [window.price_list.headerItem().text(i) for i in range(5)] == [
+            "価格", "ジェムLv", "品質", "出品日時", "取引方式",
         ]
         assert window.price_list.topLevelItem(0).text(1) == "20"
         assert window.price_list.topLevelItem(0).text(2) == "23"
@@ -532,7 +3174,10 @@ def test_japanese_trade_url_button_opens_result_url(qapp):
             "Standard", "q", 0, (), web_url=url, cached=True,
         ))
         assert window.trade_url_button.isEnabled()
-        assert "キャッシュ" in window.price_status.text()
+        assert window.price_status.text() == (
+            "Standard: 検索候補0件 / キャッシュ。"
+            "価格付き出品は取得できませんでした。"
+        )
         with patch("src.poetore.ui.QDesktopServices.openUrl") as opened:
             window._open_trade_url()
         assert opened.call_args.args[0].toString() == url
@@ -543,6 +3188,9 @@ def test_japanese_trade_url_button_opens_result_url(qapp):
 def test_price_result_columns_reset_when_switching_from_gem_to_weapon(qapp):
     window = PoetoreWindow()
     try:
+        window.trade_status_combo.setCurrentIndex(
+            window.trade_status_combo.findData("available")
+        )
         gem = parse_item_text("""アイテムクラス: スキルジェム
 レアリティ: ジェム
 Arc
@@ -561,7 +3209,7 @@ Arc
         assert [
             window.price_list.headerItem().text(index)
             for index in range(window.price_list.columnCount())
-        ] == ["価格", "ジェムLv", "品質", "出品日時"]
+        ] == ["価格", "ジェムLv", "品質", "出品日時", "取引方式"]
 
         weapon = parse_item_text("""アイテムクラス: ワンド
 レアリティ: レア
@@ -579,11 +3227,30 @@ Imbued Wand
         window._show_price_result(PriceResult(
             "Standard", "weapon", 1, (weapon_listing,),
         ))
-        assert window.price_list.columnCount() == 3
+        assert window.price_list.columnCount() == 4
         assert [
             window.price_list.headerItem().text(index)
             for index in range(window.price_list.columnCount())
-        ] == ["価格", "ilvl", "出品日時"]
+        ] == ["価格", "ilvl", "出品日時", "取引方式"]
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("trade_status", ("instant", "online"))
+def test_price_result_hides_redundant_pricing_method_column(qapp, trade_status):
+    window = PoetoreWindow()
+    try:
+        window.trade_status_combo.setCurrentIndex(
+            window.trade_status_combo.findData(trade_status)
+        )
+        window._show_price_result(PriceResult("Mirage", "q", 1, (
+            PriceListing(4, "chaos", pricing_method="instant"),
+        )))
+
+        assert [
+            window.price_list.headerItem().text(index)
+            for index in range(window.price_list.columnCount())
+        ] == ["価格", "出品日時"]
     finally:
         window.close()
 
@@ -599,8 +3266,9 @@ def test_mod_filters_are_checkable_and_minimum_is_editable(qapp):
     )
     assert checkbox is not None
     assert not checkbox.isChecked()
-    assert "#4488ff" in checkbox.styleSheet()
-    editor = window.mod_filter_tree.itemWidget(row, 4)
+    assert "#257a64" in checkbox.styleSheet()
+    assert "poenavi_check_257a64.png" in checkbox.styleSheet()
+    editor = window.mod_filter_tree.itemWidget(row, 4).findChild(QLineEdit)
     assert editor.text() == "55"
     checkbox.click()
     editor.setText("50")
@@ -610,24 +3278,229 @@ def test_mod_filters_are_checkable_and_minimum_is_editable(qapp):
     window.close()
 
 
-def test_mod_filter_check_and_condition_columns_fit_without_clipping(qapp):
+def test_shared_checkbox_style_keeps_blue_as_default(qapp):
+    checkbox = QCheckBox()
+    Styles.apply_checkbox_style(checkbox)
+    assert "#4488ff" in checkbox.styleSheet()
+    assert "poenavi_check_4488ff.png" in checkbox.styleSheet()
+
+
+def test_mod_filter_rows_do_not_use_alternating_backgrounds(qapp):
     window = PoetoreWindow()
     try:
-        assert window.mod_filter_tree.columnWidth(0) == 40
-        assert window.mod_filter_tree.columnWidth(3) == 346
+        assert window.mod_filter_tree.alternatingRowColors() is False
     finally:
         window.close()
 
 
-def test_mod_filter_minimum_and_maximum_editors_use_narrow_width(qapp):
+def test_mod_filter_tooltip_contains_only_full_mod_text(qapp):
     window = PoetoreWindow()
+    full_text = "品質4%ごとに効果範囲1%増加する長いMod文章"
+    window._populate_stat_filters((TradeStatFilter(
+        "explicit.stat_1",
+        full_text,
+        3,
+        "suffix",
+        False,
+        read_value=7,
+        tier=1,
+        roll_min=3,
+        roll_max=7,
+        selection_reason="候補として表示（初期未選択）",
+        confidence=1.0,
+    ),))
+
+    row = window.mod_filter_tree.topLevelItem(0)
+    tooltip = row.toolTip(_MOD_COLUMN_TEXT)
+    assert tooltip == full_text
+    window.close()
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected_tier_width"),
+    (("small", 62), ("medium", 72), ("large", 83)),
+)
+def test_mod_filter_tier_is_compact_and_condition_column_uses_remaining_width(
+    qapp, setting, expected_tier_width,
+):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": setting}}
+    )
+    try:
+        assert window.mod_filter_tree.columnWidth(2) == expected_tier_width
+        assert (
+            window.mod_filter_tree.header().sectionResizeMode(_MOD_COLUMN_TEXT)
+            == QHeaderView.Stretch
+        )
+        assert not window.mod_filter_tree.header().stretchLastSection()
+    finally:
+        window.close()
+
+
+def test_mod_filter_keeps_maximum_editor_visible_without_horizontal_scroll(qapp):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": "small"}}
+    )
+    window._populate_stat_filters((TradeStatFilter(
+        "explicit.stat_1",
+        "モンスターは物理ダメージの100%を追加混沌ダメージとして獲得する",
+        100,
+        "prefix",
+        False,
+        max_value=100,
+    ),))
+    try:
+        window.show()
+        qapp.processEvents()
+        row = window.mod_filter_tree.topLevelItem(0)
+        maximum_editor = window.mod_filter_tree.itemWidget(
+            row, _MOD_COLUMN_MAX
+        ).findChild(QLineEdit)
+        maximum_editor.setFocus()
+        qapp.processEvents()
+
+        assert window.mod_filter_tree.horizontalScrollBar().maximum() == 0
+        assert window.mod_filter_tree.visualItemRect(row).right() <= (
+            window.mod_filter_tree.viewport().rect().right()
+        )
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected_height"),
+    (("small", 26), ("medium", 30), ("large", 34)),
+)
+def test_mod_value_editors_have_vertical_inset(qapp, setting, expected_height):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": setting}}
+    )
+    window._populate_stat_filters((TradeStatFilter(
+        "explicit.stat_1", "最大ライフ +#", 100, "prefix", False,
+        max_value=120,
+    ),))
+    try:
+        window.show()
+        qapp.processEvents()
+        row = window.mod_filter_tree.topLevelItem(0)
+        minimum_cell = window.mod_filter_tree.itemWidget(row, _MOD_COLUMN_MIN)
+        maximum_cell = window.mod_filter_tree.itemWidget(row, _MOD_COLUMN_MAX)
+        for cell in (minimum_cell, maximum_cell):
+            editor = cell.findChild(QLineEdit)
+            assert editor.height() == expected_height
+            assert editor.height() < window.mod_filter_tree.visualItemRect(row).height()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected_min_width", "expected_max_width", "expected_gap", "expected_font_size"),
+    (
+        ("small", 56, 48, 8, 11),
+        ("medium", 65, 56, 9, 12),
+        ("large", 75, 64, 11, 14),
+    ),
+)
+def test_mod_filter_minimum_and_maximum_editors_use_narrow_width_and_smaller_font(
+    qapp, setting, expected_min_width, expected_max_width, expected_gap,
+    expected_font_size,
+):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": setting}}
+    )
     window._populate_stat_filters((TradeStatFilter(
         "explicit.stat_1", "命中力 +55", 55, "prefix", False, max_value=100,
     ),))
     try:
         row = window.mod_filter_tree.topLevelItem(0)
-        assert window.mod_filter_tree.itemWidget(row, 4).width() == 72
-        assert window.mod_filter_tree.itemWidget(row, 5).width() == 72
+        minimum_cell = window.mod_filter_tree.itemWidget(row, 4)
+        maximum_cell = window.mod_filter_tree.itemWidget(row, 5)
+        minimum_editor = minimum_cell.findChild(QLineEdit)
+        maximum_editor = maximum_cell.findChild(QLineEdit)
+        assert minimum_cell.width() == expected_min_width
+        assert maximum_cell.width() == expected_max_width
+        assert minimum_cell.layout().contentsMargins().left() == expected_gap
+        assert maximum_cell.layout().contentsMargins().left() == 0
+        assert f"font-size: {expected_font_size}px" in minimum_editor.styleSheet()
+        assert f"font-size: {expected_font_size}px" in maximum_editor.styleSheet()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected_font_size"),
+    (("small", 11), ("medium", 12), ("large", 14)),
+)
+def test_mod_filter_kind_uses_same_compact_font_as_value_editors(
+    qapp, setting, expected_font_size,
+):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": setting}}
+    )
+    window._populate_stat_filters((TradeStatFilter(
+        "explicit.stat_1", "命中力 +55", 55, "prefix", False,
+    ),))
+    try:
+        row = window.mod_filter_tree.topLevelItem(0)
+        minimum_editor = window.mod_filter_tree.itemWidget(
+            row, _MOD_COLUMN_MIN
+        ).findChild(QLineEdit)
+        assert row.font(_MOD_COLUMN_KIND).pixelSize() == expected_font_size
+        assert row.foreground(_MOD_COLUMN_KIND).color().name() == "#98a39f"
+        assert (
+            f"font-size: {expected_font_size}px"
+            in minimum_editor.styleSheet()
+        )
+    finally:
+        window.close()
+
+
+def test_mod_filter_kind_font_updates_with_display_size(qapp):
+    config = {"poetore": {"result_font_size": "small"}}
+    window = PoetoreWindow(app_config=config)
+    window._populate_stat_filters((TradeStatFilter(
+        "explicit.stat_1", "命中力 +55", 55, "prefix", False,
+    ),))
+    try:
+        row = window.mod_filter_tree.topLevelItem(0)
+        assert row.font(_MOD_COLUMN_KIND).pixelSize() == 11
+
+        config["poetore"]["result_font_size"] = "large"
+        window.apply_result_display_size()
+
+        assert row.font(_MOD_COLUMN_KIND).pixelSize() == 14
+    finally:
+        window.close()
+
+
+def test_mod_text_click_toggles_without_selecting_or_moving_value_editors(qapp):
+    window = PoetoreWindow()
+    window._populate_stat_filters((TradeStatFilter(
+        "explicit.stat_1", "命中力 +55", 55, "prefix", False, max_value=100,
+    ),))
+    try:
+        window.show()
+        qapp.processEvents()
+        row = window.mod_filter_tree.topLevelItem(0)
+        checkbox = window.mod_filter_tree.itemWidget(row, 0).findChild(
+            QCheckBox, "modFilterCheckbox"
+        )
+        minimum_editor = window.mod_filter_tree.itemWidget(row, 4).findChild(QLineEdit)
+        maximum_editor = window.mod_filter_tree.itemWidget(row, 5).findChild(QLineEdit)
+        before = (minimum_editor.geometry(), maximum_editor.geometry())
+
+        window._toggle_mod_condition_from_text(row, 3)
+        qapp.processEvents()
+
+        assert checkbox.isChecked()
+        assert not row.isSelected()
+        assert (minimum_editor.geometry(), maximum_editor.geometry()) == before
+        row_rect = window.mod_filter_tree.visualItemRect(row)
+        assert row_rect.height() > minimum_editor.height()
+        assert minimum_editor.geometry().top() > 0
+        assert minimum_editor.geometry().bottom() < row_rect.height() - 1
+        assert maximum_editor.geometry().top() > 0
+        assert maximum_editor.geometry().bottom() < row_rect.height() - 1
     finally:
         window.close()
 
@@ -712,7 +3585,7 @@ def test_mod_filter_ui_preserves_internal_logic_without_user_logic_column(
         window.close()
 
 
-def test_mod_filter_ui_shows_reason_tier_range_generation_and_matching(qapp):
+def test_mod_filter_ui_keeps_diagnostics_internal_and_tooltip_simple(qapp):
     window = PoetoreWindow()
     try:
         source = TradeStatFilter(
@@ -724,21 +3597,136 @@ def test_mod_filter_ui_shows_reason_tier_range_generation_and_matching(qapp):
         window._populate_stat_filters((source,))
         row = window.mod_filter_tree.topLevelItem(0)
         assert row.text(2) == "T1"
-        detail = row.text(6)
-        assert "ベースアイテム向けT1 Mod" in detail
-        assert "読取 100" in detail
-        assert "T1" in detail
-        assert "範囲 90–100" in detail
-        assert "プレフィックス" in detail
-        assert "フラクチャー" in detail
-        assert "一致 100%" in detail
+        assert row.toolTip(3) == "最大ライフ +100"
 
-        editor = window.mod_filter_tree.itemWidget(row, 4)
+        editor = window.mod_filter_tree.itemWidget(row, 4).findChild(QLineEdit)
         editor.setText("95")
         selected = window._selected_stat_filters()[0]
         assert selected.min_value == 95
         assert selected.selection_reason == source.selection_reason
         assert selected.tier == 1
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(("provenance", "label"), [
+    ("crafted", "クラフト"),
+    ("fractured", "フラクチャー"),
+    ("desecrated", "冒涜"),
+    ("catalyst", "カタリスト"),
+    ("volatile", "ヴォラタイル・ヴァール"),
+    ("reflecting", "リフレクティング・ミスト"),
+    ("corrupted", "コラプト"),
+])
+def test_mod_filter_ui_shows_provenance_in_kind_column(qapp, provenance, label):
+    window = PoetoreWindow()
+    try:
+        source = TradeStatFilter(
+            "explicit.stat_1", "冷気耐性 +45%", 45, "explicit", True,
+            provenance_tags=(provenance,),
+        )
+        window._populate_stat_filters((source,))
+        row = window.mod_filter_tree.topLevelItem(0)
+        assert row.text(_MOD_COLUMN_KIND) == label
+        assert window.mod_filter_tree.itemWidget(row, _MOD_COLUMN_TEXT) is None
+        assert row.text(_MOD_COLUMN_TEXT) == source.text
+        assert window._selected_stat_filters()[0] == source
+    finally:
+        window.close()
+
+
+def test_poe2_finished_filter_keeps_special_origin_visible_after_normalization(qapp):
+    window = PoetoreWindow()
+    try:
+        item = ParsedItem(
+            item_class="Gloves", rarity="rare", name="Test",
+            base_type="Grand Bracers", category="gloves",
+            flags=("fractured",), modifiers=(ItemModifier(
+                "冷気耐性 +45%", (45.0,), kind="fractured",
+                stat_id="fractured.stat_2923486259",
+            ),),
+        )
+        filters = poe2_trade_filters(item)
+        normalized = next(
+            row for row in filters if row.stat_id == "explicit.stat_2923486259"
+        )
+        window._populate_stat_filters(filters)
+        rows = [
+            window.mod_filter_tree.topLevelItem(index)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        row = next(
+            row for row in rows
+            if row.data(_MOD_COLUMN_CHECK, Qt.UserRole) == normalized.stat_id
+        )
+        assert row.text(_MOD_COLUMN_KIND) == "フラクチャー"
+        assert window.mod_filter_tree.itemWidget(row, _MOD_COLUMN_TEXT) is None
+        selected = next(
+            row for row in window._selected_stat_filters()
+            if row.stat_id == normalized.stat_id
+        )
+        assert selected.stat_id == "explicit.stat_2923486259"
+        assert selected.provenance_tags == ("fractured",)
+    finally:
+        window.close()
+
+
+def test_poe2_filter_ui_shows_affixes_and_property_first(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        filters = (
+            TradeStatFilter("property.physical_dps", "物理DPS", 100, "property", True),
+            TradeStatFilter(
+                "explicit.stat_1", "物理ダメージ増加", 30, "explicit", True,
+                affix="prefix",
+            ),
+            TradeStatFilter(
+                "explicit.stat_2", "アタックスピード増加", 10, "explicit", True,
+                affix="suffix",
+            ),
+            TradeStatFilter("rune.stat_3", "ルーン効果", 5, "augment", True),
+        )
+        window._populate_stat_filters(filters)
+        labels = [
+            window.mod_filter_tree.topLevelItem(index).text(_MOD_COLUMN_KIND)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        assert labels == ["アイテム特性", "プレフィックス", "サフィックス", "特殊"]
+    finally:
+        window.close()
+
+
+def test_mod_filter_ui_lists_merged_special_origins_in_kind_column(qapp):
+    window = PoetoreWindow()
+    try:
+        source = TradeStatFilter(
+            "explicit.stat_1", "混沌耐性 +21%", 21, "explicit", True,
+            provenance_tags=("crafted", "fractured"),
+        )
+        window._populate_stat_filters((source,))
+        row = window.mod_filter_tree.topLevelItem(0)
+        assert row.text(_MOD_COLUMN_KIND) == "クラフト／フラクチャー"
+    finally:
+        window.close()
+
+
+def test_poe2_mod_kind_column_is_capped_and_full_label_has_tooltip(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        source = TradeStatFilter(
+            "explicit.stat_1", "混沌耐性 +21%", 21, "explicit", True,
+            provenance_tags=("crafted", "fractured"),
+        )
+        window._populate_stat_filters((source,))
+        row = window.mod_filter_tree.topLevelItem(0)
+        assert window.mod_filter_tree.header().sectionResizeMode(
+            _MOD_COLUMN_KIND
+        ) == QHeaderView.Fixed
+        assert window.mod_filter_tree.columnWidth(_MOD_COLUMN_KIND) <= (
+            window._scaled_display_value(104)
+        )
+        assert row.toolTip(_MOD_COLUMN_KIND) == "クラフト／フラクチャー"
+        assert row.toolTip(_MOD_COLUMN_TEXT) == source.text
     finally:
         window.close()
 
@@ -767,7 +3755,7 @@ def test_unique_variable_roll_slider_drag_updates_minimum_and_enables_filter(qap
         assert "QWidget#uniqueRollCell" in text_widget.styleSheet()
         labels = text_widget.findChildren(QLabel)
         assert len(labels) == 1
-        assert row.sizeHint(3).height() == 62
+        assert row.sizeHint(3).height() == 72
         rendered_cell = text_widget.grab().toImage()
         assert {
             rendered_cell.pixelColor(x, y).name()
@@ -787,8 +3775,8 @@ def test_unique_variable_roll_slider_drag_updates_minimum_and_enables_filter(qap
         QTest.mouseRelease(slider, Qt.LeftButton, pos=QPoint(drag_x, 12))
         assert slider._preview is None
 
-        minimum_editor = window.mod_filter_tree.itemWidget(row, 4)
-        maximum_editor = window.mod_filter_tree.itemWidget(row, 5)
+        minimum_editor = window.mod_filter_tree.itemWidget(row, 4).findChild(QLineEdit)
+        maximum_editor = window.mod_filter_tree.itemWidget(row, 5).findChild(QLineEdit)
         checkbox = window.mod_filter_tree.itemWidget(row, 0).findChild(
             QCheckBox, "modFilterCheckbox"
         )
@@ -830,7 +3818,7 @@ def test_unique_roll_slider_tracks_numeric_input_and_awakened_decimal_precision(
         roll_slider = window.mod_filter_tree.itemWidget(row, 3).findChild(
             _UniqueRollSlider, "uniqueRollSlider"
         )
-        window.mod_filter_tree.itemWidget(row, 4).setText("1.75")
+        window.mod_filter_tree.itemWidget(row, 4).findChild(QLineEdit).setText("1.75")
         assert roll_slider.searchValues() == (1.75, None)
     finally:
         window.close()
@@ -857,12 +3845,83 @@ def test_unique_lower_is_better_slider_updates_maximum(qapp):
         expected = slider._value_at(drag_x)
         QTest.mouseClick(slider, Qt.LeftButton, pos=QPoint(drag_x, 12))
 
-        assert window.mod_filter_tree.itemWidget(row, 4).text() == ""
-        assert window.mod_filter_tree.itemWidget(row, 5).text() == f"{expected:g}"
+        assert window.mod_filter_tree.itemWidget(row, 4).findChild(QLineEdit).text() == ""
+        assert window.mod_filter_tree.itemWidget(row, 5).findChild(QLineEdit).text() == f"{expected:g}"
         selected = window._selected_stat_filters()[0]
         assert selected.enabled is True
         assert selected.min_value is None
         assert selected.max_value == expected
+    finally:
+        window.close()
+
+
+def test_mod_text_click_toggles_condition_but_value_editor_does_not(qapp):
+    window = PoetoreWindow()
+    try:
+        source = TradeStatFilter(
+            "explicit.stat_1", "+50 to maximum Life", 45,
+            "explicit", False,
+        )
+        window._populate_stat_filters((source,))
+        window.show()
+        qapp.processEvents()
+
+        row = window.mod_filter_tree.topLevelItem(0)
+        checkbox = window.mod_filter_tree.itemWidget(
+            row, 0
+        ).findChild(QCheckBox, "modFilterCheckbox")
+        row_rect = window.mod_filter_tree.visualItemRect(row)
+        text_x = (
+            window.mod_filter_tree.header().sectionViewportPosition(
+                _MOD_COLUMN_TEXT
+            ) + 12
+        )
+
+        QTest.mouseClick(
+            window.mod_filter_tree.viewport(), Qt.LeftButton,
+            pos=QPoint(text_x, row_rect.center().y()),
+        )
+        assert checkbox.isChecked()
+
+        minimum_editor = window.mod_filter_tree.itemWidget(
+            row, _MOD_COLUMN_MIN
+        ).findChild(QLineEdit)
+        QTest.mouseClick(minimum_editor, Qt.LeftButton)
+        assert checkbox.isChecked()
+    finally:
+        window.close()
+
+
+def test_unique_roll_mod_text_click_toggles_condition_without_touching_slider(qapp):
+    window = PoetoreWindow()
+    try:
+        window._parsed_item = ParsedItem(
+            "Amulets", "Unique", "The Example", "Gold Amulet", "accessory",
+        )
+        source = TradeStatFilter(
+            "explicit.life", "+40(30-50) to maximum Life", 38,
+            "explicit", True, read_value=40, roll_min=30, roll_max=50,
+            better=1,
+        )
+        window._populate_stat_filters((source,))
+        window.show()
+        qapp.processEvents()
+
+        row = window.mod_filter_tree.topLevelItem(0)
+        text_widget = window.mod_filter_tree.itemWidget(row, _MOD_COLUMN_TEXT)
+        text_label = text_widget.findChild(QLabel)
+        checkbox = window.mod_filter_tree.itemWidget(
+            row, _MOD_COLUMN_CHECK
+        ).findChild(QCheckBox, "modFilterCheckbox")
+        slider = text_widget.findChild(
+            _UniqueRollSlider, "uniqueRollSlider"
+        )
+        before_values = slider.searchValues()
+
+        QTest.mouseClick(text_label, Qt.LeftButton)
+
+        assert not checkbox.isChecked()
+        assert slider.searchValues() == before_values
     finally:
         window.close()
 
@@ -916,6 +3975,30 @@ def test_mod_filter_ui_shows_multiple_awakened_tier_tags_on_property(qapp):
         window.close()
 
 
+@pytest.mark.parametrize(
+    ("tier", "style_fragment"),
+    ((1, "background: #D8C47A"), (2, "border: 1px solid #9F9162")),
+)
+def test_poe2_mod_filter_ui_shows_high_tier_badge(qapp, tier, style_fragment):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        source = TradeStatFilter(
+            f"explicit.stat_{tier}", f"PoE2 T{tier} Mod", 10.0,
+            "prefix", True, tier=tier,
+        )
+        window._populate_stat_filters((source,))
+
+        row = window.mod_filter_tree.topLevelItem(0)
+        tier_widget = window.mod_filter_tree.itemWidget(row, 2)
+        assert row.text(2) == ""
+        assert tier_widget is not None
+        labels = tier_widget.findChildren(QLabel)
+        assert [label.text() for label in labels] == [f"T{tier}"]
+        assert style_fragment in labels[0].styleSheet()
+    finally:
+        window.close()
+
+
 def test_weapon_compound_accuracy_tier_badge_has_double_width_column(qapp):
     window = PoetoreWindow()
     try:
@@ -961,7 +4044,7 @@ Imbued Wand
         )
         tier_widget = window.mod_filter_tree.itemWidget(accuracy_row, 2)
 
-        assert window.mod_filter_tree.columnWidth(2) == 75
+        assert window.mod_filter_tree.columnWidth(2) == 72
         assert accuracy_row.text(2) == ""
         assert tier_widget is not None
         assert [label.text() for label in tier_widget.findChildren(QLabel)] == ["T2", "T2"]
@@ -978,7 +4061,7 @@ def test_mod_conditions_can_be_collapsed_without_losing_values(qapp):
         )
         window._populate_stat_filters((source,))
         row = window.mod_filter_tree.topLevelItem(0)
-        editor = window.mod_filter_tree.itemWidget(row, 4)
+        editor = window.mod_filter_tree.itemWidget(row, 4).findChild(QLineEdit)
         editor.setText("95")
 
         window.show()
@@ -991,6 +4074,201 @@ def test_mod_conditions_can_be_collapsed_without_losing_values(qapp):
         window.mod_conditions_toggle.click()
         assert not window.mod_filter_tree.isHidden()
         assert window.mod_conditions_toggle.text() == "mod条件をたたむ∧"
+    finally:
+        window.close()
+
+
+def test_mod_conditions_default_is_reset_for_each_new_item(qapp):
+    window = PoetoreWindow()
+    try:
+        fragment = """アイテムクラス: その他マップアイテム
+レアリティ: ノーマル
+覚醒のフラグメント
+--------
+スタックサイズ: 1/10
+"""
+        window.input_edit.setPlainText(fragment)
+        window.parse_current_text()
+
+        assert window.mod_filter_tree.topLevelItemCount() == 0
+        assert window.mod_filter_tree.isHidden()
+        assert window.mod_conditions_toggle.text() == "mod条件をひらく∨"
+
+        window.mod_conditions_toggle.click()
+        assert not window.mod_filter_tree.isHidden()
+        window.parse_current_text()
+        assert not window.mod_filter_tree.isHidden()
+
+        window.mod_filter_tree.clear()
+        window.input_edit.setPlainText("""アイテムクラス: 兜
+レアリティ: レア
+堅牢な冠
+鉄の帽子
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「頑健な」 (ティア: 5) — ライフ }
+最大ライフ +72(70-84)
+""")
+        window.parse_current_text()
+
+        assert window.mod_filter_tree.topLevelItemCount() > 0
+        assert not window.mod_filter_tree.isHidden()
+        assert window.mod_conditions_toggle.text() == "mod条件をたたむ∧"
+    finally:
+        window.close()
+
+
+def test_hidden_window_still_sizes_repeated_item_mod_rows_to_content(qapp):
+    window = PoetoreWindow()
+    try:
+        window.hide()
+        filters = tuple(
+            TradeStatFilter(
+                f"explicit.stat_{index}", f"テストMod {index}", index,
+                "prefix", index < 3,
+            )
+            for index in range(10)
+        )
+
+        with patch(
+            "src.poetore.ui._auto_mod_layout_sizes",
+            return_value=(500, 180, 800),
+        ) as layout_sizes:
+            window._populate_stat_filters(filters)
+
+        assert not window.mod_filter_tree.isHidden()
+        assert window._visible_mod_content_height() > 400
+        assert layout_sizes.call_args.kwargs["content_height"] > 400
+        assert window.mod_filter_tree.maximumHeight() == 500
+    finally:
+        window.close()
+
+
+def test_overflowing_mod_rows_use_complete_scrollable_rows(qapp, monkeypatch):
+    window = PoetoreWindow()
+    try:
+        filters = tuple(
+            TradeStatFilter(
+                f"explicit.stat_{index}", f"Nebulis相当Mod {index}", index,
+                "implicit" if index < 4 else "unique", True,
+            )
+            for index in range(12)
+        )
+        monkeypatch.setattr(window, "_visible_mod_content_height", lambda: 900)
+        with patch(
+            "src.poetore.ui._auto_mod_layout_sizes",
+            return_value=(317, 120, 760),
+        ):
+            window._populate_stat_filters(filters)
+
+        frame_height = window.mod_filter_tree.frameWidth() * 2 + 4
+        row_height = window._scaled_display_value(_MOD_ROW_HEIGHT)
+        assert (window.mod_filter_tree.maximumHeight() - frame_height) % row_height == 0
+        assert window.mod_filter_tree.maximumHeight() < 317
+        assert window.mod_filter_tree.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+        assert window.mod_filter_tree.verticalScrollMode() == QAbstractItemView.ScrollPerItem
+    finally:
+        window.close()
+
+
+def test_overflowing_mod_rows_reserve_real_action_area(qapp, monkeypatch):
+    window = PoetoreWindow()
+    try:
+        window.show()
+        # Reproduce a fixed action area taller than the original display
+        # profile anticipated. Nebulis exposed this after action controls grew.
+        window.price_status.setMinimumHeight(70)
+        filters = tuple(
+            TradeStatFilter(
+                f"explicit.stat_{index}", f"Nebulis実表示Mod {index}", index,
+                "implicit" if index < 4 else "unique", True,
+            )
+            for index in range(12)
+        )
+        monkeypatch.setattr(window, "_visible_mod_content_height", lambda: 900)
+
+        with patch(
+            "src.poetore.ui._auto_mod_layout_sizes",
+            wraps=_auto_mod_layout_sizes,
+        ) as layout_sizes:
+            window._populate_stat_filters(filters)
+        qapp.processEvents()
+
+        assert layout_sizes.call_args.kwargs["profile_height"] > 900
+        tree_bottom = (
+            window.mod_filter_tree.mapTo(window, QPoint(0, 0)).y()
+            + window.mod_filter_tree.height()
+        )
+        actions_top = window.mod_conditions_toggle.mapTo(window, QPoint(0, 0)).y()
+        assert tree_bottom <= actions_top
+    finally:
+        window.close()
+
+
+def test_mod_condition_checks_toggle_all_without_changing_item_level(qapp):
+    window = PoetoreWindow()
+    try:
+        filters = (
+            TradeStatFilter("explicit.stat_1", "最大ライフ +100", 90, "prefix", True),
+            TradeStatFilter("explicit.stat_2", "火耐性 +40%", 35, "suffix", True),
+        )
+        window._populate_stat_filters(filters)
+        window.item_level_tag.show()
+        window.item_level_edit.setText("84")
+        window._set_item_level_filter_enabled(True)
+
+        assert window.clear_mod_conditions_button.text() == "一覧のチェックを全て解除"
+        assert window.clear_mod_conditions_button.toolTip() == (
+            "上の条件一覧のみ。ilvlなどの基本条件は変更しません"
+        )
+        window.show()
+        qapp.processEvents()
+        assert (
+            window.clear_mod_conditions_button.parentWidget()
+            is window.mod_conditions_toggle.parentWidget()
+        )
+        assert (
+            window.clear_mod_conditions_button.geometry().left()
+            > window.mod_conditions_toggle.geometry().right()
+        )
+        assert (
+            window.clear_mod_conditions_button.geometry().center().y()
+            == window.mod_conditions_toggle.geometry().center().y()
+        )
+        window.clear_mod_conditions_button.click()
+
+        assert [row.enabled for row in window._selected_stat_filters()] == [False, False]
+        assert window.clear_mod_conditions_button.text() == "一覧のチェックを全て選択"
+        assert window._selected_item_level() == 84
+        assert window._item_level_filter_enabled
+
+        window.clear_mod_conditions_button.click()
+
+        assert [row.enabled for row in window._selected_stat_filters()] == [True, True]
+        assert window.clear_mod_conditions_button.text() == "一覧のチェックを全て解除"
+    finally:
+        window.close()
+
+
+def test_mod_condition_toggle_shows_clear_when_partially_checked(qapp):
+    window = PoetoreWindow()
+    try:
+        filters = (
+            TradeStatFilter("explicit.stat_1", "最大ライフ +100", 90, "prefix", True),
+            TradeStatFilter("explicit.stat_2", "火耐性 +40%", 35, "suffix", False),
+        )
+        window._populate_stat_filters(filters)
+
+        assert [row.enabled for row in window._selected_stat_filters()] == [True, False]
+        assert window.clear_mod_conditions_button.text() == "一覧のチェックを全て解除"
+
+        checkboxes = window._mod_condition_checkboxes()
+        checkboxes[0].setChecked(False)
+        assert window.clear_mod_conditions_button.text() == "一覧のチェックを全て選択"
+
+        checkboxes[1].setChecked(True)
+        assert window.clear_mod_conditions_button.text() == "一覧のチェックを全て解除"
     finally:
         window.close()
 
@@ -1011,6 +4289,301 @@ Unknown Experimental Modifier 123
         assert not window.mod_warning.isHidden()
         assert "メタデータ未解決 1件" in window.mod_warning.text()
         assert "Unknown Experimental Modifier 123" in window.mod_warning.text()
+    finally:
+        window.close()
+
+
+def test_constricting_command_surrounded_mod_has_no_unresolved_warning(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        fixture = (
+            Path(__file__).parent / "fixtures" / "poe2" / "constricting_command_ja.txt"
+        )
+        window.input_edit.setPlainText(fixture.read_text(encoding="utf-8"))
+        window.parse_current_text()
+
+        assert window.mod_warning.isHidden()
+        surrounded = next(
+            row for row in window._selected_stat_filters()
+            if row.stat_id == "explicit.stat_2267564181"
+        )
+        assert surrounded.min_value is None
+        assert surrounded.max_value == -2.0
+    finally:
+        window.close()
+
+
+def test_dawnbreaker_shield_block_mod_does_not_show_unresolved_warning(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 盾
+レアリティ: ユニーク
+ドーンブレイカー
+巨大なタワーシールド
+--------
+ブロック率: 45% (augmented)
+アーマー: 2003 (augmented)
+--------
+アイテムレベル: 86
+--------
+{ 暗黙モッド — ライフ }
+最大ライフ +17(10-20)
+--------
+{ ユニークモッド }
+ブロック率 +22(20-25)%
+{ ユニークモッド }
+直近ヒットにより受けた火ダメージ200ごとにアタックブロック率 -1%
+(Recently: 直近とは過去4秒間を指す)
+{ ユニークモッド }
+冷気ダメージの10(10-20)%を火ダメージとして受ける
+{ ユニークモッド }
+雷ダメージの12(10-20)%を火ダメージとして受ける
+{ ユニークモッド }
+物理ダメージの20(10-20)%を火ダメージとして受ける
+{ ユニークモッド }
+ブロック時に近距離にいる敵に焦げを付与する
+(Scorch: 焦げた敵は元素耐性が-10%される)
+(近距離は最大2メートル)
+""")
+        window.parse_current_text()
+
+        assert window.mod_warning.isHidden()
+        assert window.mod_warning.text() == ""
+        visible_filters = [
+            window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole + 4)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        block_filter = next(
+            row for row in visible_filters
+            if row.stat_id == "explicit.stat_4253454700"
+        )
+        assert block_filter.text == "ブロック率 +22(20-25)%"
+        assert block_filter.min_value == 21
+    finally:
+        window.close()
+
+
+def test_itemised_spectre_corpse_hides_fixed_ability_mod_warning(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 死体
+レアリティ: カレンシー
+完全体のドルイド錬金術師
+--------
+死体レベル: 85
+モンスターカテゴリー: 人型
+--------
+アイテムレベル: 85
+--------
+ポイゾナスコンコクションを投げる
+フラスコの効果が200％増加する
+所有者は3秒ごとにライフフラスコのチャージを1得る
+--------
+このアイテムを右クリックしてこの死体を生成する。
+""")
+        window.parse_current_text()
+
+        assert window._parsed_item.category == "corpse"
+        assert window.mod_warning.isHidden()
+        assert window._selected_stat_filters() == ()
+        assert not window.item_level_tag.isHidden()
+        assert window._selected_item_level() == 85
+
+        window.item_level_toggle.click()
+        assert window._selected_item_level() is None
+
+        window.item_level_edit.setFocus()
+        window.item_level_edit.selectAll()
+        QTest.keyClicks(window.item_level_edit, "83")
+        assert window._selected_item_level() == 83
+    finally:
+        window.close()
+
+
+def test_embryonic_gift_full_copy_has_no_unresolved_metadata_warning(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 母胎ギフト
+レアリティ: カレンシー
+古代の母胎ギフト
+--------
+アイテムレベル: 83
+1790のハイヴブラッドが必要
+--------
+創生の樹でユニークアイテムに成長させられる
+--------
+このアイテムを創生の樹の割り当て済みのユニークアイテムの母胎に配置する。右クリックで創生の樹から取り除ける。
+""")
+        window.parse_current_text()
+
+        assert window._parsed_item.category == "incubator"
+        assert window._parsed_item.modifiers == ()
+        assert window.mod_warning.isHidden()
+        assert window.mod_warning.text() == ""
+        assert window._selected_stat_filters() == ()
+    finally:
+        window.close()
+
+
+def test_replica_dragonfang_full_copy_shows_selected_skill_mod(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Onyx Amulet"
+        window._trade_item_name = "Replica Dragonfang's Flight"
+        window.input_edit.setPlainText("""アイテムクラス: アミュレット
+レアリティ: ユニーク
+竜の牙の飛翔（レプリカ）
+オニキスのアミュレット
+--------
+装備要求:
+レベル: 56
+--------
+アイテムレベル: 85
+--------
+山の如し を割り当てる (enchant)
+--------
+{ 暗黙モッド — 能力値 }
+全ての能力値 +16(10-16)
+--------
+{ ユニークモッド }
+全てのブレードブラスト(ファイヤーボール-マナインフューズスタッフ)ジェムのレベル +3
+{ ユニークモッド — 元素, 耐性 }
+全ての元素耐性 +5(5-10)%
+{ ユニークモッド }
+スキルのリザーブ効率が10(5-10)%増加する
+{ ユニークモッド }
+アイテムおよびジェムの要求能力値が10(10-5)%減少する
+""")
+        window.parse_current_text()
+
+        visible_filters = [
+            window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole + 4)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        skill = next(
+            row for row in visible_filters
+            if row.stat_id == "explicit.indexable_skill_217"
+        )
+        assert skill.text.startswith("全てのブレードブラスト")
+        assert skill.enabled is True
+        assert skill.hidden_reason == ""
+        assert window.mod_warning.isHidden()
+    finally:
+        window.close()
+
+
+def test_forbidden_shako_full_copy_shows_both_random_support_mods(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Great Crown"
+        window._trade_item_name = "Forbidden Shako"
+        window.input_edit.setPlainText("""アイテムクラス: 兜
+レアリティ: ユニーク
+禁断のシャコー帽
+グレートクラウン
+--------
+装備要求:
+レベル: 68
+--------
+アイテムレベル: 85
+--------
+{ ユニークモッド }
+ソケットされたジェムはレベル8(1-10)クリティカルダメージ増加によりサポートされる
+{ ユニークモッド }
+ソケットされたジェムはレベル29(25-35)ミニオンスピードによりサポートされる
+{ ユニークモッド — 能力値 }
+全ての能力値 +29(25-30)
+""")
+        window.parse_current_text()
+
+        visible_filters = [
+            window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole + 4)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        by_id = {row.stat_id: row for row in visible_filters}
+        assert by_id["explicit.indexable_support_67"].enabled is True
+        assert by_id["explicit.indexable_support_62"].enabled is True
+        assert by_id["explicit.indexable_support_67"].read_value == 8
+        assert by_id["explicit.indexable_support_62"].read_value == 29
+        assert window.mod_warning.isHidden()
+    finally:
+        window.close()
+
+
+def test_forbidden_shako_reported_advanced_copy_shows_both_support_mods(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Great Crown"
+        window._trade_item_name = "Forbidden Shako"
+        window.input_edit.setPlainText("""アイテムクラス: 兜
+レアリティ: ユニーク
+禁断のシャコー帽
+グレートクラウン
+--------
+アイテムレベル: 85
+--------
+{ ユニークモッド — ジェム }
+ソケットされたジェムはレベル10(1-10)投射物追加(グレーター投射物追加-聖別)によりサポートされる
+{ ユニークモッド — ジェム }
+ソケットされたジェムはレベル25(25-35)元素伝染(グレーター投射物追加-聖別)によりサポートされる
+{ ユニークモッド — 能力値 }
+全ての能力値 +29(25-30)
+""")
+        window.parse_current_text()
+
+        visible_filters = [
+            window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole + 4)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        by_id = {row.stat_id: row for row in visible_filters}
+        assert by_id["explicit.indexable_support_55"].enabled is True
+        assert by_id["explicit.indexable_support_89"].enabled is True
+        assert by_id["explicit.indexable_support_55"].read_value == 10
+        assert by_id["explicit.indexable_support_89"].read_value == 25
+        assert window.mod_warning.isHidden()
+    finally:
+        window.close()
+
+
+def test_itemised_spectre_corpse_item_level_toggle_controls_final_search(qapp):
+    from src.poetore.trade import PriceResult
+
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 死体
+レアリティ: カレンシー
+完全体のドルイド錬金術師
+--------
+死体レベル: 85
+モンスターカテゴリー: 人型
+--------
+アイテムレベル: 85
+--------
+ポイゾナスコンコクションを投げる
+フラスコの効果が200％増加する
+所有者は3秒ごとにライフフラスコのチャージを1得る
+--------
+このアイテムを右クリックしてこの死体を生成する。
+""")
+        window.parse_current_text()
+        window.item_level_toggle.click()
+
+        result = PriceResult("Standard", "qid", 0, ())
+        with patch("src.poetore.ui.search_prices", return_value=result) as search:
+            window.search_current_item()
+            for _ in range(50):
+                qapp.processEvents()
+                if search.called:
+                    break
+                QTest.qWait(10)
+
+        assert search.called
+        kwargs = search.call_args.kwargs
+        assert kwargs["item_level_min"] is None
+        assert all(
+            row.stat_id != "property.item_level"
+            for row in kwargs["stat_filters"]
+        )
     finally:
         window.close()
 
@@ -1079,14 +4652,79 @@ Contract: Underbelly
         assert not window.heist_job_chip.isHidden()
         assert window.heist_job_chip.values() == (1.0, None)
         assert window.heist_job_chip.isActive()
+        assert "Job Lv（工作）" in window.heist_job_chip.toggle.text()
         assert window.area_level_chip.values() == (49.0, None)
         assert window.mod_warning.isHidden()
         rows = [
             window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole + 4)
             for index in range(window.mod_filter_tree.topLevelItemCount())
         ]
-        assert rows
-        assert all(row.kind == "craft" for row in rows)
+        assert rows == []
+    finally:
+        window.close()
+
+
+def test_poe2_djinn_barya_keeps_exact_area_level_across_mod_range_changes(qapp):
+    window = PoetoreWindow(app_config={
+        "poe_version": "poe2",
+        "poetore": {"search_stat_range": 10},
+    })
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 試練のコイン
+レアリティ: カレンシー
+ジンのバリャ
+--------
+エリアレベル: 80
+試練数: 4
+--------
+アイテムレベル: 80
+--------
+「セケマの試練へ連れて行ってくれ。
+仕えよう。」
+--------
+このアイテムをセケマの試練のレリックの祭壇に持っていく。""")
+        window.parse_current_text()
+
+        assert window._parsed_item.category == "barya"
+        assert window._parsed_item.item_level == 80
+        assert window.area_level_chip.values() == (80.0, None)
+        assert window.area_level_chip.isActive()
+
+        window.search_range_combo.setCurrentIndex(
+            window.search_range_combo.findData(0)
+        )
+        assert window.area_level_chip.values() == (80.0, None)
+        selected = window._selected_special_chip_filters()
+        area = next(row for row in selected if row.stat_id == "property.area_level")
+        assert (area.min_value, area.max_value) == (80.0, None)
+    finally:
+        window.close()
+
+
+def test_japanese_contract_required_deception_is_visible_in_job_chip(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: 依頼書
+レアリティ: レア
+崇高な宣誓書
+依頼書: 研究所
+--------
+依頼人: 真夜中の修理人
+ハイスト目標: イノセンスの血 (貴重)
+エリアレベル: 83
+必要ジョブ 欺瞞 (レベル 1 (unmet))
+アイテム数量: +52% (augmented)
+--------
+アイテムレベル: 83
+""")
+        window.parse_current_text()
+
+        assert not window.heist_job_chip.isHidden()
+        assert window.heist_job_chip.values() == (1.0, None)
+        assert "Job Lv（欺瞞）" in window.heist_job_chip.toggle.text()
+        selected = window._selected_special_chip_filters()
+        deception = next(row for row in selected if row.stat_id == "property.heist_deception")
+        assert deception.min_value == 1.0
     finally:
         window.close()
 
@@ -1150,14 +4788,293 @@ Chaos Orb
         window.close()
 
 
+def test_poe2_inscribed_ultimatum_uses_only_area_level_without_poe1_notice(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2", "poetore": {}})
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: アルティメイタム
+レアリティ: ノーマル
+アルティメイタムの刻印
+--------
+エリアレベル: 80
+試練数: 10
+致死
+--------
+アイテムレベル: 80
+""")
+        window.parse_current_text()
+
+        assert window.search_scope_notice.isHidden()
+        assert window.mod_filter_tree.topLevelItemCount() == 0
+        assert window.area_level_chip.isActive()
+        assert window.area_level_chip.values() == (80.0, None)
+    finally:
+        window.close()
+
+
+def test_misc_map_boss_invitation_has_no_unresolved_modifier_warning(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: その他マップアイテム
+レアリティ: ノーマル
+極性の招待状
+--------
+アイテムレベル: 83
+--------
+{ 暗黙モッド }
+アイテムの数量のモッドはボスからドロップする報酬の量に影響する
+--------
+一度ブラック・スターに捕まれば、
+逃げ場はない。
+--------
+自身のマップデバイスで使用することで、極性の虚無へのポータルを開く。
+""")
+        window.parse_current_text()
+
+        assert window._parsed_item.category == "invitation"
+        assert window.mod_warning.isHidden()
+        assert window.mod_filter_tree.topLevelItemCount() == 0
+    finally:
+        window.close()
+
+
 def test_unidentified_unique_candidates_can_be_selected(qapp):
     window = PoetoreWindow()
     try:
         window._show_unique_candidates(("The First", "The Second"))
-        assert not window.unique_name_combo.isHidden()
-        assert window.unique_name_combo.count() == 2
-        assert window.unique_name_combo.itemData(1) == "The Second"
+        buttons = window.unique_name_group.buttons()
+        assert not window.unique_name_container.isHidden()
+        assert [button.property("uniqueName") for button in buttons] == [
+            "The First", "The Second",
+        ]
+        assert buttons[0].isChecked()
+        buttons[1].click()
+        assert buttons[1].isChecked()
+        assert not buttons[0].isChecked()
         assert "2種類" in window.price_status.text()
+    finally:
+        window.close()
+
+
+def test_unidentified_unique_candidates_keep_icon_urls(qapp):
+    from src.poetore.trade import UniqueCandidate
+
+    window = PoetoreWindow()
+    try:
+        icon = "https://web.poecdn.com/gen/image/example.png"
+        window._show_unique_candidates((UniqueCandidate("The Example", icon),))
+        button = window.unique_name_group.buttons()[0]
+        assert button.property("uniqueName") == "The Example"
+        assert button.property("iconUrl") == icon
+        assert button.iconSize() == QSize(48, 48)
+    finally:
+        window.close()
+
+
+def test_unidentified_unique_candidates_show_japanese_but_search_in_english(qapp):
+    from src.poetore.trade import UniqueCandidate
+
+    window = PoetoreWindow()
+    try:
+        window._show_unique_candidates((
+            UniqueCandidate(
+                "Eternal Damnation",
+                "https://web.poecdn.com/example.png",
+                "永遠の破滅",
+            ),
+        ))
+        button = window.unique_name_group.buttons()[0]
+        assert button.text() == "永遠の破滅"
+        assert button.property("uniqueName") == "Eternal Damnation"
+        assert button.toolTip() == "永遠の破滅\nEternal Damnation"
+    finally:
+        window.close()
+
+
+def test_unidentified_unique_candidate_selection_recalculates_disenchant_dust(qapp):
+    window = PoetoreWindow()
+    try:
+        window._parsed_item = ParsedItem(
+            item_class="Amulets", rarity="Unique", name="Agate Amulet",
+            base_type="Agate Amulet", category="accessory", item_level=83,
+            flags=("unidentified",),
+        )
+        window._trade_base_type = "Agate Amulet"
+        candidates = (
+            UniqueCandidate("Eternal Damnation", None, "永遠の破滅"),
+            UniqueCandidate("Voll's Devotion", None, "ヴォールの献身"),
+        )
+        with patch(
+            "src.poetore.ui.disenchant_dust",
+            side_effect=lambda item, unique_name=None, base_type=None: {
+                "Eternal Damnation": 551_218,
+                "Voll's Devotion": 153_349,
+            }.get(unique_name),
+        ):
+            window._show_unique_candidates(candidates)
+            assert not window.disenchant_dust_panel.isHidden()
+            assert window.disenchant_dust_value.text() == "551.2K"
+            assert window.disenchant_dust_panel.toolTip() == (
+                "解呪ダスト（推定）：551,218"
+            )
+
+            window.unique_name_group.buttons()[1].click()
+            assert window.disenchant_dust_value.text() == "153.3K"
+            assert window.disenchant_dust_panel.toolTip() == (
+                "解呪ダスト（推定）：153,349"
+            )
+    finally:
+        window.close()
+
+
+def test_identified_unique_shows_disenchant_dust_from_generated_metadata(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""Item Class: Belts
+Rarity: Unique
+Mageblood
+Heavy Belt
+--------
+Item Level: 85
+""")
+        window.parse_current_text()
+
+        assert not window.disenchant_dust_panel.isHidden()
+        assert window.disenchant_dust_value.text() == "2.23M"
+        assert window.disenchant_dust_panel.toolTip() == (
+            "解呪ダスト（推定）：2,227,900"
+        )
+        assert window.weapon_property_header.indexOf(window.disenchant_dust_panel) >= 0
+    finally:
+        window.close()
+
+
+def test_identified_japanese_unique_uses_resolved_identity_for_compact_dust(qapp):
+    window = PoetoreWindow()
+    try:
+        window._trade_base_type = "Champion Kite Shield"
+        window._trade_item_name = "Aegis Aurora"
+        window.input_edit.setPlainText("""アイテムクラス: 盾
+レアリティ: ユニーク
+イージス・オーロラ
+チャンピオンカイトシールド
+--------
+ブロック率: 32% (augmented)
+アーマー: 914 (augmented)
+エナジーシールド: 188 (augmented)
+--------
+アイテムレベル: 83
+""")
+        window.parse_current_text()
+
+        assert not window.disenchant_dust_panel.isHidden()
+        assert window.disenchant_dust_label.text() == "ダスト"
+        assert window.disenchant_dust_value.text() == "119.7K"
+        assert window.disenchant_dust_panel.toolTip() == (
+            "解呪ダスト（推定）：119,700"
+        )
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(("value", "expected"), (
+    (999, "999"),
+    (119_700, "119.7K"),
+    (2_227_900, "2.23M"),
+))
+def test_compact_dust_amount(value, expected):
+    from src.poetore.ui import _compact_dust_amount
+
+    assert _compact_dust_amount(value) == expected
+
+
+def test_unique_weapon_shows_dps_and_compact_dust_in_same_header(qapp):
+    window = PoetoreWindow()
+    try:
+        with patch("src.poetore.ui.disenchant_dust", return_value=119_700):
+            window.input_edit.setPlainText("""Item Class: Two Hand Swords
+Rarity: Unique
+Terminus Est
+Tiger Sword
+--------
+Physical Damage: 50-100 (augmented)
+Attacks per Second: 1.50
+--------
+Item Level: 83
+""")
+            window.parse_current_text()
+
+        assert not window.weapon_dps_label.isHidden()
+        assert not window.disenchant_dust_panel.isHidden()
+        assert window.weapon_property_header.indexOf(window.weapon_dps_label) >= 0
+        assert window.weapon_property_header.indexOf(window.disenchant_dust_panel) >= 0
+        assert window.disenchant_dust_value.text() == "119.7K"
+    finally:
+        window.close()
+
+
+def test_poe2_never_shows_poe1_disenchant_dust(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        item = ParsedItem(
+            item_class="Body Armours", rarity="Unique", name="Test Unique",
+            base_type="Test Armour", category="armour", item_level=80,
+        )
+        with patch("src.poetore.ui.disenchant_dust") as calculate:
+            window._update_disenchant_dust(item)
+
+        calculate.assert_not_called()
+        assert window.disenchant_dust_panel.isHidden()
+    finally:
+        window.close()
+
+
+def test_unidentified_agate_amulet_shows_all_five_candidates(qapp):
+    from src.poetore.trade import UniqueCandidate
+
+    window = PoetoreWindow()
+    try:
+        names = (
+            "Eternal Damnation",
+            "Extractor Mentis",
+            "Shaper's Seed",
+            "The Aylardex",
+            "Voll's Devotion",
+        )
+        candidates = tuple(
+            UniqueCandidate(name, f"https://web.poecdn.com/{index}.png")
+            for index, name in enumerate(names)
+        )
+        window._show_unique_candidates(candidates)
+
+        buttons = window.unique_name_group.buttons()
+        assert [button.property("uniqueName") for button in buttons] == list(names)
+        assert all(button.property("iconUrl") for button in buttons)
+        assert all(not button.isHidden() for button in buttons)
+    finally:
+        window.close()
+
+
+def test_many_unidentified_unique_candidates_are_scrollable(qapp):
+    from src.poetore.trade import UniqueCandidate
+
+    window = PoetoreWindow()
+    try:
+        candidates = tuple(
+            UniqueCandidate(f"Candidate {index}", f"https://example.test/{index}.png")
+            for index in range(55)
+        )
+        window._show_unique_candidates(candidates)
+        window.show()
+        qapp.processEvents()
+
+        assert len(window.unique_name_group.buttons()) == 55
+        assert not window.unique_name_scroll.isHidden()
+        assert window.unique_name_scroll.minimumHeight() == 204
+        assert window.unique_name_scroll.maximumHeight() == 204
+        assert window.unique_name_scroll.verticalScrollBar().maximum() > 0
+        assert window.unique_name_scroll.viewport().palette().color(
+            window.unique_name_scroll.viewport().backgroundRole()
+        ).name() == "#111416"
     finally:
         window.close()
 
@@ -1212,14 +5129,32 @@ def test_split_filter_is_an_awakened_style_cycle_button(qapp):
     try:
         toggle = window.split_combo
         assert toggle.property("active") is True
-        assert toggle.currentText() == "スプリット"
+        assert toggle.currentText() == "スプリット品含む"
         assert toggle.currentData() is True
         toggle.click()
         assert toggle.currentText() == "非スプリット"
         assert toggle.currentData() is False
         assert toggle.property("active") is True
         toggle.click()
-        assert toggle.currentText() == "スプリット"
+        assert toggle.currentText() == "スプリット品含む"
+    finally:
+        window.close()
+
+
+def test_item_state_cycle_buttons_use_clear_search_condition_labels(qapp):
+    window = PoetoreWindow()
+    try:
+        expected_labels = {
+            "unidentified_chip": ("未鑑定のみ", "未鑑定を含む"),
+            "veiled_chip": ("同一Veiled Modあり", "Veiled指定なし"),
+            "foil_chip": ("Foil Unique", "通常Unique"),
+            "mirrored_combo": ("ミラー品含む", "ミラー品を除外"),
+            "sanctified_combo": ("聖別品のみ", "非聖別品のみ", "聖別品含む"),
+            "split_combo": ("スプリット品含む", "非スプリット"),
+        }
+        for name, labels in expected_labels.items():
+            toggle = getattr(window, name)
+            assert tuple(toggle.itemText(index) for index in range(toggle.count())) == labels
     finally:
         window.close()
 
@@ -1271,17 +5206,18 @@ Item Level: 85
         window._configure_trade_presets(low_level)
         assert window.trade_preset_combo.count() == 1
         assert not window.trade_preset_combo.isEnabled()
+        assert window.trade_preset_combo.isHidden()
+        assert not window.trade_preset_placeholder.isHidden()
         window.resize(720, window.height())
         window.show()
         qapp.processEvents()
-        assert window.trade_preset_combo.width() <= window._panel.width() / 2
-        single_width = window.trade_preset_combo._buttons[0].width()
-        assert window.trade_preset_combo._empty_segment.isVisible()
+        assert window.trade_preset_placeholder.width() <= window._panel.width() / 2
 
         window._configure_trade_presets(high_level)
         qapp.processEvents()
+        assert not window.trade_preset_combo.isHidden()
+        assert window.trade_preset_placeholder.isHidden()
         assert not window.trade_preset_combo._empty_segment.isVisible()
-        assert abs(window.trade_preset_combo._buttons[0].width() - single_width) <= 1
     finally:
         window.close()
 
@@ -1299,6 +5235,8 @@ def test_dedicated_exact_preset_is_labeled_as_dedicated_search_and_restores_fini
         assert window.trade_preset_combo.currentData() == "finished"
         assert window.trade_preset_combo.currentText() == "専用検索"
         assert window.trade_preset_combo._buttons[0].text() == "専用検索"
+        assert window.trade_preset_combo.isHidden()
+        assert not window.trade_preset_placeholder.isHidden()
         window._trade_preset_changed()
         assert "専用条件" in window.price_status.text()
 
@@ -1316,6 +5254,11 @@ Item Level: 85
         assert window.trade_preset_combo.currentText() == "完成品"
         assert window.trade_preset_combo.itemText(1) == "ベースアイテム"
         assert window.trade_preset_combo.count() == 2
+        assert not window.trade_preset_combo.isHidden()
+        assert window.trade_preset_placeholder.isHidden()
+        assert "QPushButton#binaryToggle" in window.styleSheet()
+        assert "border: 1px solid #465154" in window.styleSheet()
+        assert "QPushButton#binaryToggle:hover" in window.styleSheet()
     finally:
         window.close()
 
@@ -1341,6 +5284,8 @@ Superior Imbued Wand
         assert window.trade_preset_combo.currentData() == "finished"
         assert window.trade_preset_combo.currentText() == "ベースアイテム"
         assert window.trade_preset_combo._buttons[0].text() == "ベースアイテム"
+        assert window.trade_preset_combo.isHidden()
+        assert not window.trade_preset_placeholder.isHidden()
     finally:
         window.close()
 
@@ -1389,38 +5334,351 @@ Item Level: 82
         window.close()
 
 
-def test_currency_selection_uses_recommended_default_and_is_kept_for_same_item(qapp):
-    window = PoetoreWindow()
+def test_magic_equipment_keeps_magic_toggle_when_scope_changes_to_item_class(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
     try:
-        sword = parse_item_text("""Item Class: Two Hand Swords
+        item = parse_item_text("""アイテムクラス: 指輪
+レアリティ: マジック
+感電する トパーズの指輪
+--------
+アイテムレベル: 82
+""")
+        window._parsed_item = item
+        window._update_item_header(item)
+        window._configure_trade_presets(item)
+        window.trade_preset_combo.setCurrentIndex(1)
+
+        window.base_scope_toggle.setCurrentIndex(1)
+
+        assert not window._searches_exact_base_type(item)
+        assert not window.magic_rarity_toggle.isHidden()
+        assert window.magic_rarity_toggle.currentData() is True
+    finally:
+        window.close()
+
+
+def test_poe2_low_level_magic_shows_preset_and_current_rarity_condition(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        item = parse_item_text("""Item Class: Rings
+Rarity: Magic
+Healthy Ruby Ring
+Ruby Ring
+--------
+Item Level: 75
+""")
+        window._parsed_item = item
+        window._configure_trade_presets(item)
+
+        assert window.trade_preset_combo.count() == 2
+        assert window.rarity_condition_chip.text() == "非ユニーク"
+        assert not window.rarity_condition_chip.isHidden()
+        assert window.magic_rarity_toggle.isHidden()
+
+        window.trade_preset_combo.setCurrentIndex(1)
+        assert window.rarity_condition_chip.isHidden()
+        assert not window.magic_rarity_toggle.isHidden()
+        assert window.magic_rarity_toggle.itemText(0) == "非ユニーク"
+        assert window.magic_rarity_toggle.currentText() == "マジック完全一致"
+
+        window.magic_rarity_toggle.setCurrentIndex(0)
+        assert window.magic_rarity_toggle.currentData() is False
+    finally:
+        window.close()
+
+
+def test_poe2_fixed_rarity_condition_labels_match_trade2(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        for rarity, expected in (("Rare", "非ユニーク"), ("Unique", "ユニーク")):
+            item = ParsedItem(
+                "Rings", rarity, "Test", "Ruby Ring", "ring",
+                item_level=75, raw_text=f"{rarity} ring",
+            )
+            window._preset_item_key = None
+            window._parsed_item = item
+            window._configure_trade_presets(item)
+            assert window.rarity_condition_chip.text() == expected
+            assert not window.rarity_condition_chip.isHidden()
+            assert window.magic_rarity_toggle.isHidden()
+    finally:
+        window.close()
+
+
+def test_trade_options_are_kept_when_item_changes(qapp):
+    config = {"poe_version": POE1, "poetore": {}}
+    window = PoetoreWindow(app_config=config)
+    try:
+        sword_text = """Item Class: Two Hand Swords
+Rarity: Rare
+Test Sword
+Reaver Sword
+--------
+Item Level: 70
+"""
+        window.input_edit.setPlainText(sword_text)
+        window.parse_current_text()
+        assert window.trade_currency_combo.currentData() == "any"
+
+        window.trade_currency_combo.setCurrentIndex(
+            window.trade_currency_combo.findData("divine")
+        )
+        window.trade_status_combo.setCurrentIndex(
+            window.trade_status_combo.findData("available")
+        )
+        logbook_text = """Item Class: Expedition Logbooks
+Rarity: Rare
+Test Logbook
+Expedition Logbook
+--------
+Item Level: 83
+"""
+        window.input_edit.setPlainText(logbook_text)
+        window.parse_current_text()
+        assert window.trade_currency_combo.currentData() == "divine"
+        assert window.trade_status_combo.currentData() == "available"
+    finally:
+        window.close()
+
+
+def test_trade_option_memory_defaults_to_on_and_includes_listing_period(qapp):
+    from PySide6.QtWidgets import QStyle, QStyleOptionButton
+
+    config = {
+        "poe_version": POE1,
+        "poetore": {
+            "trade_options": {
+                "poe1": {
+                    "status": "online",
+                    "currency": "divine",
+                    "listed_within": "3days",
+                },
+            },
+        },
+    }
+    native_checkbox = QCheckBox()
+    native_option = QStyleOptionButton()
+    native_checkbox.initStyleOption(native_option)
+    native_indicator = native_checkbox.style().subElementRect(
+        QStyle.SubElement.SE_CheckBoxIndicator,
+        native_option,
+        native_checkbox,
+    ).size()
+
+    window = PoetoreWindow(app_config=config)
+    try:
+        assert window.remember_trade_options_checkbox.isChecked()
+        style = window.remember_trade_options_checkbox.styleSheet().lower()
+        assert "poenavi_check_257a64_" in style
+        assert "border: 1px solid #257a64" in style
+        styled_option = QStyleOptionButton()
+        window.remember_trade_options_checkbox.initStyleOption(styled_option)
+        styled_indicator = (
+            window.remember_trade_options_checkbox.style().subElementRect(
+                QStyle.SubElement.SE_CheckBoxIndicator,
+                styled_option,
+                window.remember_trade_options_checkbox,
+            ).size()
+        )
+        assert styled_indicator == native_indicator
+        assert "remembertradeoptionscheckbox { color: #e6ecea; }" in style
+        assert window.trade_status_combo.currentData() == "online"
+        assert window.trade_currency_combo.currentData() == "divine"
+        assert window.listed_within_combo.currentData() == "3days"
+    finally:
+        window.close()
+
+
+def test_disabling_trade_option_memory_resets_and_does_not_save_choices(qapp):
+    config = {
+        "poe_version": POE1,
+        "poetore": {
+            "trade_options": {
+                "poe1": {
+                    "status": "online",
+                    "currency": "divine",
+                    "listed_within": "3days",
+                },
+            },
+        },
+    }
+    saved = Mock()
+    window = PoetoreWindow(app_config=config, save_config=saved)
+    try:
+        window.remember_trade_options_checkbox.setChecked(False)
+        assert config["poetore"]["remember_trade_options"] is False
+        assert window.trade_status_combo.currentData() == "instant"
+        assert window.trade_currency_combo.currentData() == "any"
+        assert window.listed_within_combo.currentData() == "any"
+
+        window.trade_status_combo.setCurrentIndex(
+            window.trade_status_combo.findData("available")
+        )
+        window.trade_currency_combo.setCurrentIndex(
+            window.trade_currency_combo.findData("chaos")
+        )
+        window.listed_within_combo.setCurrentIndex(
+            window.listed_within_combo.findData("1week")
+        )
+        assert config["poetore"]["trade_options"]["poe1"] == {
+            "status": "online",
+            "currency": "divine",
+            "listed_within": "3days",
+        }
+
+        window.input_edit.setPlainText("""Item Class: Two Hand Swords
 Rarity: Rare
 Test Sword
 Reaver Sword
 --------
 Item Level: 70
 """)
-        window._trade_base_type = "Reaver Sword"
-        window._configure_trade_currency(sword)
+        window.parse_current_text()
+        assert window.trade_status_combo.currentData() == "instant"
         assert window.trade_currency_combo.currentData() == "any"
-
-        window.trade_currency_combo.setCurrentIndex(
-            window.trade_currency_combo.findData("divine")
-        )
-        window._configure_trade_currency(sword)
-        assert window.trade_currency_combo.currentData() == "divine"
-
-        logbook = parse_item_text("""Item Class: Expedition Logbooks
-Rarity: Rare
-Test Logbook
-Expedition Logbook
---------
-Item Level: 83
-""")
-        window._trade_base_type = "Expedition Logbook"
-        window._configure_trade_currency(logbook)
-        assert window.trade_currency_combo.currentData() == "chaos_divine"
+        assert window.listed_within_combo.currentData() == "any"
+        assert saved.called
     finally:
         window.close()
+
+
+def test_enabling_trade_option_memory_saves_current_three_choices(qapp):
+    config = {
+        "poe_version": POE2,
+        "poetore": {"remember_trade_options": False},
+    }
+    saved = Mock()
+    window = PoetoreWindow(app_config=config, save_config=saved)
+    try:
+        window.trade_status_combo.setCurrentIndex(
+            window.trade_status_combo.findData("available")
+        )
+        window.trade_currency_combo.setCurrentIndex(
+            window.trade_currency_combo.findData("exalted")
+        )
+        window.listed_within_combo.setCurrentIndex(
+            window.listed_within_combo.findData("2weeks")
+        )
+        window.remember_trade_options_checkbox.setChecked(True)
+
+        assert config["poetore"]["remember_trade_options"] is True
+        assert config["poetore"]["trade_options"]["poe2"] == {
+            "status": "available",
+            "currency": "exalted",
+            "listed_within": "2weeks",
+        }
+        assert saved.called
+    finally:
+        window.close()
+
+
+def test_poe2_trade_currency_shortens_only_exalted_divine_label(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    try:
+        assert [
+            window.trade_currency_combo.itemText(index)
+            for index in range(window.trade_currency_combo.count())
+        ] == [
+            "すべての通貨",
+            "高貴なオーブのみ",
+            "神のオーブのみ",
+            "カオスオーブのみ",
+            "高貴または神",
+        ]
+
+        chaos = window.trade_currency_combo.findData("chaos")
+        assert chaos >= 0
+        window.trade_currency_combo.setCurrentIndex(chaos)
+        assert window.trade_currency_combo.toolTip() == (
+            "カオスオーブ建ての出品のみ"
+        )
+
+        combined = window.trade_currency_combo.findData("exalted_divine")
+        window.trade_currency_combo.setCurrentIndex(combined)
+        assert window.trade_currency_combo.toolTip() == (
+            "高貴なオーブまたは神のオーブ建ての出品"
+        )
+
+        window._fit_compact_action_widths()
+        combined_width = window.trade_currency_combo.width()
+        compact_font = window.trade_currency_combo.font()
+        compact_font.setPixelSize(
+            _DISPLAY_SIZE_PROFILES[window._result_font_size]["mod_value_font"]
+        )
+        compact_metrics = QFontMetrics(compact_font)
+        assert combined_width == compact_metrics.horizontalAdvance("高貴または神") + 12
+        window.trade_currency_combo.setCurrentIndex(
+            window.trade_currency_combo.findData("exalted")
+        )
+        window._fit_compact_action_widths()
+        exalted_width = window.trade_currency_combo.width()
+        assert exalted_width == compact_metrics.horizontalAdvance("高貴なオーブのみ") + 12
+        assert window.trade_currency_combo.view().minimumWidth() >= exalted_width
+        assert combined_width < window.trade_status_combo.width()
+        assert combined_width < exalted_width
+        assert window.width() == 650
+    finally:
+        window.close()
+
+
+def test_trade_options_are_persisted_separately_for_poe1_and_poe2(qapp):
+    config = {
+        "poetore": {
+            "trade_options": {
+                "poe1": {"status": "online", "currency": "divine"},
+                "poe2": {
+                    "status": "available",
+                    "currency": "exalted",
+                    "listed_within": "3days",
+                },
+            }
+        }
+    }
+    saved = Mock()
+    poe1 = PoetoreWindow(
+        app_config={**config, "poe_version": POE1}, save_config=saved,
+    )
+    poe2 = PoetoreWindow(
+        app_config={**config, "poe_version": POE2}, save_config=saved,
+    )
+    try:
+        assert poe1.trade_status_combo.currentData() == "online"
+        assert poe1.trade_currency_combo.currentData() == "divine"
+        assert poe2.trade_status_combo.currentData() == "available"
+        assert poe2.trade_currency_combo.currentData() == "exalted"
+        assert poe2.listed_within_combo.currentData() == "3days"
+
+        poe2.trade_status_combo.setCurrentIndex(
+            poe2.trade_status_combo.findData("offline")
+        )
+        poe2.trade_currency_combo.setCurrentIndex(
+            poe2.trade_currency_combo.findData("exalted_divine")
+        )
+        poe2.listed_within_combo.setCurrentIndex(
+            poe2.listed_within_combo.findData("1week")
+        )
+        assert config["poetore"]["trade_options"]["poe1"] == {
+            "status": "online", "currency": "divine",
+        }
+        assert config["poetore"]["trade_options"]["poe2"] == {
+            "status": "offline",
+            "currency": "exalted_divine",
+            "listed_within": "1week",
+        }
+        assert saved.called
+
+        reloaded_poe2 = PoetoreWindow(
+            app_config={**config, "poe_version": POE2}, save_config=saved,
+        )
+        try:
+            assert reloaded_poe2.trade_status_combo.currentData() == "offline"
+            assert reloaded_poe2.trade_currency_combo.currentData() == "exalted_divine"
+            assert reloaded_poe2.listed_within_combo.currentData() == "1week"
+        finally:
+            reloaded_poe2.close()
+    finally:
+        poe1.close()
+        poe2.close()
 
 
 def test_item_state_filters_use_clear_labels_defaults_and_keep_selection(qapp):
@@ -1440,7 +5698,7 @@ Split
         assert window.corrupted_combo.itemText(1) == "非コラプトのみ"
         assert window.corrupted_combo.itemText(2) == "コラプト品含む"
         assert window.corrupted_combo.currentData() is False
-        assert window.split_combo.itemText(0) == "スプリット"
+        assert window.split_combo.itemText(0) == "スプリット品含む"
         assert window.split_combo.itemText(1) == "非スプリット"
         assert window.split_combo.currentData() is True
         assert not window.split_combo.isHidden()
@@ -1500,6 +5758,44 @@ def test_hidden_split_filter_does_not_auto_exclude_fractured_item(qapp):
         window.close()
 
 
+def test_standard_finished_search_includes_split_but_base_search_excludes_it(qapp):
+    window = PoetoreWindow(app_config={"poetore": {"league": "Standard"}})
+    try:
+        item = parse_item_text("""Item Class: Body Armours
+Rarity: Rare
+Test Armour
+Sacred Chainmail
+--------
+Item Level: 94
+""")
+        window._parsed_item = item
+        window._configure_item_state_filters(item)
+        assert window.trade_preset_combo.currentData() == PRESET_FINISHED
+        assert window._hidden_include_split is True
+
+        window.trade_preset_combo.setCurrentIndex(1)
+        assert window._hidden_include_split is False
+    finally:
+        window.close()
+
+
+def test_temporary_league_finished_search_excludes_split(qapp):
+    window = PoetoreWindow(app_config={"poetore": {"league": "Mirage"}})
+    try:
+        item = parse_item_text("""Item Class: Body Armours
+Rarity: Rare
+Test Armour
+Sacred Chainmail
+--------
+Item Level: 94
+""")
+        window._configure_item_state_filters(item)
+
+        assert window._hidden_include_split is False
+    finally:
+        window.close()
+
+
 def test_mirrored_chip_matches_awakened_visible_and_hidden_states(qapp):
     window = PoetoreWindow()
     try:
@@ -1514,10 +5810,10 @@ Mirrored
 """)
         window._configure_item_state_filters(mirrored)
         assert not window.mirrored_combo.isHidden()
-        assert window.mirrored_combo.currentText() == "ミラー化"
+        assert window.mirrored_combo.currentText() == "ミラー品含む"
         assert window.mirrored_combo.currentData() is True
         window.mirrored_combo.click()
-        assert window.mirrored_combo.currentText() == "非ミラー化"
+        assert window.mirrored_combo.currentText() == "ミラー品を除外"
         assert window.mirrored_combo.currentData() is False
 
         plain = replace(mirrored, raw_text="plain", flags=())
@@ -1529,6 +5825,39 @@ Mirrored
         window._configure_item_state_filters(corrupted)
         assert window.mirrored_combo.isHidden()
         assert window._hidden_include_mirrored is True
+    finally:
+        window.close()
+
+
+def test_poe2_sanctified_chip_is_three_state_without_warning_color(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        sanctified = ParsedItem(
+            item_class="Two Hand Maces", rarity="Rare", name="Test Maul",
+            base_type="Anvil Maul", category="two_hand_mace",
+            flags=("sanctified",), raw_text="sanctified item",
+        )
+        window._configure_item_state_filters(sanctified)
+
+        toggle = window.sanctified_combo
+        assert not toggle.isHidden()
+        assert toggle.currentText() == "聖別品のみ"
+        assert toggle.currentData() == "only"
+        assert toggle.property("alert") is False
+
+        toggle.click()
+        assert toggle.currentText() == "非聖別品のみ"
+        assert toggle.currentData() is False
+        assert toggle.property("alert") is False
+
+        toggle.click()
+        assert toggle.currentText() == "聖別品含む"
+        assert toggle.currentData() is True
+        assert toggle.property("alert") is False
+
+        plain = replace(sanctified, flags=(), raw_text="plain item")
+        window._configure_item_state_filters(plain)
+        assert toggle.isHidden()
     finally:
         window.close()
 
@@ -1564,7 +5893,74 @@ Penumbra Ring
         assert by_id["explicit.stat_1368271171"].min_value == 48.0
         assert window.mod_warning.isHidden()
         assert not window.mirrored_combo.isHidden()
-        assert window.mirrored_combo.currentText() == "ミラー化"
+        assert window.mirrored_combo.currentText() == "ミラー品含む"
+    finally:
+        window.close()
+
+
+def test_reduced_curse_effect_flask_shows_awakened_positive_minimum(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: ユーティリティフラスコ
+レアリティ: マジック
+医者の モッキングバードの 水銀のフラスコ
+--------
+アイテムレベル: 84
+--------
+{ サフィックスモッド 「モッキングバードの」 (ティア: 4) }
+効果中にプレイヤーに対する呪いの効果が45(47-42)%減少する
+""")
+        window.parse_current_text()
+
+        target = None
+        for index in range(window.mod_filter_tree.topLevelItemCount()):
+            row = window.mod_filter_tree.topLevelItem(index)
+            stat_filter = row.data(0, Qt.UserRole + 4)
+            if stat_filter.stat_id == "explicit.stat_4265534424":
+                target = row
+                break
+        assert target is not None
+        minimum = window.mod_filter_tree.itemWidget(
+            target, _MOD_COLUMN_MIN
+        ).findChild(QLineEdit)
+        maximum = window.mod_filter_tree.itemWidget(
+            target, _MOD_COLUMN_MAX
+        ).findChild(QLineEdit)
+        assert minimum.text() == "40"
+        assert maximum.text() == ""
+    finally:
+        window.close()
+
+
+def test_reduced_effect_flask_hybrid_is_resolved_without_exclusion_warning(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: ユーティリティフラスコ
+レアリティ: マジック
+割り当てられた クリスタルの ダイヤモンドフラスコ
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「割り当てられた」 (ティア: 2) }
+チャージ回復量が60(55-60)%増加する
+効果が25%減少する
+{ サフィックスモッド 「クリスタルの」 (ティア: 3) — 元素, 耐性 }
+効果中は13(12-14)%の元素耐性が追加される
+""")
+        window.parse_current_text()
+
+        rows = [
+            window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole + 4)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        effect = next(
+            row for row in rows if row.stat_id == "explicit.stat_2448920197"
+        )
+        assert effect.text == "効果が25%減少する"
+        assert effect.inverted is True
+        assert effect.enabled is True
+        assert not any(row.kind == "flask hybrid" for row in rows)
+        assert window.mod_warning.isHidden()
     finally:
         window.close()
 
@@ -1587,6 +5983,37 @@ def test_special_state_chips_for_unidentified_veiled_and_foil(qapp):
         assert window.unidentified_chip.currentData() is False
         assert window.veiled_chip.isHidden()
         assert window.foil_chip.isHidden()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected_height"),
+    (("small", 23), ("medium", 25), ("large", 27)),
+)
+def test_cycle_state_chips_match_regular_filter_chip_height(
+    qapp, setting, expected_height,
+):
+    window = PoetoreWindow(
+        app_config={"poetore": {"result_font_size": setting}}
+    )
+    try:
+        state_chips = (
+            window.unidentified_chip,
+            window.veiled_chip,
+            window.foil_chip,
+            window.mirrored_combo,
+            window.sanctified_combo,
+            window.split_combo,
+        )
+        assert all(chip.objectName() == "cycleToggle" for chip in state_chips)
+        all_chips = (window.gem_variant_chip, *state_chips)
+        assert all(chip.minimumHeight() == expected_height for chip in all_chips)
+        assert all(chip.maximumHeight() == expected_height for chip in all_chips)
+        assert all(chip.height() == expected_height for chip in all_chips)
+        assert "QPushButton#cycleToggle {" in window.styleSheet()
+        assert "border: 1px solid #65FFCA;\n                padding: 3px 7px;" in window.styleSheet()
+        assert f"min-height: {expected_height - 8}px;" in window.styleSheet()
     finally:
         window.close()
 
@@ -1636,6 +6063,27 @@ Map (Tier 16)
         }
         assert detailed_ids["property.map_tier"].min_value == 16.0
         assert detailed_ids["property.map_tier"].max_value == 16.0
+
+        nightmare_map = parse_item_text("""アイテムクラス: マップ
+レアリティ: レア
+勝利の航海
+ナイトメアマップ
+--------
+アイテム数量: +96% (augmented)
+--------
+アイテムレベル: 85
+--------
+モンスターレベル：83
+""")
+        window._trade_base_type = "Nightmare Map"
+        window._configure_special_filter_chips(nightmare_map)
+        assert not window.nightmare_map_chip.isHidden()
+        assert window.nightmare_map_chip.text() == "ナイトメア"
+        assert not window.nightmare_map_chip.isEnabled()
+        assert window.map_tier_chip.isHidden()
+        assert "property.map_tier" not in {
+            row.stat_id for row in window._selected_special_chip_filters()
+        }
 
         detailed_blighted_map = parse_item_text("""アイテムクラス: マップ
 レアリティ: レア
@@ -1737,7 +6185,9 @@ Valdo Map
         window.close()
 
 
-def test_unidentified_unique_is_explicitly_unsupported_in_initial_release(qapp):
+def test_unidentified_unique_can_open_candidate_selector(qapp):
+    from src.poetore.trade import UniqueCandidate
+
     window = PoetoreWindow()
     try:
         window.input_edit.setPlainText("""アイテムクラス: スタッフ
@@ -1750,14 +6200,30 @@ Judgement Staff
 """)
         window.parse_current_text()
 
-        assert not window.search_scope_notice.isHidden()
-        assert window.search_scope_notice.text() == (
-            "⚠ 未鑑定ユニークの候補選択は初版では対応していません。"
-            "鑑定後に検索してください。"
-        )
-        assert not window.price_button.isEnabled()
+        assert window.search_scope_notice.isHidden()
+        assert window.price_button.isEnabled()
         assert not window.trade_url_button.isEnabled()
-        assert window.unique_name_combo.isHidden()
+        assert window.unique_name_container.isHidden()
+
+        candidates = (
+            UniqueCandidate("The First", "https://web.poecdn.com/first.png"),
+            UniqueCandidate("The Second", "https://web.poecdn.com/second.png"),
+        )
+        with patch("src.poetore.ui.unique_candidate_details", return_value=candidates):
+            window.search_current_item()
+            for _ in range(50):
+                qapp.processEvents()
+                if not window.unique_name_container.isHidden():
+                    break
+                QTest.qWait(10)
+
+        assert not window.unique_name_container.isHidden()
+        assert [
+            button.property("uniqueName")
+            for button in window.unique_name_group.buttons()
+        ] == ["The First", "The Second"]
+        assert window.price_button.isEnabled()
+        assert "候補を選んで" in window.price_status.text()
     finally:
         window.close()
 
@@ -1804,7 +6270,10 @@ Medium Cluster Jewel
             special = window._selected_special_chip_filters()
             stat_ids = [row.stat_id for row in special]
             assert stat_ids.count("enchant.stat_3086156145") == 1
-            assert stat_ids.count("enchant.stat_3948993189") == 1
+            assert sum(
+                stat_id.split("|", 1)[0] == "enchant.stat_3948993189"
+                for stat_id in stat_ids
+            ) == 1
 
             initial = resolve_trade_stat_filters(
                 item, PRESET_FINISHED, "Medium Cluster Jewel",
@@ -1812,7 +6281,66 @@ Medium Cluster Jewel
             effective = _replace_filters_with_special_chips(initial, (), special)
             effective_ids = [row.stat_id for row in effective if row.enabled]
             assert effective_ids.count("enchant.stat_3086156145") == 1
-            assert effective_ids.count("enchant.stat_3948993189") == 1
+            assert sum(
+                stat_id.split("|", 1)[0] == "enchant.stat_3948993189"
+                for stat_id in effective_ids
+            ) == 1
+    finally:
+        window.close()
+
+
+def test_large_cluster_eight_passives_stays_at_eight_in_ui_with_search_range(qapp):
+    window = PoetoreWindow(app_config={"poetore": {"search_stat_range": 10}})
+    try:
+        item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: ノーマル
+クラスタージュエル (大)
+--------
+アイテムレベル: 84
+--------
+パッシブスキルを8個追加する (enchant)
+ジュエルソケット2個がパッシブスキルに追加される (enchant)
+追加される通常パッシブスキルは付与: 物理ダメージが12%増加する (enchant)
+""")
+        window._trade_base_type = "Large Cluster Jewel"
+        filters = window._resolved_trade_filters(item, PRESET_FINISHED)
+        window._configure_special_filter_chips(item)
+        window._populate_stat_filters(filters)
+
+        assert window.cluster_passives_chip.values() == (None, 8.0)
+        selected = window._selected_special_chip_filters()
+        passive = next(row for row in selected if row.ref == "Adds # Passive Skills")
+        assert (passive.min_value, passive.max_value) == (None, 8.0)
+    finally:
+        window.close()
+
+
+def test_medium_cluster_base_preset_keeps_passive_rule_with_search_range(qapp):
+    window = PoetoreWindow(app_config={"poetore": {"search_stat_range": 20}})
+    try:
+        item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: レア
+蛍光する石
+クラスタージュエル (中)
+--------
+アイテムレベル: 83
+--------
+パッシブスキルを4個追加する (enchant)
+ジュエルソケット1個がパッシブスキルに追加される (enchant)
+追加される通常パッシブスキルは付与: 範囲ダメージが10%増加する (enchant)
+""")
+        window._parsed_item = item
+        window._trade_base_type = "Medium Cluster Jewel"
+        window.trade_preset_combo.setCurrentIndex(1)
+        window._configure_special_filter_chips(item)
+
+        assert window.cluster_passives_chip.values() == (None, 5.0)
+        selected = window._selected_special_chip_filters()
+        passive = next(
+            row for row in selected
+            if row.stat_id == "enchant.stat_3086156145"
+        )
+        assert (passive.min_value, passive.max_value) == (None, 5.0)
     finally:
         window.close()
 
@@ -1833,8 +6361,11 @@ Item Level: 86
         assert window.item_level_edit.validator().bottom() == 1
         assert window.item_level_edit.validator().top() == 100
         assert window.item_level_tag.parentWidget() is window.filter_chip_container
+        assert window._selected_item_level() is None
+        assert window.item_level_toggle.text() == "☐ ilvl："
 
         window.item_level_edit.setText("84")
+        window.item_level_toggle.click()
         assert window._selected_item_level() == 84
         window.item_level_toggle.click()
         assert window._selected_item_level_range() == (None, None)
@@ -1860,6 +6391,47 @@ Item Level: 86
             "property.item_level", "アイテムレベル", 86.0, "base", True,
         ),))
         assert window.mod_filter_tree.topLevelItemCount() == 0
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(("item_class", "base_type"), [
+    ("Two Hand Axes", "Vaal Axe"),
+    ("Body Armours", "Sacred Chainmail"),
+    ("Rings", "Ruby Ring"),
+])
+def test_rare_gear_item_level_is_off_for_finished_and_on_for_base(
+    qapp, item_class, base_type,
+):
+    window = PoetoreWindow()
+    try:
+        item = parse_item_text(f"""Item Class: {item_class}
+Rarity: Rare
+Test Item
+{base_type}
+--------
+Item Level: 89
+--------
+Fractured Item
+""")
+        window._parsed_item = item
+        window._trade_base_type = base_type
+        window._configure_trade_presets(item)
+        window._configure_item_level(item, force=True)
+
+        assert window.trade_preset_combo.currentData() == PRESET_FINISHED
+        assert not window.item_level_tag.isHidden()
+        assert window.item_level_edit.text() == "89"
+        assert window._selected_item_level_range() == (None, None)
+
+        window.trade_preset_combo.setCurrentIndex(1)
+        assert window.trade_preset_combo.currentData() == PRESET_BASE
+        assert window.item_level_edit.text() == "86"
+        assert window._selected_item_level_range() == (86, None)
+
+        window.trade_preset_combo.setCurrentIndex(0)
+        assert window.item_level_edit.text() == "89"
+        assert window._selected_item_level_range() == (None, None)
     finally:
         window.close()
 
@@ -1914,13 +6486,16 @@ def test_filter_chips_follow_awakened_order_in_shared_flow_layout(qapp):
     window = PoetoreWindow()
     try:
         assert tuple(name for name, _widget in window._filter_chips) == (
-            "links", "map_tier", "completion_reward", "area_level", "heist_wings",
+            "links", "nightmare_map", "map_tier", "completion_reward", "area_level", "heist_wings",
             "heist_job", "heist_target", "cluster_enchant",
             "cluster_passives", "cluster_sockets", "blighted", "item_level",
-            "base_percentile", "gem_variant", "gem_level", "quality",
+            "base_percentile", "gem_variant", "gem_level", "quality", "runemastered",
+            "gem_sockets",
             "influence_shaper", "influence_elder", "influence_crusader",
             "influence_hunter", "influence_redeemer", "influence_warlord",
-            "magic_rarity", "unidentified", "veiled", "foil", "mirrored", "split",
+            "influence_eater", "influence_exarch",
+            "rarity", "magic_rarity", "tablet_rarity", "unidentified", "veiled", "foil",
+            "mirrored", "sanctified", "split",
         )
         assert window.filter_chip_layout.ordered_widgets() == tuple(
             widget for _name, widget in window._filter_chips
@@ -1959,7 +6534,7 @@ def test_cross_category_transitions_clear_chips_notice_and_restore_preset(qapp):
 
 
 def test_windows_acceptance_csv_has_complete_ordered_cases():
-    path = Path("docs/poetore-windows-acceptance-tests.csv")
+    path = Path("tests/manual/poetore-windows-acceptance-tests.csv")
     with path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 42
@@ -1968,6 +6543,7 @@ def test_windows_acceptance_csv_has_complete_ordered_cases():
     required = {"ID", "区分", "優先度", "前提条件", "テストデータ", "手順", "期待結果", "結果", "証跡", "備考"}
     assert set(rows[0]) == required
     assert all(row["手順"] and row["期待結果"] for row in rows)
+    assert all(not row["結果"] and not row["証跡"] and not row["備考"] for row in rows)
 
 
 def test_filter_chip_flow_wraps_visible_chips(qapp):
@@ -1988,7 +6564,7 @@ def test_filter_chip_flow_wraps_visible_chips(qapp):
 def test_poe_ninja_placeholder_sits_between_header_and_filter_chips(qapp):
     window = PoetoreWindow()
     try:
-        panel_layout = window._panel.layout()
+        panel_layout = window._obs_content.layout()
         header_index = panel_layout.indexOf(window.item_header)
         ninja_index = panel_layout.indexOf(window.poe_ninja_price_panel)
         chips_index = panel_layout.indexOf(window.filter_chip_container)
@@ -2013,11 +6589,17 @@ def test_poe_ninja_price_panel_renders_price_trend_and_link(qapp):
         assert not window.poe_ninja_price_panel.isHidden()
         assert window.poe_ninja_price_value.text() == "200"
         assert not window.poe_ninja_currency_icon.pixmap().isNull()
-        assert window.poe_ninja_currency_icon.toolTip() == "神のオーブ"
+        assert window.poe_ninja_currency_icon.toolTip() == "Divine Orb"
         assert window.poe_ninja_price_multiplier.text() == "×"
         assert "7日推移" in window.poe_ninja_trend_label.text()
         assert window.poe_ninja_trend_chart._points == (0, 1, 2, 3, 4, 5, 6)
         assert window._last_poe_ninja_url == "https://poe.ninja/example"
+
+        ninja_layout = window.poe_ninja_price_panel.layout()
+        assert ninja_layout.itemAt(0).spacerItem() is not None
+        assert ninja_layout.indexOf(window.poe_ninja_price_label) == 1
+        assert ninja_layout.indexOf(window.poe_ninja_currency_icon) == 4
+        assert ninja_layout.indexOf(window.poe_ninja_trend_label) == 5
 
         window._hide_poe_ninja_price(key)
         assert window.poe_ninja_price_panel.isHidden()
@@ -2036,7 +6618,328 @@ def test_poe_ninja_price_panel_uses_chaos_icon_for_small_price(qapp):
         )
         assert window.poe_ninja_price_value.text() == "10"
         assert not window.poe_ninja_currency_icon.pixmap().isNull()
-        assert window.poe_ninja_currency_icon.toolTip() == "カオスオーブ"
+        assert window.poe_ninja_currency_icon.toolTip() == "Chaos Orb"
+    finally:
+        window.close()
+
+
+def test_poe2_currency_icon_names_use_supplied_assets():
+    assert _price_currency_icon_filename("divine", "poe2") == "DivineOrb2.png"
+    assert _price_currency_icon_filename("chaos", "poe2") == "ChaosOrb2.png"
+    assert _price_currency_icon_filename("exalted", "poe2") == "ExaltedOrb2.png"
+    assert _price_currency_icon_filename("mirror", "poe2") == "MirrorofKalandra2.png"
+    assert _price_currency_icon_filename("alch", "poe2") == "OrbofAlchemy2.png"
+    assert _price_currency_icon_filename("aug", "poe2") == "OrbofAugmentation2.png"
+    assert _price_currency_icon_filename("chance", "poe2") == "OrbofChance2.png"
+    assert _price_currency_icon_filename("transmute", "poe2") == "OrbofTransmutation2.png"
+    assert _price_currency_icon_filename("regal", "poe2") == "RegalOrb2.png"
+    assert _price_currency_icon_filename("vaal", "poe2") == "VaalOrb2.png"
+    assert _price_currency_icon_filename("divine", "poe1") == "DivineOrb.png"
+
+
+def test_poe2_poe_ninja_panel_renders_supplied_divine_icon(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        key = ("item", "Runes of Aldur", "Mageblood", "Utility Belt")
+        window._poe_ninja_item_key = key
+        window._show_poe_ninja_price(
+            key,
+            PoeNinjaPrice("Mageblood", "Utility Belt", 35000, (), "https://poe.ninja/example", 100),
+        )
+        icon_path = Path(__file__).parents[1] / "assets" / "icons" / "DivineOrb2.png"
+        expected = QPixmap(str(icon_path)).scaled(
+            26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        assert window.poe_ninja_currency_icon.pixmap().toImage() == expected.toImage()
+    finally:
+        window.close()
+
+
+def test_poe2_exchange_item_skips_trade2_and_uses_exalted_price_icon(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        fixture = Path(__file__).parent / "fixtures" / "poe2" / "real_copy_bilingual.csv"
+        with fixture.open(encoding="utf-8-sig", newline="") as stream:
+            row = next(
+                row for row in csv.DictReader(stream) if row["収集対象"] == "Uncut Gem"
+            )
+        window.input_edit.setPlainText(row["日本語設定の詳細コピー全文"])
+        with patch("src.poetore.poe2.trade.search_prices") as trade_search:
+            window.search_current_item()
+        trade_search.assert_not_called()
+        assert window._parsed_item.category == "uncut_gem"
+        assert window.search_scope_notice.text() == (
+            "ℹ 「カレンシー交換」の対象品です。通常トレード出品検索は行わず、"
+            "カレンシー交換の直近価格を優先して表示します。"
+        )
+        assert "カレンシー交換の直近価格を優先" in window.price_status.text()
+
+        key = ("uncut",)
+        window._poe_ninja_item_key = key
+        window._show_poe_ninja_price(
+            key,
+            PoeNinjaPrice(
+                "Uncut Skill Gem (Level 18)", None, 0.01, (),
+                "https://poe.ninja/example", 7.74,
+                quote_amount=0.56, quote_currency="exalted",
+            ),
+        )
+        assert window.poe_ninja_price_value.text() == "0.56"
+        assert window.poe_ninja_currency_icon.toolTip() == "Exalted Orb"
+        expected = QPixmap(str(
+            Path(__file__).resolve().parents[1] / "assets" / "icons" / "ExaltedOrb2.png"
+        )).scaled(26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        assert window.poe_ninja_currency_icon.pixmap().toImage() == expected.toImage()
+    finally:
+        window.close()
+
+
+def test_poe2_fragment_exchange_item_skips_trade2(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText(
+            "Item Class: Map Fragments\nRarity: Normal\nSimulacrum\n--------\n"
+        )
+        with patch("src.poetore.poe2.trade.search_prices") as trade_search:
+            window.search_current_item()
+        trade_search.assert_not_called()
+        assert window._parsed_item.category == "map_fragment"
+        assert "通常トレード出品検索は行わず" in window.search_scope_notice.text()
+        assert "カレンシー交換の直近価格を優先" in window.price_status.text()
+    finally:
+        window.close()
+
+
+def test_poe2_logbook_uses_exchange_price_without_trade2_filters(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText(
+            "Item Class: Expedition Logbooks\nRarity: Normal\n"
+            "Expedition Logbook\n--------\nArea Level: 80\n"
+        )
+        with patch("src.poetore.poe2.trade.search_prices") as trade_search:
+            window.search_current_item()
+        trade_search.assert_not_called()
+        assert window._parsed_item.category == "expedition_logbook"
+        assert window._parsed_item.base_type == "Expedition Logbook"
+        assert window.logbook_area_container.isHidden()
+        assert window.mod_filter_tree.topLevelItemCount() == 0
+        assert "「カレンシー交換」の対象品" in window.search_scope_notice.text()
+        assert not window.trade_url_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_poe2_vorana_saga_uses_expedition_exchange_price(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: お告げ
+レアリティ: カレンシー
+ヴォラナの叙事詩
+--------
+スタック数: 1/10
+--------
+このアイテムがインベントリー内でアクティブな間、次回使用するログブックは
+公開されたグランドエクスペディションエリアに特別なモッドを追加する
+--------
+インベントリ内で右クリックでアクティブ状態となる。このアイテムはトリガー時に消費される。""")
+        with patch("src.poetore.poe2.trade.search_prices") as trade_search:
+            window.search_current_item()
+
+        trade_search.assert_not_called()
+        assert window._parsed_item.category == "currency"
+        assert window._parsed_item.base_type == "Vorana's Saga"
+        assert "「カレンシー交換」の対象品" in window.search_scope_notice.text()
+        assert "カレンシー交換の直近価格を優先" in window.price_status.text()
+        assert not window.trade_url_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_poe2_sanctification_omen_is_an_exchange_price_item(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: お告げ
+レアリティ: カレンシー
+聖別のお告げ
+--------
+スタック数: 2/10
+--------
+インベントリ内でアクティブ状態の時
+次回レアアイテムに使用する神のオーブはそのアイテムを聖別する
+--------
+インベントリ内で右クリックでアクティブ状態となる。このアイテムはトリガー時に消費される。
+Shift+クリックでスタックから取り出す。""")
+        with patch("src.poetore.poe2.trade.search_prices") as trade_search:
+            window.search_current_item()
+
+        trade_search.assert_not_called()
+        assert window._parsed_item.item_class == "お告げ"
+        assert window._parsed_item.base_type == "Omen of Sanctification"
+        assert "カレンシー交換の直近価格を優先" in window.price_status.text()
+        assert not window.trade_url_button.isEnabled()
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("item_class", "localized_name", "category", "base_type"),
+    [
+        ("ソウルコア", "トポタンテのソウルコア", "soul_core", "Soul Core of Topotante"),
+        ("ルーン", "鉄のグレータールーン", "rune", "Greater Iron Rune"),
+    ],
+)
+def test_poe2_augments_are_exchange_price_items(
+    qapp, item_class, localized_name, category, base_type,
+):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText(
+            f"アイテムクラス: {item_class}\nレアリティ: カレンシー\n"
+            f"{localized_name}\n--------\nスタック数: 1/10\n--------\n"
+        )
+        with patch("src.poetore.poe2.trade.search_prices") as trade_search:
+            window.search_current_item()
+
+        trade_search.assert_not_called()
+        assert window._parsed_item.category == category
+        assert window._parsed_item.base_type == base_type
+        assert "カレンシー交換の直近価格を優先" in window.price_status.text()
+        assert not window.trade_url_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_poe2_shared_search_controls_reach_trade_adapter(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        text = (Path(__file__).parent / "fixtures" / "poe2" / "phase45_gem_ja.txt").read_text(
+            encoding="utf-8"
+        )
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+        window.trade_currency_combo.setCurrentIndex(
+            window.trade_currency_combo.findData("exalted_divine")
+        )
+        window.listed_within_combo.setCurrentIndex(
+            window.listed_within_combo.findData("3days")
+        )
+        window.gem_socket_toggle.click()
+
+        result = PriceResult("Standard", "qid", 0, ())
+        with patch("src.poetore.poe2.trade.search_prices", return_value=result) as search:
+            window.search_current_item()
+            for _ in range(50):
+                qapp.processEvents()
+                if search.called:
+                    break
+                QTest.qWait(10)
+
+        assert search.called
+        kwargs = search.call_args.kwargs
+        assert kwargs["trade_currency"] == "exalted_divine"
+        assert kwargs["listed_within"] == "3days"
+        assert kwargs["gem_level_min"] == 20
+        assert kwargs["quality_min"] == 20
+        assert kwargs["gem_sockets_min"] == 2
+    finally:
+        window.close()
+
+
+def test_related_items_panel_renders_materials_and_rewards(qapp):
+    window = PoetoreWindow()
+    try:
+        key = ("item", "Standard", "", "")
+        window._poe_ninja_item_key = key
+        price = PoeNinjaPrice(
+            "Blessing of Chayula", None, 12, (), "https://poe.ninja/example", 200,
+        )
+        window._show_related_items(key, {
+            "current": ("ITEM", "chayula's breachstone"),
+            "query": (({
+                "namespace": "ITEM", "name": "Chayula's Breachstone",
+                "display_name": "チャユラのブリーチストーン",
+            }, None),),
+            "items": (({
+                "namespace": "ITEM", "name": "Blessing of Chayula",
+                "display_name": "チャユラの祝福",
+            }, price),),
+        })
+        assert not window.related_items_panel.isHidden()
+        assert window.related_items_tree.topLevelItemCount() == 2
+        assert (
+            window.related_items_tree.topLevelItem(0).child(0).text(0)
+            == "● チャユラのブリーチストーン"
+        )
+        assert (
+            window.related_items_tree.topLevelItem(1).child(0).text(0)
+            == "チャユラの祝福"
+        )
+        assert window.related_items_tree.topLevelItem(1).child(0).text(1) == "12 chaos"
+        assert window.related_items_tree.topLevelItem(1).child(0).toolTip(1) == (
+            "poe.ninja 参考価格"
+        )
+        assert window.related_items_tree.minimumHeight() == 210
+        assert window.related_items_tree.maximumHeight() == 210
+        assert window.price_list.minimumHeight() == 224
+        window.show()
+        qapp.processEvents()
+        assert window.related_items_tree.height() == 210
+        assert window.related_items_panel.height() >= 200
+
+        window._hide_related_items(key)
+        assert window.related_items_tree.minimumHeight() == 0
+        assert window.price_list.minimumHeight() == 434
+    finally:
+        window.close()
+
+
+def test_related_items_panel_labels_official_exchange_price(qapp):
+    window = PoetoreWindow()
+    try:
+        key = ("item", "Standard", "", "")
+        window._poe_ninja_item_key = key
+        price = ResolvedReferencePrice(
+            "Blessing of Chayula", 14, 14, "chaos", "official",
+        )
+        window._show_related_items(key, {
+            "current": ("ITEM", "chayula's breachstone"),
+            "query": (),
+            "items": (({
+                "namespace": "ITEM", "name": "Blessing of Chayula",
+                "display_name": "チャユラの祝福",
+            }, price),),
+        })
+
+        child = window.related_items_tree.topLevelItem(0).child(0)
+        assert child.text(1) == "14 chaos"
+        assert child.toolTip(1) == "カレンシー交換 直近価格"
+    finally:
+        window.close()
+
+
+def test_related_items_panel_uses_specific_beastcraft_label(qapp):
+    window = PoetoreWindow()
+    try:
+        key = ("item", "Standard", "Watcher's Eye", "Prismatic Jewel")
+        window._poe_ninja_item_key = key
+        window._show_related_items(key, {
+            "current": ("UNIQUE", "watcher's eye"),
+            "query_label": "ビーストクラフト素材：Modをリロール",
+            "query": (({
+                "namespace": "CAPTURED_BEAST", "name": "Wild Hellion Alpha",
+                "display_name": "ワイルド・ヘリオン・アルファ",
+            }, PoeNinjaPrice(
+                "Wild Hellion Alpha", None, 42, (),
+                "https://poe.ninja/example", 200,
+            )),),
+            "items": (),
+        })
+
+        parent = window.related_items_tree.topLevelItem(0)
+        assert parent.text(0) == "ビーストクラフト素材：Modをリロール"
+        assert parent.child(0).text(0) == "ワイルド・ヘリオン・アルファ"
+        assert parent.child(0).text(1) == "42 chaos"
     finally:
         window.close()
 
@@ -2068,6 +6971,76 @@ def test_divine_rate_button_builds_awakened_style_conversion_menu(qapp):
                 if not label.pixmap().isNull()
             ]
             assert len(icons) == 2
+    finally:
+        window.close()
+
+
+def test_poe2_divine_rate_button_builds_exalted_conversion_menu(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        window._divine_rate_key = "Runes of Aldur"
+        window._show_divine_rate("Runes of Aldur", 364.9)
+
+        assert not window.divine_rate_button.isHidden()
+        assert window.divine_rate_button.text() == "⇄ 365"
+        assert window.divine_rate_button.toolTip() == (
+            "Divine OrbのExalted換算早見表（poe.ninja参考価格）"
+        )
+        assert [action.text() for action in window.divine_rate_menu.actions()] == [
+            "0.1 div  →  36 ex",
+            "0.2 div  →  73 ex",
+            "0.3 div  →  109 ex",
+            "0.4 div  →  146 ex",
+            "0.5 div  →  182 ex",
+            "0.6 div  →  219 ex",
+            "0.7 div  →  255 ex",
+            "0.8 div  →  292 ex",
+            "0.9 div  →  328 ex",
+        ]
+    finally:
+        window.close()
+
+
+def test_divine_rate_button_labels_official_exchange_rate(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    try:
+        window._divine_rate_key = "Forbidden Rites"
+        rate = ResolvedReferencePrice(
+            "Divine Orb", 492.4, 492.4, "exalted", "official",
+        )
+        window._show_divine_rate("Forbidden Rites", rate)
+
+        assert window.divine_rate_button.text() == "⇄ 492"
+        assert window.divine_rate_button.toolTip() == (
+            "Divine OrbのExalted換算早見表（公式Currency Exchangeの直近価格）"
+        )
+    finally:
+        window.close()
+
+
+def test_divine_rate_uses_official_when_ninja_is_unavailable(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2})
+    rate = ResolvedReferencePrice(
+        "Divine Orb", 492.4, 492.4, "exalted", "official",
+    )
+    try:
+        with (
+            patch.object(
+                default_poe_ninja_service,
+                "divine_exalted_rate",
+                side_effect=AssertionError("poe.ninja must not be fetched"),
+            ) as ninja,
+            patch("src.poetore.ui.resolve_divine_rate", return_value=rate),
+        ):
+            window._queue_divine_rate("Forbidden Rites")
+            for _ in range(100):
+                qapp.processEvents()
+                if window.divine_rate_button.text() == "⇄ 492":
+                    break
+                QTest.qWait(10)
+
+        assert window.divine_rate_button.text() == "⇄ 492"
+        ninja.assert_not_called()
     finally:
         window.close()
 
@@ -2121,7 +7094,7 @@ def test_logbook_area_switch_has_dedicated_row_and_fits_long_labels(qapp):
         )
         window.logbook_area_container.show()
 
-        panel_layout = window._panel.layout()
+        panel_layout = window._obs_content.layout()
         chip_index = panel_layout.indexOf(window.filter_chip_container)
         area_index = panel_layout.indexOf(window.logbook_area_container)
         assert area_index == chip_index + 2
@@ -2162,11 +7135,17 @@ Large Cluster Jewel
 --------
 Item Level: {item_level}
 """)
+        window._parsed_item = item
+        window._trade_base_type = "Large Cluster Jewel"
+        window._configure_trade_presets(item)
         window._configure_item_level(item)
 
         assert window.item_level_edit.text() == minimum
         assert not window.item_level_max_edit.isHidden()
         assert window.item_level_max_edit.text() == maximum
+        assert window._selected_item_level_range() == (None, None)
+
+        window.trade_preset_combo.setCurrentIndex(1)
         assert window._selected_item_level_range() == (
             int(minimum), int(maximum) if maximum else None,
         )
@@ -2239,6 +7218,160 @@ def test_gem_quality_chip_uses_read_quality_and_can_be_toggled_and_edited(qapp):
         window.close()
 
 
+@pytest.mark.parametrize(("level", "enabled"), [(18, False), (19, True)])
+def test_poe2_gem_level_chip_matches_ee2_threshold(qapp, level, enabled):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        item = parse_poe2_item_text(
+            f"アイテムクラス: スキルジェム\nレアリティ: ジェム\nアーク\n"
+            f"--------\nレベル: {level}\n品質: +20%\nソケット: S S S\n"
+        )
+        window._configure_gem_level(item)
+        assert not window.gem_level_tag.isHidden()
+        assert window._selected_gem_level() == (level if enabled else None)
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(("sockets", "enabled"), [(2, False), (3, True)])
+def test_poe2_gem_socket_chip_matches_ee2_threshold(qapp, sockets, enabled):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        item = parse_poe2_item_text(
+            "アイテムクラス: スキルジェム\nレアリティ: ジェム\nアーク\n--------\n"
+            f"レベル: 20\n品質: +20%\nソケット: {' '.join('G' for _ in range(sockets))}\n"
+        )
+        window._parsed_item = item
+        window._configure_gem_sockets(item)
+        assert not window.gem_socket_tag.isHidden()
+        assert window._selected_gem_sockets() == (sockets if enabled else None)
+        window._populate_stat_filters(window._resolved_trade_filters(item, PRESET_FINISHED))
+        assert all(
+            window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole)
+            != "property.gem_sockets"
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        )
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(("quality", "enabled"), [(9, False), (10, True)])
+def test_poe2_charm_quality_chip_matches_ee2_threshold(qapp, quality, enabled):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        item = ParsedItem(
+            item_class="Charms", rarity="magic", name="Test Charm",
+            base_type="Topaz Charm", category="charm",
+            properties={"Quality": f"+{quality}%"}, raw_text=f"charm-{quality}",
+        )
+        window._parsed_item = item
+        window._configure_quality(item)
+        assert not window.gem_quality_tag.isHidden()
+        assert window._selected_quality() == (quality if enabled else None)
+    finally:
+        window.close()
+
+
+def test_poe2_rare_equipment_uses_shared_header_presets_and_item_level_chip(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        item = replace(
+            parse_poe2_item_text(
+                (Path(__file__).parent / "fixtures" / "poe2" / "rare_spear_ja.txt").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            item_level=89,
+            raw_text="poe2-rare-spear-ilvl-89",
+        )
+        window._parsed_item = item
+        window._trade_base_type = item.base_type
+        window._configure_trade_presets(item)
+        window._update_item_header(item)
+        window._configure_item_level(item, force=True)
+        assert not window.base_scope_toggle.isHidden()
+        assert window.trade_preset_combo.isEnabled()
+        assert window.trade_preset_combo.currentData() == PRESET_FINISHED
+        assert not window.item_level_tag.isHidden()
+        assert window._selected_item_level() is None
+
+        window.trade_preset_combo.setCurrentIndex(1)
+        assert window.trade_preset_combo.currentData() == PRESET_BASE
+        assert window._selected_item_level() == 86
+    finally:
+        window.close()
+
+
+def test_poe2_runemastered_chip_defaults_on_and_switches_trade_type(qapp):
+    fixture = Path(__file__).parent / "fixtures" / "poe2" / "real_copy_bilingual.csv"
+    with fixture.open(encoding="utf-8-sig", newline="") as handle:
+        row = next(row for row in csv.DictReader(handle) if row["fixture_id"] == "FX022")
+    item = parse_poe2_item_text(row["英語設定の詳細コピー全文"])
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window._parsed_item = item
+        window._update_item_header(item)
+        window.show()
+        qapp.processEvents()
+
+        assert not window.runemastered_tag.isHidden()
+        assert window.runemastered_chip.isChecked()
+        assert window.runemastered_chip.text() == "☑ ルーンマスター"
+        assert window.runemastered_tag.parentWidget() is window.filter_chip_container
+        chips = [chip for _name, chip in window._filter_chips]
+        assert chips.index(window.runemastered_tag) == chips.index(window.gem_quality_tag) + 1
+        assert window.runemastered_tag.height() == window.gem_quality_tag.sizeHint().height()
+        selected = window._poe2_search_item(item)
+        assert build_poe2_search_query(selected)["query"]["type"] == (
+            "Runemastered Strider Vest"
+        )
+        assert build_poe2_search_query(selected)["query"]["name"] == "Yriel's Fostering"
+
+        window.runemastered_chip.setChecked(False)
+        assert window.runemastered_chip.text() == "☐ ルーンマスター"
+        assert window.runemastered_tag.property("active") is False
+        selected = window._poe2_search_item(item)
+        query = build_poe2_search_query(selected)["query"]
+        assert query["type"] == "Strider Vest"
+        assert query["name"] == "Yriel's Fostering"
+        assert window.price_status.text() == "通常版のベースを検索します。"
+
+        # 検索直前の再解析でも、同じアイテムならユーザー選択を維持する。
+        window._update_item_header(item)
+        assert not window.runemastered_chip.isChecked()
+        assert window._poe2_search_item(item).base_type == "Strider Vest"
+    finally:
+        window.close()
+
+
+def test_poe2_equipment_search_matrix_ui_contract(qapp):
+    """All equipment classes share the intended rarity/preset/scope UI branches."""
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.show()
+        qapp.processEvents()
+        for category in _EQUIPMENT_FIXTURES:
+            for rarity in _RARITIES:
+                item = poe2_audit_item(category, rarity)
+                window._parsed_item = item
+                window._trade_base_type = item.base_type
+                window._configure_trade_presets(item)
+                window._update_item_header(item)
+                presets = available_trade_presets(item)
+                assert window.trade_preset_combo.isEnabled() == (PRESET_BASE in presets)
+                if rarity == "unique":
+                    assert window.base_scope_toggle.isHidden()
+                    assert window._searches_exact_base_type(item) is True
+                else:
+                    assert not window.base_scope_toggle.isHidden()
+                    window.base_scope_toggle.setCurrentIndex(0)
+                    assert window._searches_exact_base_type(item) is True
+                    window.base_scope_toggle.setCurrentIndex(1)
+                    assert window._searches_exact_base_type(item) is False
+    finally:
+        window.close()
+
+
 @pytest.mark.parametrize(("quality", "metadata", "visible", "enabled"), [
     (0, {"max_level": 20}, False, False),
     (15, {"max_level": 20}, True, False),
@@ -2269,7 +7402,7 @@ def test_gem_quality_chip_initial_state_matches_awakened(
         window.close()
 
 
-def test_non_gem_quality_chip_matches_awakened_exact_rules(qapp):
+def test_non_gem_quality_chip_keeps_exceptional_quality_in_finished_search(qapp):
     window = PoetoreWindow()
     try:
         armour = parse_item_text("""Item Class: Body Armours
@@ -2277,17 +7410,18 @@ Rarity: Rare
 Test Armour
 Sacred Chainmail
 --------
-Quality: +30%
+Quality: +21%
 Item Level: 86
 """)
         window._parsed_item = armour
         window._configure_trade_presets(armour)
         window._configure_quality(armour)
-        assert window.gem_quality_tag.isHidden()
+        assert not window.gem_quality_tag.isHidden()
+        assert window._selected_quality() == 21
 
         window.trade_preset_combo.setCurrentIndex(1)
         assert not window.gem_quality_tag.isHidden()
-        assert window._selected_quality() == 30
+        assert window._selected_quality() == 21
 
         accessory = parse_item_text("""Item Class: Rings
 Rarity: Rare
@@ -2304,6 +7438,18 @@ Item Level: 86
         window.trade_preset_combo.setCurrentIndex(1)
         assert not window.gem_quality_tag.isHidden()
         assert window._selected_quality() is None
+
+        accessory25 = replace(
+            accessory,
+            raw_text=accessory.raw_text + "\n25",
+            properties={**accessory.properties, "Quality": "+25%"},
+        )
+        window._parsed_item = accessory25
+        window._configure_trade_presets(accessory25)
+        window._configure_quality(accessory25)
+        assert not window.gem_quality_tag.isHidden()
+        assert window.gem_quality_edit.text() == "25"
+        assert window._selected_quality() == 25
 
         flask20 = parse_item_text("""Item Class: Utility Flasks
 Rarity: Magic
@@ -2325,6 +7471,357 @@ Item Level: 84
         window._parsed_item = flask21
         window._configure_quality(flask21)
         assert window._selected_quality() == 21
+    finally:
+        window.close()
+
+
+def test_poe2_weapon_parse_shows_dps_summary_in_header(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_spear_ja.txt").read_text(
+            encoding="utf-8"
+        )
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        assert window.weapon_dps_label.text() == "pDPS：241.3（品質20%換算）"
+        assert not window.weapon_dps_label.isHidden()
+    finally:
+        window.close()
+
+
+def test_poe2_life_flask_properties_do_not_show_metadata_warning(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        text = (
+            Path(__file__).parent / "fixtures" / "poe2" / "magic_life_flask_ja.txt"
+        ).read_text(encoding="utf-8")
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        assert window.mod_warning.isHidden()
+        assert window.mod_filter_tree.topLevelItemCount() == 3
+        assert {
+            window.mod_filter_tree.topLevelItem(index).text(_MOD_COLUMN_TEXT)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        } == {
+            "回復量が70(66-70)%増加する",
+            "毎秒チャージを0.20獲得する",
+            "レアリティ：マジック",
+        }
+        assert not window.hidden_mods_toggle.isHidden()
+    finally:
+        window.close()
+
+
+def test_poe2_chiming_staff_shows_sigil_of_power_level_in_mod_list(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: スタッフ
+レアリティ: マジック
+青い 熟達者の 鐘鳴のスタッフ
+--------
+装備条件：レベル 56, 29 (augmented) 知性
+--------
+アイテムレベル: 82
+--------
+スキルを付与: レベル18 シギルオブパワー
+--------
+{ プレフィックスモッド「青い」 (ティア: 1) — マナ }
+最大マナ +319(299-328)
+{ サフィックスモッド 「熟達者の」 (ティア: 1) }
+要求能力値が35%減少する""")
+        window.parse_current_text()
+
+        visible_mods = {
+            window.mod_filter_tree.topLevelItem(index).text(_MOD_COLUMN_TEXT)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+            if not window.mod_filter_tree.topLevelItem(index).isHidden()
+        }
+        assert "スキルを付与: レベル18 シギルオブパワー" in visible_mods
+        assert window.mod_warning.isHidden()
+    finally:
+        window.close()
+
+
+def test_poe2_absent_amulet_shows_rhoa_mount_level_in_mod_list(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: アミュレット
+レアリティ: ノーマル
+不在のアミュレット
+--------
+装備条件：レベル 58
+--------
+アイテムレベル: 65
+--------
+{ 暗黙モッド }
+プレフィックスモッド -1個
+サフィックスモッド -1個
+--------
+スキルを付与: レベル14 ロアマウント
+--------
+我らは永遠に生まれぬ者たちを掴む……
+--------
+メモ: ~b/o 10 chaos""")
+        window.parse_current_text()
+
+        visible_mods = {
+            window.mod_filter_tree.topLevelItem(index).text(_MOD_COLUMN_TEXT)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+            if not window.mod_filter_tree.topLevelItem(index).isHidden()
+        }
+        assert "スキルを付与: レベル14 ロアマウント" in visible_mods
+        assert window.mod_warning.isHidden()
+    finally:
+        window.close()
+
+
+def test_poe2_wombgift_hiveblood_cost_does_not_show_metadata_warning(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        text = (
+            Path(__file__).parent / "fixtures" / "poe2" / "signet_wombgift_ja.txt"
+        ).read_text(encoding="utf-8")
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        assert window.mod_warning.isHidden()
+        assert window.mod_filter_tree.topLevelItemCount() == 0
+        assert window.item_name_label.text() == "印章の母胎ギフト"
+        assert not window.item_level_tag.isHidden()
+        assert window.item_level_edit.text() == "80"
+        assert window._selected_item_level_range() == (80, None)
+        assert window.item_level_toggle.text() == "☑ ilvl："
+    finally:
+        window.close()
+
+
+def test_poe2_wombgift_item_level_chip_reaches_trade2_search(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        text = (
+            Path(__file__).parent / "fixtures" / "poe2" / "signet_wombgift_ja.txt"
+        ).read_text(encoding="utf-8")
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        result = PriceResult("Standard", "qid", 0, ())
+        with patch("src.poetore.poe2.trade.search_prices", return_value=result) as search:
+            window.search_current_item()
+            for _ in range(50):
+                qapp.processEvents()
+                if search.called:
+                    break
+                QTest.qWait(10)
+
+        assert search.called
+        assert search.call_args.kwargs["item_level_min"] == 80
+        assert search.call_args.kwargs["item_level_max"] is None
+    finally:
+        window.close()
+
+
+def test_poe2_jewel_scoped_mana_on_kill_stat_reaches_trade2_search(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "poe2"
+            / "rare_sapphire_mana_on_kill_ja.txt"
+        )
+        window.input_edit.setPlainText(fixture.read_text(encoding="utf-8"))
+        window.parse_current_text()
+
+        result = PriceResult("Forbidden Rites", "qid", 1, ())
+        with patch("src.poetore.poe2.trade.search_prices", return_value=result) as search:
+            window.search_current_item()
+            for _ in range(50):
+                qapp.processEvents()
+                if search.called:
+                    break
+                QTest.qWait(10)
+
+        assert search.called
+        stat_ids = {row.stat_id for row in search.call_args.kwargs["stat_filters"]}
+        assert "explicit.stat_1604736568" in stat_ids
+        assert "explicit.stat_1030153674" not in stat_ids
+    finally:
+        window.close()
+
+
+def test_poe2_weapon_header_uses_individual_elemental_damage_properties(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        text = (
+            Path(__file__).parent
+            / "fixtures"
+            / "poe2"
+            / "rare_spear_physical_fire_ja.txt"
+        ).read_text(encoding="utf-8")
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        assert window.weapon_dps_label.text() == (
+            "合計DPS：117.1（pDPS 78.7 / eDPS 38.4、pDPSは品質20%換算）"
+        )
+        rows = {
+            window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        }
+        assert "property.total_dps" in rows
+        assert "property.physical_dps" in rows
+        assert "property.elemental_dps" in rows
+    finally:
+        window.close()
+
+
+def test_poe2_weapon_quality_20_is_visible_but_initially_disabled(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        from src.poetore.poe2.parser import parse_item_text as parse_poe2_item_text
+
+        text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_spear_ja.txt").read_text(
+            encoding="utf-8"
+        )
+        item = parse_poe2_item_text(text)
+        window._configure_quality(item)
+        filters = window._resolved_trade_filters(item, "finished")
+        flat = next(row for row in filters if "物理ダメージを追加" in row.text)
+
+        assert not window.gem_quality_tag.isHidden()
+        assert window.gem_quality_edit.text() == "20"
+        assert window._selected_quality() is None
+        assert window.gem_quality_toggle.text() == "☐ 品質："
+        assert flat.min_value == 28.0
+        assert flat.read_value == 32.0
+
+        window.gem_quality_toggle.click()
+        assert window._selected_quality() == 20
+    finally:
+        window.close()
+
+
+def test_poe2_phase45_properties_and_states_join_editable_trade_rows(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        from src.poetore.poe2.parser import parse_item_text as parse_poe2_item_text
+
+        fixture = Path(__file__).parent / "fixtures" / "poe2" / "phase45_sceptre_ja.txt"
+        item = parse_poe2_item_text(fixture.read_text(encoding="utf-8"))
+        window.input_edit.setPlainText(item.raw_text)
+        window.parse_current_text()
+        filters = window._resolved_trade_filters(item, "finished")
+        by_id = {row.stat_id: row for row in filters}
+        assert by_id["property.spirit"].min_value == 90
+        assert by_id["property.spirit"].enabled
+        assert by_id["property.augment_sockets"].min_value == 2
+        assert not by_id["property.augment_sockets"].enabled
+        assert "property.state.sanctified" not in by_id
+        assert any(row.stat_id.startswith("rune.") for row in filters)
+        assert not window.virtual_augment_combo.isHidden()
+        assert not window.virtual_augment_count_combo.isHidden()
+        assert window.virtual_augment_count_combo.itemText(0) == "空き1個に追加"
+        assert window.virtual_augment_count_combo.itemText(1) == "全2個を置換"
+        index = window.virtual_augment_combo.findData("Adept Rune")
+        assert index >= 0
+        label = window.virtual_augment_combo.itemText(index)
+        assert "熟達のルーン" in label
+        assert label != "熟達のルーン"
+        assert window.virtual_augment_combo.itemData(index, Qt.ToolTipRole) == label
+        soul_core_index = window.virtual_augment_combo.findData(
+            "Jiquani's Soul Core of Automation"
+        )
+        assert soul_core_index >= 0
+        assert "ジクアニの自動化のソウルコア" in (
+            window.virtual_augment_combo.itemText(soul_core_index)
+        )
+        window.virtual_augment_combo.setCurrentIndex(index)
+        selected = window._selected_stat_filters()
+        virtual = next(row for row in selected if row.kind == "virtual-rune")
+        assert virtual.min_value == 8.0
+        assert "仮想:" in virtual.text
+
+        window.virtual_augment_count_combo.setCurrentIndex(1)
+        selected = window._selected_stat_filters()
+        virtual = next(row for row in selected if row.kind == "virtual-rune")
+        assert virtual.min_value == 16.0
+        assert all(not row.enabled for row in selected if row.kind == "augment")
+
+        corrupted = item.__class__(**{**item.__dict__, "flags": (*item.flags, "corrupted")})
+        window._configure_virtual_augments(corrupted)
+        assert not window.virtual_augment_combo.isHidden()
+
+        unique = item.__class__(**{**item.__dict__, "rarity": "unique"})
+        window._configure_virtual_augments(unique)
+        assert window.virtual_augment_combo.isHidden()
+    finally:
+        window.close()
+
+
+def test_poe2_search_reparse_preserves_virtual_augment_selection(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        fixture = Path(__file__).parent / "fixtures" / "poe2" / "phase45_sceptre_ja.txt"
+        window.input_edit.setPlainText(fixture.read_text(encoding="utf-8"))
+        window.parse_current_text()
+
+        window.virtual_augment_count_combo.setCurrentIndex(1)
+        augment_index = window.virtual_augment_combo.findData("Adept Rune")
+        assert augment_index >= 0
+        window.virtual_augment_combo.setCurrentIndex(augment_index)
+
+        result = PriceResult("Standard", "qid", 0, ())
+        with (
+            patch("src.poetore.poe2.trade.search_prices", return_value=result) as search,
+            patch.object(window, "_queue_augment_values") as queue_augment_values,
+        ):
+            window.search_current_item()
+            for _ in range(50):
+                qapp.processEvents()
+                if search.called and queue_augment_values.called:
+                    break
+                QTest.qWait(10)
+
+        assert search.called
+        assert window.virtual_augment_count_combo.currentData() == 2
+        assert window.virtual_augment_combo.currentData() == "Adept Rune"
+        assert queue_augment_values.called
+    finally:
+        window.close()
+
+
+def test_poe2_fresh_parse_resets_virtual_augment_selection(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        fixture = Path(__file__).parent / "fixtures" / "poe2" / "phase45_sceptre_ja.txt"
+        window.input_edit.setPlainText(fixture.read_text(encoding="utf-8"))
+        window.parse_current_text()
+        augment_index = window.virtual_augment_combo.findData("Adept Rune")
+        assert augment_index >= 0
+        window.virtual_augment_combo.setCurrentIndex(augment_index)
+
+        window.parse_current_text()
+
+        assert window.virtual_augment_combo.currentData() is None
+    finally:
+        window.close()
+
+
+def test_poe2_two_identical_runes_show_only_replace_all_mode(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        item = parse_poe2_item_text(
+            (Path(__file__).parent / "fixtures" / "poe2"
+             / "rare_body_armour_two_identical_runes_ja.txt").read_text(encoding="utf-8")
+        )
+        window.input_edit.setPlainText(item.raw_text)
+        window.parse_current_text()
+
+        assert window.virtual_augment_count_combo.count() == 1
+        assert window.virtual_augment_count_combo.itemText(0) == "全2個を置換"
+        assert window.virtual_augment_count_combo.findText("空き1個に追加") == -1
     finally:
         window.close()
 
@@ -2351,15 +7848,15 @@ Cardinal Round Shield
 
         window.trade_preset_combo.setCurrentIndex(1)
         assert not window.base_percentile_chip.isHidden()
-        assert window.base_percentile_chip.isActive()
+        assert not window.base_percentile_chip.isActive()
         assert window.base_percentile_chip.suffix_label.text() == "%"
         minimum, maximum = window.base_percentile_chip.values()
         assert minimum is not None
         assert maximum is None
 
         window.base_percentile_chip.toggle.click()
-        assert not window.base_percentile_chip.isActive()
-        assert not any(
+        assert window.base_percentile_chip.isActive()
+        assert any(
             row.stat_id == "property.base_percentile"
             for row in window._selected_special_chip_filters()
         )
@@ -2374,15 +7871,15 @@ Cardinal Round Shield
         window.close()
 
 
-@pytest.mark.parametrize(("item_class", "base_type", "visible"), [
-    ("鎧", "Sacred Chainmail", True),
-    ("弓", "Spine Bow", True),
-    ("両手剣", "Exquisite Blade", True),
-    ("スタッフ", "Gnarled Branch", False),
-    ("ワンド", "Imbued Wand", False),
+@pytest.mark.parametrize(("item_class", "base_type"), [
+    ("鎧", "Sacred Chainmail"),
+    ("弓", "Spine Bow"),
+    ("両手剣", "Exquisite Blade"),
+    ("スタッフ", "Gnarled Branch"),
+    ("ワンド", "Imbued Wand"),
 ])
-def test_six_link_chip_is_limited_to_body_armour_and_normal_two_handers(
-    qapp, item_class, base_type, visible,
+def test_link_chip_is_shown_for_socketed_weapons_and_armour(
+    qapp, item_class, base_type,
 ):
     window = PoetoreWindow()
     try:
@@ -2398,15 +7895,91 @@ Test Item
         window._parsed_item = item
         window._configure_links(item)
 
-        assert window.links_tag.isHidden() is (not visible)
-        assert window._selected_links() == (6 if visible else None)
-        if visible:
-            window.links_toggle.click()
-            assert window._selected_links() is None
-            window.links_edit.setFocus()
-            window.links_edit.selectAll()
-            QTest.keyClicks(window.links_edit, "5")
-            assert window._selected_links() == 5
+        assert not window.links_tag.isHidden()
+        assert window._selected_links() == 6
+        window.links_toggle.click()
+        assert window._selected_links() is None
+        window.links_edit.setFocus()
+        window.links_edit.selectAll()
+        QTest.keyClicks(window.links_edit, "5")
+        assert window._selected_links() == 5
+    finally:
+        window.close()
+
+
+def test_link_chip_always_replaces_link_and_socket_rows_for_equipment(qapp):
+    window = PoetoreWindow()
+    try:
+        six_link_armour = parse_item_text("""アイテムクラス: 鎧
+レアリティ: レア
+Test Item
+Sacred Chainmail
+--------
+ソケット: R-R-R-G-B-B
+--------
+アイテムレベル: 86
+""")
+        window._parsed_item = six_link_armour
+        window._configure_links(six_link_armour)
+        window._populate_stat_filters((
+            TradeStatFilter("property.sockets", "ソケット数", 6.0, "socket", True),
+            TradeStatFilter("property.links", "最大リンク数", 6.0, "socket", False),
+        ))
+        assert not window.links_tag.isHidden()
+        assert window.mod_filter_tree.topLevelItemCount() == 0
+
+        three_socket_armour = parse_item_text("""アイテムクラス: 鎧
+レアリティ: レア
+Test Item
+Sacred Chainmail
+--------
+ソケット: R-G B
+--------
+アイテムレベル: 86
+""")
+        window._parsed_item = three_socket_armour
+        window._configure_links(three_socket_armour)
+        window._populate_stat_filters((
+            TradeStatFilter("property.sockets", "ソケット数", 3.0, "socket", False),
+            TradeStatFilter("property.links", "最大リンク数", 2.0, "socket", False),
+        ))
+        assert not window.links_tag.isHidden()
+        assert window.links_edit.text() == "2"
+        assert window._selected_links() is None
+        stat_ids = [
+            window.mod_filter_tree.topLevelItem(index).data(0, Qt.UserRole)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        ]
+        assert "property.sockets" not in stat_ids
+        assert "property.links" not in stat_ids
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(("socket_text", "value", "enabled"), [
+    ("R-R-R-R-R", 5, True),
+    ("R-R-R-R-R-R", 6, True),
+    ("R-R-R-R G", 4, False),
+    ("R-G B", 2, False),
+])
+def test_link_chip_defaults_only_five_and_six_links_on(
+    qapp, socket_text, value, enabled,
+):
+    window = PoetoreWindow()
+    try:
+        item = parse_item_text(f"""Item Class: Body Armours
+Rarity: Rare
+Test Item
+Sacred Chainmail
+--------
+Sockets: {socket_text}
+--------
+Item Level: 86
+""")
+        window._configure_links(item)
+        assert not window.links_tag.isHidden()
+        assert window.links_edit.text() == str(value)
+        assert window._selected_links() == (value if enabled else None)
     finally:
         window.close()
 
@@ -2458,6 +8031,41 @@ Elder Item
         window.close()
 
 
+def test_eldritch_influence_chips_are_visible_enabled_and_independent(qapp):
+    window = PoetoreWindow()
+    try:
+        item = parse_item_text("""アイテムクラス: 靴
+レアリティ: レア
+勝利の拍車
+賢者の履物
+--------
+アイテムレベル: 83
+--------
+シアリング・エグザークのアイテム
+イーター・オブ・ワールズのアイテム
+""")
+        window._parsed_item = item
+        window._configure_trade_presets(item)
+        window._configure_influence_chips(item)
+
+        eater = window.influence_chips["eater"]
+        exarch = window.influence_chips["exarch"]
+        assert not eater.isHidden()
+        assert not exarch.isHidden()
+        assert not eater.icon().isNull()
+        assert not exarch.icon().isNull()
+        assert eater.text() == "Eater"
+        assert exarch.text() == "Exarch"
+        assert window._selected_eldritch_influences() == (True, True)
+
+        eater.click()
+        assert window._selected_eldritch_influences() == (True, False)
+        exarch.click()
+        assert window._selected_eldritch_influences() == (False, False)
+    finally:
+        window.close()
+
+
 def test_corrupted_item_defaults_to_corrupted_only(qapp):
     window = PoetoreWindow()
     try:
@@ -2474,6 +8082,53 @@ Corrupted
         assert window.corrupted_combo.currentText() == "コラプトのみ"
         assert window.corrupted_combo.currentData() == "only"
         assert window.corrupted_combo.property("alert") is True
+    finally:
+        window.close()
+
+
+def test_poe2_against_the_darkness_defaults_to_corrupted_only(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        fixture = Path(__file__).parent / "fixtures" / "poe2" / "against_the_darkness_ja.txt"
+        window.input_edit.setPlainText(fixture.read_text(encoding="utf-8"))
+        window.parse_current_text()
+
+        assert window._parsed_item.category == "jewel"
+        assert "corrupted" in window._parsed_item.flags
+        assert not window.corrupted_combo.isHidden()
+        assert window.corrupted_combo.currentData() == "only"
+    finally:
+        window.close()
+
+
+def test_poe2_double_corrupted_gem_defaults_to_corrupted_only_and_searches_it(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "poe2"
+            / "whirling_assault_double_corrupted_ja.txt"
+        )
+        window.input_edit.setPlainText(fixture.read_text(encoding="utf-8"))
+        window.parse_current_text()
+
+        assert "corrupted" in window._parsed_item.flags
+        assert not window.corrupted_combo.isHidden()
+        assert window.corrupted_combo.currentText() == "コラプトのみ"
+        assert window.corrupted_combo.currentData() == "only"
+
+        result = PriceResult("Standard", "qid", 0, ())
+        with patch("src.poetore.poe2.trade.search_prices", return_value=result) as search:
+            window.search_current_item()
+            for _ in range(50):
+                qapp.processEvents()
+                if search.called:
+                    break
+                QTest.qWait(10)
+
+        assert search.called
+        assert search.call_args.kwargs["include_corrupted"] == "only"
     finally:
         window.close()
 
@@ -2656,6 +8311,90 @@ def test_header_removes_affixes_only_for_nonunique_equipment(qapp):
         window.close()
 
 
+def test_header_shows_rare_waystone_base_instead_of_affix_name(qapp):
+    from src.poetore.poe2.parser import parse_item_text as parse_poe2_item_text
+
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_waystone_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_poe2_item_text(text)
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window._update_item_header(item)
+
+        assert window.item_name_label.text() == "ウェイストーン (ティア15)"
+        assert "先祖の突撃" not in window.item_name_label.text()
+    finally:
+        window.close()
+
+
+def test_poe2_nonunique_equipment_scope_uses_japanese_base_name(qapp):
+    from src.poetore.poe2.parser import parse_item_text as parse_poe2_item_text
+
+    text = (Path(__file__).parent / "fixtures" / "poe2" / "rare_spear_ja.txt").read_text(
+        encoding="utf-8"
+    )
+    item = parse_poe2_item_text(text)
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window._update_item_header(item)
+
+        assert item.base_type == "Soaring Spear"
+        assert window.base_scope_toggle.itemText(0) == "飛翔のスピア"
+        assert window.base_scope_toggle.itemText(1) == "すべてのスピア"
+
+        flying = replace(item, base_type="Flying Spear", raw_text="flying-spear")
+        window._update_item_header(flying)
+        assert window.base_scope_toggle.itemText(0) == "フレイングスピア"
+    finally:
+        window.close()
+
+
+def test_poe2_item_header_uses_japanese_identity_for_all_item_kinds(qapp):
+    fixture_dir = Path(__file__).parent / "fixtures" / "poe2"
+    mageblood = parse_poe2_item_text(
+        (fixture_dir / "mageblood_en.txt").read_text(encoding="utf-8")
+    )
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window._update_item_header(mageblood)
+        assert window.item_name_label.text() == "メイジブラッド"
+
+        currency = ParsedItem(
+            item_class="Currency", rarity="Currency", name="Exalted Orb",
+            base_type="Exalted Orb", category="currency", raw_text="currency",
+        )
+        window._update_item_header(currency)
+        assert window.item_name_label.text() == "高貴なオーブ"
+
+        gem = ParsedItem(
+            item_class="Skill Gems", rarity="Gem", name="Arc",
+            base_type="Arc", category="active_gem", raw_text="gem",
+        )
+        window._update_item_header(gem)
+        assert window.item_name_label.text() == "アーク"
+    finally:
+        window.close()
+
+
+def test_poe2_unidentified_unique_header_uses_japanese_base_name(qapp):
+    item = ParsedItem(
+        item_class="Talismans",
+        rarity="unique",
+        name="",
+        base_type="Nettle Talisman",
+        category="talisman",
+        flags=("unidentified",),
+        raw_text="unidentified unique talisman",
+    )
+    window = PoetoreWindow(app_config={"poe_version": "poe2"})
+    try:
+        window._update_item_header(item)
+        assert window.item_name_label.text() == "イラクサのタリスマン"
+    finally:
+        window.close()
+
+
 def test_nonunique_jewels_use_category_search_but_cluster_and_unique_stay_exact(qapp):
     window = PoetoreWindow()
     try:
@@ -2673,7 +8412,15 @@ def test_nonunique_jewels_use_category_search_but_cluster_and_unique_stay_exact(
         )
         unique = replace(jewel, rarity="Unique", raw_text="unique")
         assert window._searches_exact_base_type(jewel) is False
+        window._update_item_header(abyss)
+        assert not window.base_scope_toggle.isHidden()
+        assert window.base_scope_toggle.itemText(0) == "Ghastly Eye Jewel"
+        assert window.base_scope_toggle.itemText(1) == "すべてのアビスジュエル"
+        assert window.base_scope_toggle.currentData() is False
         assert window._searches_exact_base_type(abyss) is False
+
+        window.base_scope_toggle.setCurrentIndex(0)
+        assert window._searches_exact_base_type(abyss) is True
         assert window._searches_exact_base_type(cluster) is True
         assert window._searches_exact_base_type(unique) is True
     finally:
@@ -2704,6 +8451,37 @@ Tenacious Blood Sap Tincture of Battering
 { サフィックスモッド 「殴打の」 (ティア: 3) }
 近接武器は30(30-39)%の確率で敵物理ダメージ軽減を無視する
 """, "explicit.stat_116232170"),
+    ("""アイテムクラス: チンキ
+レアリティ: マジック
+Tenacious Blood Sap Tincture
+--------
+アイテムレベル: 84
+--------
+{ プレフィックスモッド }
+マナ燃焼レートが45(42-46)%増加する
+""", "explicit.stat_116232170"),
+    ("""アイテムクラス: チンキ
+レアリティ: マジック
+強い 液状化の 血の樹液のチンキ
+--------
+アイテムレベル: 84
+--------
+{ プレフィックスモッド「強い」 (ティア: 3) }
+効果が35%増加する
+マナ燃焼レートが48(47-51)%増加する
+{ サフィックスモッド 「液状化の」 (ティア: 3) }
+近接武器によるアタックの継続ダメージ倍率 +23(19-23)%
+""", "explicit.stat_3529940209"),
+    ("""アイテムクラス: ユーティリティフラスコ
+レアリティ: ユニーク
+オロスの決意
+ルビーフラスコ
+--------
+アイテムレベル: 84
+--------
+{ ユニークモッド }
+持続時間が36(39-35)%低下する
+""", "explicit.stat_1256719186"),
 ])
 def test_current_japanese_flask_and_tincture_have_no_unresolved_warning(
     qapp, text, expected_stat_id,
@@ -2720,6 +8498,51 @@ def test_current_japanese_flask_and_tincture_have_no_unresolved_warning(
         assert expected_stat_id in {row.stat_id for row in rows}
         assert window.mod_warning.isHidden()
         assert window.item_level_tag.property("active") is False
+    finally:
+        window.close()
+
+
+def test_flask_instilling_enchantment_is_hidden_from_search_conditions(qapp):
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText("""アイテムクラス: ユーティリティフラスコ
+レアリティ: マジック
+検査者の 虹の シルバーフラスコ
+--------
+品質: +17% (augmented)
+8.90 (augmented)秒間持続
+使用時に60中40チャージを消費
+現在0チャージ
+猛攻
+--------
+装備要求:
+レベル: 64
+--------
+アイテムレベル: 85
+--------
+チャージがフルになった時に使用される (enchant)
+--------
+{ プレフィックスモッド「検査者の」 (ティア: 3) }
+持続時間が27(26-30)%増加する
+{ サフィックスモッド 「虹の」 (ティア: 1) }
+効果中は20(18-20)%の元素耐性が追加される
+--------
+右クリックして飲む。腰につけているときだけチャージを貯めることができる。
+""")
+        window.parse_current_text()
+
+        enchant_item = next(
+            window.mod_filter_tree.topLevelItem(index)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+            if window.mod_filter_tree.topLevelItem(index).data(
+                0, Qt.UserRole + 4,
+            ).stat_id == "enchant.stat_3287581721"
+        )
+        enchant = enchant_item.data(0, Qt.UserRole + 4)
+        assert enchant.text == "チャージがフルになった時に使用される (enchant)"
+        assert enchant.enabled is False
+        assert enchant_item.isHidden()
+        assert window.mod_warning.isHidden()
     finally:
         window.close()
 
@@ -2767,6 +8590,632 @@ Vaal Molten Strike
         window.parse_current_text()
 
         assert window._parsed_item.base_type == "Vaal Molten Strike"
+        assert window.item_name_label.text() == "ヴァールモルテンストライク"
         assert window.gem_variant_chip.text() == "Variant：ヴァールジェム"
+    finally:
+        window.close()
+
+
+def test_japanese_vaal_gem_copy_is_parsed_and_shown_as_vaal_grace(qapp):
+    text = """アイテムクラス: スキルジェム
+レアリティ: ジェム
+グレース
+--------
+オーラ, スペル, 範囲効果, 持続時間, ヴァール
+レベル: 1
+リザーブ: 50% マナ
+--------
+使用者とその仲間に回避力を付与するオーラを纏う。
+--------
+ヴァールグレース
+--------
+クールダウン時間: 0.50秒
+使用ごとの必要ソウル: 50
+1回分保持可能
+--------
+基礎持続時間は6.00秒
+--------
+経験値: 1/118,383
+--------
+コラプト状態
+"""
+    window = PoetoreWindow()
+    try:
+        detailed_item = parse_item_text(text)
+        window._trade_base_type = detailed_item.base_type
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        assert window._parsed_item.base_type == "Vaal Grace"
+        assert window.item_name_label.text() == "ヴァールグレース"
+        assert window.gem_variant_chip.text() == "Variant：ヴァールジェム"
+    finally:
+        window.close()
+
+
+def test_scrying_orb_header_includes_the_searched_map_area(qapp):
+    text = """アイテムクラス: スタック可能カレンシー
+レアリティ: カレンシー
+透視のオーブ
+--------
+マップエリア: 岸辺
+--------
+アトラス上のマップを透視する
+"""
+    window = PoetoreWindow()
+    try:
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+        assert window.item_name_label.text() == "透視のオーブ (岸辺)"
+    finally:
+        window.close()
+
+
+def test_poe2_exchange_currency_description_does_not_show_metadata_warning(qapp):
+    text = """アイテムクラス: スタック可能カレンシー
+レアリティ: カレンシー
+高貴なオーブ
+--------
+スタック数: 2,152/20
+--------
+レアアイテムを1個の新しいランダムなモッドで強化する。
+--------
+このアイテムを右クリックした後、レアアイテムをクリックして使用する。レアアイテムは最大で6個のランダムなモッドを持つことができる。
+Shift+クリックでスタックから取り出す。
+"""
+    window = PoetoreWindow(app_config={"poe_version": "poe2", "poetore": {}})
+    try:
+        window.input_edit.setPlainText(text)
+        window.parse_current_text()
+
+        assert window._parsed_item.modifiers == ()
+        assert window.mod_warning.isHidden()
+        assert "カレンシー交換" in window.search_scope_notice.text()
+    finally:
+        window.close()
+
+
+def test_poe2_waystone_item_rarity_is_visible_and_tablet_copy_has_no_warning(qapp):
+    waystone = """アイテムクラス: ウェイストーン
+レアリティ: レア
+恐るべき辺境
+ウェイストーン (ティア3)
+--------
+復活が利用可能: 2 (augmented)
+アイテムレアリティ: +29% (augmented)
+モンスターレアリティ: +18% (augmented)
+ウェイストーンドロップ確率: +55% (augmented)
+--------
+アイテムレベル: 70
+"""
+    tablet = """アイテムクラス: 石板
+レアリティ: レア
+虚無に触れられし命令
+ブリーチの石板
+--------
+アイテムレベル: 80
+--------
+{ 暗黙モッド }
+マップに異世界からのブリーチを追加する
+残り使用可能回数 10回
+--------
+{ サフィックスモッド 「侵略の」 (ティア: 1) }
+マップの不安定なブリーチは安定化した後レアモンスターが追加で3(1-3)体スポーンする
+"""
+    window = PoetoreWindow(app_config={"poe_version": "poe2", "poetore": {}})
+    try:
+        window.input_edit.setPlainText(waystone)
+        window.parse_current_text()
+        labels = {
+            window.mod_filter_tree.topLevelItem(index).text(_MOD_COLUMN_TEXT)
+            for index in range(window.mod_filter_tree.topLevelItemCount())
+        }
+        assert "アイテムレアリティ" in labels
+
+        window.input_edit.setPlainText(tablet)
+        window.parse_current_text()
+        assert window.mod_warning.isHidden()
+        assert window._parsed_item.properties["残り使用回数"] == "10"
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize(
+    ("rarity_label", "expected_rarity", "expected_text"),
+    (
+        ("ノーマル", "normal", "ノーマル限定"),
+        ("マジック", "magic", "マジック限定"),
+        ("レア", "rare", "レア限定"),
+    ),
+)
+def test_poe2_nonunique_tablet_toggles_detected_rarity_and_nonunique(
+    qapp, rarity_label, expected_rarity, expected_text,
+):
+    tablet = f"""アイテムクラス: 石板
+レアリティ: {rarity_label}
+埋もれた記録
+エクスペディションの石板
+--------
+アイテムレベル: 82
+--------
+{{ 暗黙モッド }}
+マップにカルグールのエクスペディションを追加する
+残り使用可能回数 10回
+--------
+{{ サフィックスモッド 「宝探しの」 (ティア: 1) }}
+マップにレアのチェストが追加で3(2-3)個出現する
+"""
+    window = PoetoreWindow(app_config={"poe_version": "poe2", "poetore": {}})
+    try:
+        window.input_edit.setPlainText(tablet)
+        window.parse_current_text()
+
+        assert window.mod_warning.isHidden()
+        assert not window.tablet_rarity_combo.isHidden()
+        assert [
+            window.tablet_rarity_combo.itemData(index)
+            for index in range(window.tablet_rarity_combo.count())
+        ] == [expected_rarity, "nonunique"]
+        assert window.tablet_rarity_combo.objectName() == "cycleToggle"
+        assert window.tablet_rarity_combo.currentData() == expected_rarity
+        assert window.tablet_rarity_combo.currentText() == expected_text
+        window.tablet_rarity_combo.click()
+        assert window.tablet_rarity_combo.currentData() == "nonunique"
+        assert window.tablet_rarity_combo.currentText() == "非ユニーク"
+        window.parse_current_text()
+        assert window.tablet_rarity_combo.currentData() == "nonunique"
+        assert window.rarity_condition_chip.isHidden()
+    finally:
+        window.close()
+
+
+def test_poe2_related_items_resolve_ee2_group_and_keep_unpriced_rows(qapp):
+    window = PoetoreWindow(app_config={"poe_version": "poe2", "poetore": {}})
+    item = ParsedItem(
+        "Map Fragments", "normal", "", "Primary Calamity Fragment", "map_fragment",
+    )
+    try:
+        window._trade_base_type = "Primary Calamity Fragment"
+        with patch.object(
+            __import__("src.poetore.ui", fromlist=["default_poe_ninja_service"])
+            .default_poe_ninja_service,
+            "lookup_poe2_identities",
+            return_value=tuple(None for _ in range(11)),
+        ) as lookup:
+            related = window._lookup_poe2_related_items(item, "Runes of Aldur")
+        assert related is not None
+        assert [row[0]["name"] for row in related["query"]] == [
+            "Primary Calamity Fragment", "Secondary Calamity Fragment",
+            "Tertiary Calamity Fragment",
+        ]
+        assert all(price is None for _row, price in related["items"])
+        assert related["items"][2][0]["display_name"] == "信仰のプリズム"
+        assert lookup.call_args.args[0][0] == (
+            "ITEM", "Primary Calamity Fragment", None, "Fragments",
+        )
+    finally:
+        window.close()
+
+
+def test_poe2_related_items_skip_ninja_when_all_official_prices_resolve(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    item = ParsedItem(
+        "Map Fragments", "normal", "", "Primary Calamity Fragment", "map_fragment",
+    )
+
+    def resolved(_version, _league, entries, **_kwargs):
+        return {
+            key: ResolvedReferencePrice(
+                next(iter(names)), 12, 12, "exalted", "official",
+            )
+            for key, names, _fallback in entries
+        }
+
+    try:
+        window._trade_base_type = "Primary Calamity Fragment"
+        with (
+            patch("src.poetore.ui.resolve_reference_prices", side_effect=resolved),
+            patch.object(
+                default_poe_ninja_service, "lookup_poe2_identities",
+                side_effect=AssertionError("poe.ninja must not be fetched"),
+            ) as lookup,
+            patch.object(
+                default_poe_ninja_service, "divine_exalted_rate",
+                side_effect=AssertionError("poe.ninja must not be fetched"),
+            ) as divine_rate,
+        ):
+            related = window._lookup_poe2_related_items(item, "Forbidden Rites")
+
+        assert related is not None
+        assert all(price.source == "official" for _row, price in related["items"])
+        lookup.assert_not_called()
+        divine_rate.assert_not_called()
+    finally:
+        window.close()
+
+
+def test_poe2_related_items_fetch_ninja_only_for_unresolved_rows(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    item = ParsedItem(
+        "Map Fragments", "normal", "", "Primary Calamity Fragment", "map_fragment",
+    )
+    pass_number = 0
+
+    def resolved(_version, _league, entries, **_kwargs):
+        nonlocal pass_number
+        rows = tuple(entries)
+        pass_number += 1
+        if pass_number == 1:
+            return {
+                key: (
+                    None if index == len(rows) - 1 else ResolvedReferencePrice(
+                        next(iter(names)), 12, 12, "exalted", "official",
+                    )
+                )
+                for index, (key, names, _fallback) in enumerate(rows)
+            }
+        return {
+            key: ResolvedReferencePrice(
+                next(iter(names)), 9, 9, "exalted", "poe_ninja",
+            )
+            for key, names, _fallback in rows
+        }
+
+    try:
+        window._trade_base_type = "Primary Calamity Fragment"
+        fallback = PoeNinjaPrice(
+            "Faith of Prism", None, 9, (), "https://poe.ninja/example", 490,
+        )
+        with (
+            patch("src.poetore.ui.resolve_reference_prices", side_effect=resolved),
+            patch.object(
+                default_poe_ninja_service, "lookup_poe2_identities",
+                return_value=(fallback,),
+            ) as lookup,
+            patch.object(
+                default_poe_ninja_service, "divine_exalted_rate", return_value=490,
+            ),
+        ):
+            related = window._lookup_poe2_related_items(item, "Forbidden Rites")
+
+        assert related is not None
+        assert len(lookup.call_args.args[0]) == 1
+        assert pass_number == 2
+    finally:
+        window.close()
+
+
+def test_official_exchange_shadow_sync_uses_selected_mode_and_league(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    try:
+        window._auto_league = "Runes of Aldur"
+        with patch(
+            "src.poetore.ui.default_official_exchange_shadow_service.queue_sync",
+            return_value=True,
+        ) as queue_sync:
+            window._queue_official_exchange_shadow_sync()
+        queue_sync.assert_called_once_with(
+            POE2,
+            "Runes of Aldur",
+            on_complete=window._official_exchange_sync_completed,
+        )
+    finally:
+        window.close()
+
+
+def test_official_exchange_shadow_records_without_changing_visible_ninja_price(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE1, "poetore": {}})
+    item = Mock(name="The Doctor", base_type="The Doctor")
+    price = PoeNinjaPrice(
+        "The Doctor", None, 1800, (), "https://poe.ninja/example", 200,
+    )
+    try:
+        window._trade_item_name = "The Doctor"
+        window._trade_base_type = "The Doctor"
+        window._poe_ninja_item_key = ("active",)
+        window._show_poe_ninja_price(("active",), price)
+        visible_before = window.poe_ninja_price_value.text()
+        with patch(
+            "src.poetore.ui.default_official_exchange_shadow_service.record_search",
+        ) as record:
+            window._record_official_exchange_shadow(
+                item, "Allflame", price, "The Doctor", "The Doctor",
+            )
+        assert window.poe_ninja_price_value.text() == visible_before
+        record.assert_called_once()
+        assert record.call_args.args[:2] == (POE1, "Allflame")
+        assert record.call_args.kwargs["reference_base_price"] == 1800
+        assert record.call_args.kwargs["reference_divine_rate"] == 200
+    finally:
+        window.close()
+
+
+def _official_price(**overrides):
+    values = {
+        "status": "accepted_direct",
+        "selected_route": "direct_base",
+        "display_amount": 86.03398169336384,
+        "display_currency": CHAOS,
+        "selected_price": 86.03398169336384,
+        "selected_currency": CHAOS,
+    }
+    values.update(overrides)
+    return Mock(**values)
+
+
+def test_reference_price_panel_prefers_official_price_and_keeps_ninja_context(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE1, "poetore": {}})
+    key = ("official",)
+    ninja = PoeNinjaPrice(
+        "Omen of Amelioration", None, 104.5, (0, 2, 4),
+        "https://poe.ninja/example", 370.8,
+    )
+    official = _official_price(
+        display_amount=1.25,
+        display_currency=DIVINE,
+        selected_price=463.5,
+        selected_currency=CHAOS,
+    )
+    try:
+        window._poe_ninja_item_key = key
+        window._show_reference_price(key, ninja, official)
+
+        assert window.poe_ninja_price_label.text() == "カレンシー交換 直近価格"
+        assert (
+            "公式Currency Exchangeで直近24時間以内に取引が成立した"
+            "最新1時間の平均価格"
+            in window.poe_ninja_price_label.toolTip()
+        )
+        assert window.poe_ninja_price_value.text() == "1.2"
+        assert window.poe_ninja_currency_icon.toolTip() == "Divine Orb"
+        assert "poe.ninja 7日推移" in window.poe_ninja_trend_label.text()
+        assert window.poe_ninja_trend_chart._points == (0, 2, 4)
+        assert window._last_poe_ninja_url == "https://poe.ninja/example"
+        assert not window.poe_ninja_open_button.isHidden()
+    finally:
+        window.close()
+
+
+def test_reference_price_panel_uses_poe2_exalted_official_price(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    key = ("official-poe2",)
+    ninja = PoeNinjaPrice(
+        "Liquid Verisium", None, 26.2, (), "https://poe.ninja/example", 492.4,
+        quote_amount=26.2, quote_currency="exalted",
+    )
+    official = _official_price(
+        display_amount=28.839236303265082,
+        display_currency=EXALTED,
+        selected_price=28.839236303265082,
+        selected_currency=EXALTED,
+    )
+    try:
+        window._poe_ninja_item_key = key
+        window._show_reference_price(key, ninja, official)
+        assert window.poe_ninja_price_value.text() == "29"
+        assert window.poe_ninja_currency_icon.toolTip() == "Exalted Orb"
+    finally:
+        window.close()
+
+
+def test_reference_price_panel_labels_ninja_fallback_as_reference(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE1, "poetore": {}})
+    key = ("fallback",)
+    ninja = PoeNinjaPrice(
+        "Test Item", None, 42, (), "https://poe.ninja/example", 200,
+    )
+    official = _official_price(
+        status="poe_ninja_fallback",
+        selected_route="poe_ninja",
+        display_amount=42,
+        display_currency=CHAOS,
+    )
+    try:
+        window._poe_ninja_item_key = key
+        window._show_reference_price(key, ninja, official)
+        assert window.poe_ninja_price_label.text() == "poe.ninja 参考価格"
+        assert "直近価格が未確定" in window.poe_ninja_price_label.toolTip()
+        assert window.poe_ninja_price_value.text() == "42"
+        assert window.poe_ninja_currency_icon.toolTip() == "Chaos Orb"
+    finally:
+        window.close()
+
+
+def test_reference_price_panel_labels_syncing_exchange_item_as_reference(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE1, "poetore": {}})
+    key = ("syncing",)
+    ninja = PoeNinjaPrice(
+        "Test Item", None, 42, (), "https://poe.ninja/example", 200,
+    )
+    try:
+        window._poe_ninja_item_key = key
+        window._show_reference_price(key, ninja, None, official_expected=True)
+        assert window.poe_ninja_price_label.text() == "poe.ninja 参考価格"
+        assert "カレンシー交換の直近価格が未確定" in (
+            window.poe_ninja_price_label.toolTip()
+        )
+    finally:
+        window.close()
+
+
+def test_reference_price_panel_keeps_legacy_ninja_label_for_non_exchange_item(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE1, "poetore": {}})
+    key = ("non-exchange",)
+    ninja = PoeNinjaPrice(
+        "Mageblood", None, 40000, (), "https://poe.ninja/example", 200,
+    )
+    try:
+        window._poe_ninja_item_key = key
+        window._show_reference_price(key, ninja, None)
+        assert window.poe_ninja_price_label.text() == "poe.ninja 参考価格"
+        assert "Currency Exchange対象外" in (
+            window.poe_ninja_price_label.toolTip()
+        )
+        assert window.poe_ninja_price_value.text() == "200"
+    finally:
+        window.close()
+
+
+def test_reference_price_panel_can_show_official_price_without_ninja(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    key = ("official-only",)
+    official = _official_price(
+        status="accepted_divine",
+        selected_route="direct_divine",
+        display_amount=0.5,
+        display_currency=DIVINE,
+        selected_price=0.5,
+        selected_currency=DIVINE,
+    )
+    try:
+        window._poe_ninja_item_key = key
+        window._show_reference_price(key, None, official)
+        assert not window.poe_ninja_price_panel.isHidden()
+        assert window.poe_ninja_price_label.text() == "カレンシー交換 直近価格"
+        assert window.poe_ninja_price_value.text() == "0.5"
+        assert window.poe_ninja_currency_icon.toolTip() == "Divine Orb"
+        assert window.poe_ninja_trend_chart._points == ()
+        assert window.poe_ninja_open_button.isHidden()
+    finally:
+        window.close()
+
+
+def test_primary_price_queue_reaches_official_display_for_poe1_exchange_item(
+    qapp, monkeypatch,
+):
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr("src.poetore.ui.threading.Thread", ImmediateThread)
+    window = PoetoreWindow(app_config={"poe_version": POE1, "poetore": {}})
+    item = ParsedItem("Currency", "normal", "", "Chaos Orb", "currency")
+    ninja = PoeNinjaPrice(
+        "Chaos Orb", None, 1, (), "https://poe.ninja/example", 200,
+    )
+    official = _official_price(display_amount=1, display_currency=CHAOS)
+    try:
+        window._auto_league = "Allflame"
+        window._trade_item_name = "Chaos Orb"
+        window._trade_base_type = "Chaos Orb"
+        with (
+            patch.object(default_poe_ninja_service, "lookup", return_value=ninja),
+            patch.object(window, "_lookup_related_items", return_value=()),
+            patch.object(window, "_queue_divine_rate"),
+            patch.object(window, "_record_official_exchange_shadow", return_value=official),
+        ):
+            window._queue_poe_ninja_price(item)
+        assert window.poe_ninja_price_label.text() == "カレンシー交換 直近価格"
+        assert window.poe_ninja_price_value.text() == "1"
+        assert window.poe_ninja_currency_icon.toolTip() == "Chaos Orb"
+    finally:
+        window.close()
+
+
+def test_related_prices_resolve_even_when_primary_ninja_lookup_fails(
+    qapp, monkeypatch,
+):
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr("src.poetore.ui.threading.Thread", ImmediateThread)
+    window = PoetoreWindow(app_config={"poe_version": POE1, "poetore": {}})
+    item = ParsedItem("Currency", "normal", "", "Chaos Orb", "currency")
+    related = {
+        "query": (), "items": (), "query_label": "関連素材・同系統",
+        "current": ("ITEM", "chaos orb"),
+    }
+    try:
+        window._auto_league = "Allflame"
+        window._trade_item_name = "Chaos Orb"
+        window._trade_base_type = "Chaos Orb"
+        with (
+            patch.object(
+                default_poe_ninja_service, "lookup",
+                side_effect=RuntimeError("offline"),
+            ),
+            patch.object(
+                window, "_lookup_related_items", return_value=related,
+            ) as lookup_related,
+            patch.object(window, "_queue_divine_rate"),
+            patch.object(window, "_record_official_exchange_shadow", return_value=None),
+        ):
+            emitted = []
+            window._trade_signals.related_items_ready.connect(
+                lambda emitted_key, value: emitted.append((emitted_key, value))
+            )
+            window._queue_poe_ninja_price(item)
+
+        lookup_related.assert_called_once_with(item, "Allflame")
+        assert len(emitted) == 1
+        assert emitted[0][1] == related
+    finally:
+        window.close()
+
+
+def test_primary_price_queue_uses_official_when_ninja_lookup_fails(qapp, monkeypatch):
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr("src.poetore.ui.threading.Thread", ImmediateThread)
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    item = ParsedItem("Currency", "normal", "", "Liquid Verisium", "currency")
+    official = _official_price(
+        display_amount=28.8,
+        display_currency=EXALTED,
+        selected_price=28.8,
+        selected_currency=EXALTED,
+    )
+    try:
+        window._auto_league = "Forbidden Rites"
+        window._trade_item_name = "Liquid Verisium"
+        window._trade_base_type = "Liquid Verisium"
+        with (
+            patch.object(
+                default_poe_ninja_service,
+                "lookup_poe2_exchange",
+                side_effect=RuntimeError("offline"),
+            ),
+            patch.object(window, "_queue_divine_rate"),
+            patch.object(window, "_record_official_exchange_shadow", return_value=official),
+        ):
+            window._queue_poe_ninja_price(item)
+        assert window.poe_ninja_price_label.text() == "カレンシー交換 直近価格"
+        assert window.poe_ninja_price_value.text() == "29"
+        assert window.poe_ninja_open_button.isHidden()
+    finally:
+        window.close()
+
+
+def test_completed_official_sync_refreshes_current_item_only_for_active_context(qapp):
+    window = PoetoreWindow(app_config={"poe_version": POE2, "poetore": {}})
+    item = ParsedItem("Currency", "normal", "", "Liquid Verisium", "currency")
+    try:
+        window._auto_league = "Forbidden Rites"
+        window._parsed_item = item
+        window._poe_ninja_item_key = ("old",)
+        window._divine_rate_key = "Forbidden Rites"
+        with patch.object(window, "_queue_poe_ninja_price") as refresh:
+            window._refresh_reference_price_after_official_sync(
+                POE2, "Forbidden Rites",
+            )
+            refresh.assert_called_once_with(item)
+            assert window._poe_ninja_item_key is None
+            assert window._divine_rate_key is None
+
+            refresh.reset_mock()
+            window._refresh_reference_price_after_official_sync(POE1, "Allflame")
+            refresh.assert_not_called()
     finally:
         window.close()

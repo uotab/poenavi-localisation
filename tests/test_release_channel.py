@@ -103,7 +103,7 @@ def test_release_workflow_requires_curated_versioned_notes():
     workflow = (root / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
-    assert APP_VERSION == "2.6.4"
+    assert APP_VERSION == "4.5.0"
     notes = root / "docs" / "releases" / f"v{APP_VERSION}.md"
 
     assert notes.is_file()

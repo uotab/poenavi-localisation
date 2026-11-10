@@ -28,8 +28,6 @@ def write_default_config(app_dir: Path, overrides=None):
         "poe_version": "poe1",
         "poe_version_mode": "ask",
         "text_color": "#e9ffbd",
-        "guide_detail_level": "beginner",
-        "guide_detail_level_selected": False,
         "always_on_top": True,
         "notified_update_version": "",
     }
@@ -141,34 +139,6 @@ class ConfigManagerTest(unittest.TestCase):
             self.assertEqual(loaded["hotkeys"]["cheat_sheets_toggle"], "none")
             self.assertEqual(loaded["hotkeys"]["poetore_capture"], "Alt+Q")
 
-    def test_schema_v4_moves_known_old_defaults_to_new_exit_binding(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            app_dir = Path(tmp) / "app"
-            user_dir = Path(tmp) / "user-data"
-            app_dir.mkdir()
-            user_dir.mkdir()
-            write_default_config(app_dir)
-            (user_dir / ConfigManager.CONFIG_FILE).write_text(
-                json.dumps({
-                    "schemaVersion": 4,
-                    "hotkeys": {
-                        "undo_lap": "F10",
-                        "search_string_test": "F4",
-                    },
-                }),
-                encoding="utf-8",
-            )
-
-            with patch.dict(
-                os.environ,
-                {ConfigManager.ENV_USER_DATA_DIR: str(user_dir)},
-            ), patch.object(ConfigManager, "get_app_dir", return_value=app_dir):
-                loaded = ConfigManager.load_config()
-
-            self.assertEqual(loaded["hotkeys"]["undo_lap"], "none")
-            self.assertEqual(loaded["hotkeys"]["search_string_test"], "none")
-            self.assertEqual(loaded["hotkeys"]["exit"], "F4")
-
     def test_schema_v4_adds_standard_mode_to_localized_schema_v3_config(self):
         migrated = ConfigManager._migrate_config({
             "schemaVersion": 3,
@@ -186,7 +156,277 @@ class ConfigManagerTest(unittest.TestCase):
         self.assertEqual(migrated["mini_guide_overlay"]["width"], 800)
         self.assertEqual(migrated["mini_guide_overlay"]["height"], 130)
 
-    def test_schema_v4_adds_standard_mode_without_changing_existing_geometry(self):
+    def test_schema_v19_adds_distinct_exchange_rate_defaults(self):
+        migrated = ConfigManager._migrate_config({"schemaVersion": 18})
+
+        assert migrated["schemaVersion"] == ConfigManager.CURRENT_SCHEMA_VERSION
+        assert migrated["poetore"]["exchange_rate_pairs"] == {
+            "poe1": [{
+                "left_item_id": "Metadata/Items/Currency/CurrencyModValues",
+                "right_item_id": "Metadata/Items/Currency/CurrencyRerollRare",
+            }],
+            "poe2": [{
+                "left_item_id": "Metadata/Items/Currency/CurrencyModValues",
+                "right_item_id": "Metadata/Items/Currency/CurrencyAddModToRare",
+            }],
+        }
+
+    def test_schema_v19_preserves_explicit_empty_exchange_rate_lists(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 19,
+            "poetore": {"exchange_rate_pairs": {"poe1": [], "poe2": []}},
+        })
+
+        assert migrated["poetore"]["exchange_rate_pairs"] == {
+            "poe1": [],
+            "poe2": [],
+        }
+
+    def test_schema_v15_makes_legacy_topmost_default_poe_only(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 14,
+            "mini_guide_overlay": {"always_on_top": True},
+        })
+
+        self.assertEqual(migrated["mini_guide_overlay"]["topmost_mode"], "poe_only")
+        self.assertNotIn("always_on_top", migrated["mini_guide_overlay"])
+
+    def test_schema_v15_preserves_legacy_topmost_off_as_never(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 14,
+            "mini_guide_overlay": {"always_on_top": False},
+        })
+
+        self.assertEqual(migrated["mini_guide_overlay"]["topmost_mode"], "never")
+
+    def test_schema_v14_resets_cheat_sheet_transparency_to_new_defaults(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 13,
+            "cheat_sheets": {
+                "images": [{"id": "saved", "filename": "saved.png"}],
+                "image_transparency": 25,
+                "background_transparency": 60,
+            },
+        })
+
+        self.assertEqual(migrated["cheat_sheets"]["image_transparency"], 100)
+        self.assertEqual(migrated["cheat_sheets"]["background_transparency"], 0)
+
+    def test_schema_v11_removes_retired_guide_detail_selection(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 10,
+            "guide_detail_level": "intermediate",
+            "guide_detail_level_selected": True,
+        })
+
+        self.assertNotIn("guide_detail_level", migrated)
+        self.assertNotIn("guide_detail_level_selected", migrated)
+        self.assertEqual(migrated["schemaVersion"], ConfigManager.CURRENT_SCHEMA_VERSION)
+
+    def test_schema_v13_preserves_legacy_cheat_sheet_opacity_appearance(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 11,
+            "cheat_sheets": {
+                "opacity": 75,
+                "background_opacity": 40,
+                "image_transparency": 0,
+                "background_transparency": 100,
+            },
+        })
+
+        self.assertEqual(migrated["cheat_sheets"]["image_transparency"], 75)
+        self.assertEqual(migrated["cheat_sheets"]["background_transparency"], 40)
+        self.assertNotIn("opacity", migrated["cheat_sheets"])
+        self.assertNotIn("background_opacity", migrated["cheat_sheets"])
+
+    def test_schema_v13_uses_transparent_background_for_pre_feature_config(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 11,
+            "cheat_sheets": {
+                "opacity": 100,
+                "background_transparency": 100,
+            },
+        })
+
+        self.assertEqual(migrated["cheat_sheets"]["image_transparency"], 100)
+        self.assertEqual(migrated["cheat_sheets"]["background_transparency"], 0)
+
+    def test_schema_v13_reverses_schema_v12_values_without_changing_appearance(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 12,
+            "cheat_sheets": {
+                "image_transparency": 25,
+                "background_transparency": 60,
+            },
+        })
+
+        self.assertEqual(migrated["cheat_sheets"]["image_transparency"], 75)
+        self.assertEqual(migrated["cheat_sheets"]["background_transparency"], 40)
+
+    def test_schema_v10_removes_retired_hideout_hotkey(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 9,
+            "hotkeys": {"hideout": "F11", "monastery": "F12"},
+        })
+
+        self.assertNotIn("hideout", migrated["hotkeys"])
+        self.assertEqual(migrated["hotkeys"]["monastery"], "F12")
+
+    def test_schema_v8_adds_startup_mode_defaults(self):
+        migrated = ConfigManager._migrate_config({"schemaVersion": 7})
+
+        self.assertEqual(
+            migrated["startup"],
+            {
+                "preferred_mode": "poenavi",
+                "show_mode_selector": True,
+                "windows_autostart_poetore": False,
+            },
+        )
+
+    def test_schema_v16_adds_disabled_windows_poetore_autostart(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 15,
+            "startup": {
+                "preferred_mode": "poetore",
+                "show_mode_selector": False,
+            },
+        })
+
+        self.assertEqual(
+            migrated["schemaVersion"], ConfigManager.CURRENT_SCHEMA_VERSION
+        )
+        self.assertEqual(
+            migrated["startup"],
+            {
+                "preferred_mode": "poetore",
+                "show_mode_selector": False,
+                "windows_autostart_poetore": False,
+            },
+        )
+
+    def test_schema_v17_migrates_expedition_enabled_to_shared_screen_reading(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 16,
+            "hotkeys": {"expedition_reward_ocr": "alt+e"},
+            "poetore": {
+                "expedition_reward_overlay": {
+                    "enabled": True,
+                    "region": {"left": .1, "top": .2, "right": .5, "bottom": .8},
+                },
+            },
+        })
+        assert migrated["schemaVersion"] == ConfigManager.CURRENT_SCHEMA_VERSION
+        assert migrated["poetore"]["screen_reading"] == {"enabled": True}
+        assert "enabled" not in migrated["poetore"]["expedition_reward_overlay"]
+        assert migrated["poetore"]["desecration_tier_overlay"] == {}
+        assert migrated["hotkeys"]["desecration_tier_ocr"] == "alt+r"
+
+    def test_withdrawn_shared_ocr_hotkey_is_left_untouched_without_reverse_migration(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 18,
+            "hotkeys": {"screen_reading_ocr": "ctrl+shift+r"},
+        })
+
+        assert migrated["schemaVersion"] == ConfigManager.CURRENT_SCHEMA_VERSION
+        assert migrated["hotkeys"] == {
+            "screen_reading_ocr": "ctrl+shift+r",
+            "heist_curio_ocr": "alt+e",
+        }
+
+    def test_v432_config_gets_separate_default_hotkeys_without_reverse_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp) / "app"
+            user_dir = Path(tmp) / "user-data"
+            app_dir.mkdir()
+            user_dir.mkdir()
+            write_default_config(app_dir, {
+                "hotkeys": {
+                    "expedition_reward_ocr": "alt+e",
+                    "desecration_tier_ocr": "alt+r",
+                },
+            })
+            config_path = user_dir / ConfigManager.CONFIG_FILE
+            config_path.write_text(json.dumps({
+                "schemaVersion": 18,
+                "hotkeys": {"screen_reading_ocr": "ctrl+shift+r"},
+            }), encoding="utf-8")
+
+            with patch.dict(os.environ, {ConfigManager.ENV_USER_DATA_DIR: str(user_dir)}), \
+                 patch.object(ConfigManager, "get_app_dir", return_value=app_dir):
+                loaded = ConfigManager.load_config()
+
+            assert loaded["schemaVersion"] == ConfigManager.CURRENT_SCHEMA_VERSION
+            assert loaded["hotkeys"]["screen_reading_ocr"] == "ctrl+shift+r"
+            assert loaded["hotkeys"]["expedition_reward_ocr"] == "alt+e"
+            assert loaded["hotkeys"]["desecration_tier_ocr"] == "alt+r"
+
+    def test_schema_v16_preserves_enabled_windows_poetore_autostart(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 15,
+            "startup": {"windows_autostart_poetore": True},
+        })
+
+        self.assertTrue(migrated["startup"]["windows_autostart_poetore"])
+
+    def test_schema_v21_migrates_heist_to_manual_only_opt_in(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 20,
+            "hotkeys": {
+                "heist_curio_ocr": "alt+h",
+                "heist_curio_manual_ocr": "ctrl+shift+h",
+            },
+            "poetore": {},
+        })
+
+        assert migrated["schemaVersion"] == ConfigManager.CURRENT_SCHEMA_VERSION
+        assert migrated["hotkeys"]["heist_curio_ocr"] == "ctrl+shift+h"
+        assert "heist_curio_manual_ocr" not in migrated["hotkeys"]
+        assert migrated["poetore"]["heist_curio_ocr"] == {"enabled": False}
+
+    def test_schema_v22_replaces_only_unreleased_heist_default_hotkey(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 21,
+            "hotkeys": {"heist_curio_ocr": "alt+shift+h"},
+        })
+
+        assert migrated["schemaVersion"] == ConfigManager.CURRENT_SCHEMA_VERSION
+        assert migrated["hotkeys"]["heist_curio_ocr"] == "alt+e"
+
+    def test_schema_v22_preserves_custom_heist_hotkey(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 21,
+            "hotkeys": {"heist_curio_ocr": "ctrl+h"},
+        })
+
+        assert migrated["schemaVersion"] == ConfigManager.CURRENT_SCHEMA_VERSION
+        assert migrated["hotkeys"]["heist_curio_ocr"] == "ctrl+h"
+
+    def test_schema_v8_preserves_existing_startup_choice(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 7,
+            "startup": {
+                "preferred_mode": "poetore",
+                "show_mode_selector": False,
+            },
+        })
+
+        self.assertEqual(migrated["startup"]["preferred_mode"], "poetore")
+        self.assertFalse(migrated["startup"]["show_mode_selector"])
+
+    def test_schema_v9_removes_obsolete_setup_completed_flag(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 8,
+            "setup_completed": True,
+        })
+
+        self.assertNotIn("setup_completed", migrated)
+        self.assertEqual(
+            migrated["schemaVersion"],
+            ConfigManager.CURRENT_SCHEMA_VERSION,
+        )
+
+    def test_schema_v3_adds_standard_mode_without_changing_existing_geometry(self):
         migrated = ConfigManager._migrate_config({
             "schemaVersion": 2,
             "mini_guide_overlay": {
@@ -202,7 +442,7 @@ class ConfigManagerTest(unittest.TestCase):
         self.assertEqual(migrated["mini_guide_overlay"]["width"], 795)
         self.assertEqual(migrated["mini_guide_overlay"]["height"], 126)
 
-    def test_schema_v5_moves_old_default_f4_to_exit_without_overwriting_custom_hotkeys(self):
+    def test_old_default_hotkeys_are_migrated_to_current_defaults(self):
         migrated = ConfigManager._migrate_config({
             "schemaVersion": 4,
             "hotkeys": {
@@ -213,9 +453,87 @@ class ConfigManagerTest(unittest.TestCase):
         })
 
         self.assertEqual(migrated["hotkeys"]["undo_lap"], "none")
-        self.assertEqual(migrated["hotkeys"]["search_string_test"], "none")
-        self.assertEqual(migrated["hotkeys"]["exit"], "F4")
-        self.assertEqual(migrated["hotkeys"]["hideout"], "Ctrl+H")
+        self.assertEqual(migrated["hotkeys"]["search_string_test"], "F4")
+        self.assertEqual(migrated["hotkeys"]["exit"], "F5")
+        self.assertNotIn("hideout", migrated["hotkeys"])
+
+    def test_schema_v5_reassigns_only_v262_default_hotkeys(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 4,
+            "hotkeys": {
+                "lap": "F9",
+                "undo_lap": "none",
+                "logout": "F5",
+                "exit": "F4",
+                "search_string_test": "none",
+                "hideout": "Ctrl+H",
+            },
+        })
+
+        self.assertEqual(migrated["hotkeys"]["lap"], "none")
+        self.assertEqual(migrated["hotkeys"]["undo_lap"], "none")
+        self.assertEqual(migrated["hotkeys"]["logout"], "none")
+        self.assertEqual(migrated["hotkeys"]["exit"], "F5")
+        self.assertEqual(migrated["hotkeys"]["search_string_test"], "F4")
+        self.assertNotIn("hideout", migrated["hotkeys"])
+
+    def test_schema_v5_preserves_custom_hotkeys(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 4,
+            "hotkeys": {
+                "lap": "Ctrl+L",
+                "undo_lap": "Ctrl+U",
+                "logout": "Ctrl+Q",
+                "exit": "Ctrl+E",
+                "search_string_test": "Ctrl+S",
+            },
+        })
+
+        self.assertEqual(migrated["hotkeys"]["lap"], "Ctrl+L")
+        self.assertEqual(migrated["hotkeys"]["undo_lap"], "Ctrl+U")
+        self.assertEqual(migrated["hotkeys"]["logout"], "Ctrl+Q")
+        self.assertEqual(migrated["hotkeys"]["exit"], "Ctrl+E")
+        self.assertEqual(migrated["hotkeys"]["search_string_test"], "Ctrl+S")
+
+    def test_old_capslock_gem_shop_default_reaches_current_f2_default(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 5,
+            "hotkeys": {"gem_shop_search": "CapsLock"},
+        })
+
+        self.assertEqual(migrated["hotkeys"]["gem_shop_search"], "F2")
+
+    def test_schema_v6_preserves_custom_gem_shop_hotkey(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 5,
+            "hotkeys": {"gem_shop_search": "F2"},
+        })
+
+        self.assertEqual(migrated["hotkeys"]["gem_shop_search"], "F2")
+
+    def test_schema_v7_moves_left_alt_to_f2_and_clears_conflicting_hideout(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 6,
+            "hotkeys": {
+                "gem_shop_search": "Left Alt",
+                "hideout": "F2",
+            },
+        })
+
+        self.assertEqual(migrated["hotkeys"]["gem_shop_search"], "F2")
+        self.assertNotIn("hideout", migrated["hotkeys"])
+
+    def test_schema_v7_preserves_custom_gem_shop_and_hideout_hotkeys(self):
+        migrated = ConfigManager._migrate_config({
+            "schemaVersion": 6,
+            "hotkeys": {
+                "gem_shop_search": "F3",
+                "hideout": "F2",
+            },
+        })
+
+        self.assertEqual(migrated["hotkeys"]["gem_shop_search"], "F3")
+        self.assertNotIn("hideout", migrated["hotkeys"])
 
     def test_schema_v3_migrates_only_old_mini_navi_defaults(self):
         migrated = ConfigManager._migrate_config({
@@ -308,6 +626,28 @@ class ConfigManagerTest(unittest.TestCase):
             self.assertEqual(persisted["mini_guide_overlay"], loaded["mini_guide_overlay"])
             self.assertEqual(persisted["schemaVersion"], ConfigManager.CURRENT_SCHEMA_VERSION)
 
+    def test_load_config_preserves_explicit_empty_exchange_rate_lists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp) / "app"
+            user_dir = Path(tmp) / "user-data"
+            app_dir.mkdir()
+            user_dir.mkdir()
+            write_default_config(app_dir)
+            config_path = user_dir / ConfigManager.CONFIG_FILE
+            config_path.write_text(json.dumps({
+                "schemaVersion": 19,
+                "poetore": {"exchange_rate_pairs": {"poe1": [], "poe2": []}},
+            }), encoding="utf-8")
+
+            with patch.dict(os.environ, {ConfigManager.ENV_USER_DATA_DIR: str(user_dir)}), \
+                 patch.object(ConfigManager, "get_app_dir", return_value=app_dir):
+                loaded = ConfigManager.load_config()
+
+            assert loaded["poetore"]["exchange_rate_pairs"] == {
+                "poe1": [],
+                "poe2": [],
+            }
+
     def test_save_and_load_uses_user_data_dir_override(self):
         with tempfile.TemporaryDirectory() as tmp:
             app_dir = Path(tmp) / "app"
@@ -346,8 +686,6 @@ class ConfigManagerTest(unittest.TestCase):
                 self.assertEqual(loaded["hotkeys"]["start_stop"], "F7")
                 self.assertEqual(loaded["hotkeys"]["reset"], "F2")
                 self.assertEqual(loaded["text_color"], "#abcdef")
-                self.assertEqual(loaded["guide_detail_level"], "beginner")
-                self.assertFalse(loaded["guide_detail_level_selected"])
                 self.assertTrue(loaded["always_on_top"])
                 self.assertEqual(loaded["notified_update_version"], "")
                 self.assertEqual(loaded["schemaVersion"], ConfigManager.CURRENT_SCHEMA_VERSION)

@@ -15,11 +15,9 @@ from PySide6.QtWidgets import (
 
 from src.ui.gem_tracker_widget import GemTrackerWidget, PoBSkillSetSelectionDialog
 from src.ui.cheat_sheets import CheatSheetManagerDialog, CheatSheetOverlay
-from src.ui.main_window import (
-    GuideDetailLevelSelectionDialog,
-    MainWindow,
-    VendorSearchPresetDialog,
-)
+from src.ui.main_window import MainWindow
+from src.ui.startup_dialogs import RouteSelectionDialog, StartupSelectionDialog
+from src.ui.vendor_search_dialog import VendorSearchPresetDialog
 from src.ui.settings_dialog import SettingsDialog
 from src.poetore.poe_ninja import PoeNinjaPrice
 from src.poetore.ui import PoetoreWindow
@@ -87,12 +85,12 @@ def test_main_window_chrome_constructs_in_english(qapp):
         patch.object(MainWindow, "_run_startup_update_gate", return_value=True),
         patch.object(MainWindow, "register_hotkeys"),
         patch.object(MainWindow, "_show_area_note_migration_notice_once"),
-        patch.object(MainWindow, "_check_first_run"),
         patch.object(MainWindow, "_restore_progress_flags"),
         patch.object(MainWindow, "_restore_timer_state"),
         patch("src.ui.main_window.ConfigManager.save_config"),
+        patch("src.ui.main_window.ConfigManager.load_config", return_value=config),
     ):
-        window = MainWindow(config=config)
+        window = MainWindow()
         try:
             _assert_no_japanese(_display_texts(window))
             tooltip = window.visit_btn.toolTip()
@@ -158,7 +156,8 @@ def test_gem_acquisition_badges_construct_in_english(qapp):
 def test_startup_and_pob_selection_dialogs_construct_in_english(qapp):
     set_locale(EN)
     dialogs = [
-        GuideDetailLevelSelectionDialog(),
+        StartupSelectionDialog(),
+        RouteSelectionDialog(config={}),
         PoBSkillSetSelectionDialog(
             [{"id": "campaign", "title": "Act 1", "active": True}]
         ),

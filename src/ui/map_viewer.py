@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QDialog,
     QScrollArea, QSizePolicy
 )
-from PySide6.QtCore import Qt, QSize, Signal, QPoint, QTimer
+from PySide6.QtCore import Qt, QSize, Signal, QPoint, QRect, QTimer
 from PySide6.QtGui import QPixmap, QCursor, QPainter
 
 
@@ -22,6 +22,35 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 # サムネイルサイズ
 THUMB_WIDTH = 100
 THUMB_HEIGHT = 75
+
+
+def geometry_inside_available_screens(
+    geometry: QRect, available_geometries: list[QRect],
+) -> QRect:
+    """Place the whole map viewer inside the nearest monitor work area."""
+    if not available_geometries:
+        return QRect(geometry)
+    center = geometry.center()
+    intersecting = [
+        available for available in available_geometries
+        if available.intersects(geometry)
+    ]
+    candidates = intersecting or available_geometries
+    target = min(
+        candidates,
+        key=lambda available: (
+            available.center().x() - center.x()
+        ) ** 2 + (
+            available.center().y() - center.y()
+        ) ** 2,
+    )
+    width = min(geometry.width(), target.width())
+    height = min(geometry.height(), target.height())
+    max_x = target.right() - width + 1
+    max_y = target.bottom() - height + 1
+    x = min(max(geometry.x(), target.left()), max_x)
+    y = min(max(geometry.y(), target.top()), max_y)
+    return QRect(x, y, width, height)
 
 
 def get_maps_dir():
@@ -141,8 +170,7 @@ class MapImageDialog(QDialog):
         layout.setContentsMargins(10, 10, 10, 10)
         
         self.notice_label = QLabel(
-            tr_ui("実際のレイアウトは、ワールドマップ上の隣接エリアとの位置関係に依存してランダムに変動します。\n"
-            "そのため、上下または左右に反転したレイアウトや、90度回転したようなレイアウトになることがあります。")
+            tr_ui("リーグ毎でPoE2はマップ構造自体が大きく変わり、掲載画像が現行リーグと異なる場合があるため、参考情報としてご利用ください。")
         )
         self.notice_label.setWordWrap(True)
         self.notice_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -216,7 +244,15 @@ class MapImageDialog(QDialog):
             QTimer.singleShot(10, lambda: self._apply_position(pos))
 
     def _apply_position(self, pos):
-        self.move(pos)
+        from PySide6.QtWidgets import QApplication
+        geometry = QRect(pos, self.size())
+        corrected = geometry_inside_available_screens(
+            geometry,
+            [screen.availableGeometry() for screen in QApplication.screens()],
+        )
+        if corrected.size() != self.size():
+            self.resize(corrected.size())
+        self.move(corrected.topLeft())
         self.show()
 
     def resizeEvent(self, event):
@@ -368,6 +404,19 @@ class MapThumbnailWidget(QWidget):
         if self.auto_open and zone_changed and paths:
             self.open_first_map()
 
+
+    def show_detected_layout(self, image_path: str, uncertain: bool = False):
+        """自動判定したレイアウトを見出しに示し、拡大表示する。"""
+        if image_path not in self.current_paths:
+            return
+        number = self.current_paths.index(image_path) + 1
+        total = len(self.current_paths)
+        if uncertain:
+            text = tr_ui(f"🗺 マップレイアウト ({total}パターン) — 判定: {number}（不確実）")
+        else:
+            text = tr_ui(f"🗺 マップレイアウト ({total}パターン) — 判定: {number}")
+        self.header_label.setText(text)
+        self._on_thumb_clicked(image_path)
 
     def wheelEvent(self, event):
         """マップ上でホイールした時は横スクロールとして扱う。"""

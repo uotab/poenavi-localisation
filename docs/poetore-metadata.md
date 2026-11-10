@@ -9,12 +9,16 @@ PoE 1の武器・防具・装飾品について、日本語コピー文を共通
 新リーグ時の日英アイテム／Stat同期、pseudo差分、代表Trade API確認まで含む総合更新フローの
 実装前設計は`docs/poetore-league-data-update-plan.md`を参照する。
 
-## 情報源
+## 情報源と依存境界
 
-- Awakened PoE Trade: 共通ref、数値の良し悪し、Trade API ID、反転・完全一致ルール、
-  防具ベースの可変防御値範囲
+- PoENavi独自判断台帳 (`scripts/poetore-stat-rules.json`): 共通ref、数値の良し悪し、
+  反転・完全一致・小数精度・カテゴリ選択。Mod基盤の正本
 - RePoE: Tier範囲、必要レベル、Prefix/Suffix等の生成種別、ローカルstat判定
-- 日本語公式Trade API: 日本語matcherとTrade API stat ID
+- 日本語公式Trade API: 検索可能なstat IDと日本語matcher。Mod基盤の骨格
+- 日本語補完台帳 (`scripts/poetore-japanese-overrides.json`): 公式日本語APIの既知の
+  翻訳欠落だけを、確認済みの旧日本語文面で補完
+- Awakened PoE Trade: 独自台帳との比較監査、防具ベース、Gem、Unique固定Mod、関連品。
+  Mod基盤の生成入力には使わない
 
 生成物には各取得元URL、Awakenedのcommit、取得内容のSHA-256を記録する。
 `scripts/poetore-sources.lock.json`を開発時の入力正本とし、通常の再生成では取得内容が
@@ -33,11 +37,29 @@ PYTHONPATH=. python scripts/build_poetore_metadata.py
 - ルール、Tier、日本語matcher、曖昧matcher、未解決公式statの監査
 - 件数、重複stat ID、空matcher、10%超または100件超の大量削除検査
 - 候補データを使った全pytest回帰テスト
+- 前回確認済みの公式Stat一覧との差分（追加・削除・日本語文面変更）
+
+Awakened本家が取得不能でも、Mod基盤は次の経路で更新できる。この場合、既存の
+防具ベース・Gem・Unique・関連品の派生情報は保持し、Awakened比較監査だけを省略する。
+
+```bash
+PYTHONPATH=. python scripts/build_poetore_metadata.py --official-mods-only
+```
+
+独自判断台帳は通常の更新で自動上書きしない。初回分離に使った
+`scripts/extract_poetore_stat_rules.py`は、監査済みindexから台帳を再構築する保守用である。
+上流との差はレポートの`awakened_comparison`へ出し、確認せず正本へ取り込まない。
 
 ### リーグ更新時
 
-1. Awakenedを更新する場合は、レビュー対象commitへlockのURLと`revision`を変更する。
+1. 公式Trade API／RePoEを更新し、必要なら比較対象Awakenedのcommitも変更する。
 2. 次のdry-runで新しいSHA、差分レポート、全テスト結果を確認する。
+
+レポートの`official_trade_changes.added`が新リーグで増えたStat、
+`unresolved_japanese_stats`が独自台帳へ未登録のStat全体である。追加Statの仕様を確認して
+台帳へ反映した後、`--refresh-lock --apply`で公式Stat基準も同時に更新する。
+`japanese_overrides`には公式文面と実際に採用した補完文面を併記する。公式側で日本語が
+復旧した項目は、確認後に補完台帳から削除する。
 
 ```bash
 PYTHONPATH=. python scripts/build_poetore_metadata.py --refresh-lock
@@ -59,6 +81,7 @@ PYTHONPATH=. python scripts/build_poetore_metadata.py --refresh-lock --apply
 - 日本語matcher: `japanese`
 - Tier: `tier`, `minimum`, `maximum`, `required_level`, `generation`, `mod_id`
 - 防具ベース: `base_armour`配下の英語ベースタイプと`ar`／`ev`／`es`／`ward`の最小・最大値
+- 未鑑定Unique候補: `unique_icons`配下の英語Unique名とPoE公式CDNアイコンURL
 - 実アイテム解析: `stat_id`, `ref`, `confidence`, `roll_min/max`, `better`, `inverted`
 
 一致が一意なら確度1.0、同一日本語表記に複数候補があれば0.75、未解決は0.0とする。

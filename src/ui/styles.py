@@ -40,7 +40,7 @@ class Styles:
             border: 1px solid {TEXT_COLOR};
             border-radius: 4px;
             padding: 5px 10px;
-            font-family: 'Segoe UI', sans-serif;
+            font-family: 'Noto Sans JP', sans-serif;
             font-weight: bold;
         }}
         QPushButton:hover {{
@@ -55,7 +55,7 @@ class Styles:
     # ラップタイム表示用スタイル
     LAP_ITEM_BASE = f"""
         QLabel {{
-            font-family: 'Segoe UI', sans-serif;
+            font-family: 'Noto Sans JP', sans-serif;
             font-size: 14px;
             padding: 2px 8px;
         }}
@@ -63,7 +63,7 @@ class Styles:
     
     LAP_ITEM_COMPLETED = f"""
         QLabel {{
-            font-family: 'Segoe UI', sans-serif;
+            font-family: 'Noto Sans JP', sans-serif;
             font-size: 14px;
             padding: 2px 8px;
             color: rgba(176, 255, 123, 0.7);
@@ -72,7 +72,7 @@ class Styles:
     
     LAP_ITEM_CURRENT = f"""
         QLabel {{
-            font-family: 'Segoe UI', sans-serif;
+            font-family: 'Noto Sans JP', sans-serif;
             font-size: 14px;
             font-weight: bold;
             padding: 2px 8px;
@@ -124,27 +124,60 @@ class Styles:
     """
     
     @staticmethod
-    def apply_checkbox_style(checkbox):
+    def apply_checkbox_style(
+        checkbox, checked_color="#4488ff", *, match_native_indicator=False,
+    ):
         """Apply checkbox style with a proper checkmark icon."""
-        from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QIcon
-        from PySide6.QtCore import Qt, QSize
+        from PySide6.QtCore import QSize, Qt
+        from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+        from PySide6.QtWidgets import QStyle
+
+        border_width = 2
+        indicator_width = 18
+        indicator_height = 18
+        if match_native_indicator:
+            native_width = checkbox.style().pixelMetric(
+                QStyle.PixelMetric.PM_IndicatorWidth, None, checkbox,
+            )
+            native_height = checkbox.style().pixelMetric(
+                QStyle.PixelMetric.PM_IndicatorHeight, None, checkbox,
+            )
+            border_width = 1
+            indicator_width = max(1, native_width - (border_width * 2))
+            indicator_height = max(1, native_height - (border_width * 2))
+            checkbox.setProperty("poenaviNativeIndicatorWidth", native_width)
+            checkbox.setProperty("poenaviNativeIndicatorHeight", native_height)
+
         # Create checkmark pixmap
-        size = 18
-        pixmap = QPixmap(size, size)
-        pixmap.fill(QColor("#4488ff"))
+        pixmap = QPixmap(indicator_width, indicator_height)
+        checked_qcolor = QColor(checked_color)
+        pixmap.fill(checked_qcolor)
         painter = QPainter(pixmap)
-        pen = QPen(QColor("white"), 2.5)
+        pen_width = 2.5
+        if match_native_indicator:
+            pen_width = max(1.5, min(indicator_width, indicator_height) * 0.16)
+        pen = QPen(QColor("white"), pen_width)
         pen.setCapStyle(Qt.RoundCap)
         pen.setJoinStyle(Qt.RoundJoin)
         painter.setPen(pen)
         painter.setRenderHint(QPainter.Antialiasing)
         # Draw checkmark path
-        painter.drawLine(4, 9, 7, 13)
-        painter.drawLine(7, 13, 14, 5)
+        if match_native_indicator:
+            painter.drawLine(
+                round(indicator_width * 0.22), round(indicator_height * 0.50),
+                round(indicator_width * 0.40), round(indicator_height * 0.72),
+            )
+            painter.drawLine(
+                round(indicator_width * 0.40), round(indicator_height * 0.72),
+                round(indicator_width * 0.78), round(indicator_height * 0.28),
+            )
+        else:
+            painter.drawLine(4, 9, 7, 13)
+            painter.drawLine(7, 13, 14, 5)
         painter.end()
         
         # Unchecked pixmap (transparent with border - handled by stylesheet)
-        unchecked = QPixmap(size, size)
+        unchecked = QPixmap(indicator_width, indicator_height)
         unchecked.fill(QColor(0, 0, 0, 0))
         
         icon = QIcon()
@@ -154,9 +187,17 @@ class Styles:
         checkbox.setIconSize(QSize(0, 0))  # Hide icon, we use it only for indicator
         
         # Use stylesheet with image approach
-        import tempfile, os
+        import os
+        import tempfile
         tmp_dir = tempfile.gettempdir()
-        check_path = os.path.join(tmp_dir, "poenavi_check.png")
+        color_key = checked_qcolor.name().removeprefix("#")
+        size_suffix = (
+            f"_{indicator_width}x{indicator_height}"
+            if match_native_indicator else ""
+        )
+        check_path = os.path.join(
+            tmp_dir, f"poenavi_check_{color_key}{size_suffix}.png",
+        )
         pixmap.save(check_path)
         
         checkbox.setStyleSheet(f"""
@@ -164,23 +205,23 @@ class Styles:
                 color: {Styles.TEXT_COLOR}; font-size: 12px; spacing: 8px;
             }}
             QCheckBox::indicator {{
-                width: 18px; height: 18px;
-                border: 2px solid #888888;
+                width: {indicator_width}px; height: {indicator_height}px;
+                border: {border_width}px solid #888888;
                 border-radius: 3px;
                 background: transparent;
             }}
             QCheckBox::indicator:checked {{
                 image: url("{check_path.replace(os.sep, '/')}");
-                border: 2px solid #4488ff;
+                border: {border_width}px solid {checked_qcolor.name()};
             }}
             QCheckBox::indicator:unchecked:hover {{
-                border: 2px solid {Styles.TEXT_COLOR};
+                border: {border_width}px solid {Styles.TEXT_COLOR};
             }}
         """)
 
     LAP_ITEM_PENDING = f"""
         QLabel {{
-            font-family: 'Segoe UI', sans-serif;
+            font-family: 'Noto Sans JP', sans-serif;
             font-size: 14px;
             padding: 2px 8px;
             color: rgba(128, 128, 128, 0.6);

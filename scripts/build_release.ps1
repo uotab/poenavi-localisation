@@ -1,6 +1,7 @@
 param(
     [string]$Python = ".venv-build\Scripts\python.exe",
-    [string]$ReleaseRepository = $env:GITHUB_REPOSITORY
+    [string]$ReleaseRepository = $env:GITHUB_REPOSITORY,
+    [switch]$Diagnostic
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +17,7 @@ function Invoke-Python {
 }
 
 if ($Python -eq ".venv-build\Scripts\python.exe" -and -not (Test-Path $Python)) {
-    py -3 -m venv .venv-build
+    py -3.12 -m venv .venv-build
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to create .venv-build"
     }
@@ -51,10 +52,44 @@ function Resolve-ReleaseRepository {
 
 $ReleaseRepository = Resolve-ReleaseRepository $ReleaseRepository
 
-Invoke-Python -m pip install --upgrade pip setuptools wheel
-Invoke-Python -m pip install --upgrade -r requirements.txt pyinstaller pytest
+Invoke-Python -m pip install -r requirements-build.txt
 
 Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path build -Force | Out-Null
+
+dotnet publish tools\ExpeditionWindowsOcr\ExpeditionWindowsOcr.csproj `
+    --configuration Release `
+    --runtime win-x64 `
+    --self-contained true `
+    -p:PublishSingleFile=true `
+    -p:IncludeNativeLibrariesForSelfExtract=true `
+    --output build\expedition-windows-ocr
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to publish the self-contained Windows OCR helper"
+}
+if (-not (Test-Path build\expedition-windows-ocr\ExpeditionWindowsOcr.exe)) {
+    throw "Windows OCR helper was not published"
+}
+
+$appVersion = & $Python -c "from src.version import APP_VERSION; print(APP_VERSION)"
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($appVersion)) {
+    throw "Failed to read APP_VERSION"
+}
+$appVersion = $appVersion.Trim()
+
+Invoke-Python scripts\generate_windows_version_info.py `
+    --version $appVersion `
+    --description "PoENavi" `
+    --filename "PoENavi.exe" `
+    --output "build\version\PoENavi-version.txt"
+Invoke-Python scripts\generate_windows_version_info.py `
+    --version $appVersion `
+    --description "PoENavi Updater" `
+    --filename "PoENaviUpdater.exe" `
+    --output "build\version\PoENaviUpdater-version.txt"
+Invoke-Python scripts\collect_third_party_licenses.py `
+    --output "build\third-party-licenses"
+
 New-Item -ItemType Directory -Force build\generated | Out-Null
 $channelJson = @{ release_repository = $ReleaseRepository } | ConvertTo-Json -Compress
 Set-Content -Path build\generated\update_channel.json -Value $channelJson -Encoding ascii
@@ -65,6 +100,7 @@ $appArgs = @(
     "--noconfirm", "--clean", "--noupx", "--onedir", "--windowed",
     "--name", "PoENavi",
     "--icon", "assets\app\icon.ico",
+    "--version-file", "build\version\PoENavi-version.txt",
     "--distpath", "dist",
     "--workpath", "build\app",
     "--add-data", "assets\app\icon.ico;.",
@@ -78,6 +114,8 @@ $appArgs = @(
     "--add-data", "LICENSE;.",
     "--add-data", "README.md;.",
     "--add-data", "THIRD_PARTY_NOTICES.md;.",
+    "--add-data", "build\third-party-licenses;THIRD_PARTY_LICENSES",
+    "--add-data", "build\expedition-windows-ocr;tools\ExpeditionWindowsOcr",
     "--add-data", "data;data",
     "--add-data", "assets;assets",
     "--add-data", "maps;maps",
@@ -87,7 +125,9 @@ $appArgs = @(
     "--hidden-import", "pynput",
     "--hidden-import", "pynput.keyboard",
     "--hidden-import", "pynput.keyboard._win32",
-    "--hidden-import", "keyboard",
+    "--hidden-import", "miniaudio",
+    "--hidden-import", "_miniaudio",
+    "--hidden-import", "_cffi_backend",
     "main.py"
 )
 Invoke-Python @appArgs
@@ -97,6 +137,7 @@ $updaterArgs = @(
     "--noconfirm", "--clean", "--noupx", "--onefile", "--windowed",
     "--name", "PoENaviUpdater",
     "--icon", "assets\app\updater.ico",
+    "--version-file", "build\version\PoENaviUpdater-version.txt",
     "--distpath", "dist\PoENavi",
     "--workpath", "build\updater",
     "--add-data", "data\i18n;data\i18n",
@@ -121,10 +162,42 @@ if (-not ($channelCandidates | Where-Object { Test-Path $_ })) {
     throw "Build-generated update_channel.json was not packaged"
 }
 
-Remove-Item PoENavi.zip, PoENavi.zip.sha256 -ErrorAction SilentlyContinue
+$audioSmokeResult = Join-Path $repo "build\audio-smoke-result.txt"
+Remove-Item $audioSmokeResult -ErrorAction SilentlyContinue
+$env:POENAVI_AUDIO_SMOKE_RESULT = $audioSmokeResult
+try {
+    $audioSmokeProcess = Start-Process `
+        -FilePath (Resolve-Path "dist\PoENavi\PoENavi.exe") `
+        -ArgumentList "--audio-smoke-test" `
+        -Wait -PassThru
+}
+finally {
+    Remove-Item Env:\POENAVI_AUDIO_SMOKE_RESULT -ErrorAction SilentlyContinue
+}
+$audioSmokeDetails = if (Test-Path $audioSmokeResult) {
+    (Get-Content $audioSmokeResult -Raw).Trim()
+} else {
+    "result file was not created"
+}
+if ($audioSmokeProcess.ExitCode -ne 0 -or $audioSmokeDetails -ne "OK") {
+    throw "Packaged audio runtime smoke test failed: $audioSmokeDetails"
+}
+
+$artifactBase = if ($Diagnostic) { "PoENavi-diagnostic" } else { "PoENavi" }
+$zipName = "$artifactBase.zip"
+$shaName = "$zipName.sha256"
+$diagnosticFlag = "dist\PoENavi\expedition-diagnostics.flag"
+if ($Diagnostic) {
+    Set-Content -Path $diagnosticFlag -Value "friend-test diagnostics enabled" -Encoding ascii
+}
+elseif (Test-Path $diagnosticFlag) {
+    Remove-Item $diagnosticFlag -Force
+}
+
+Remove-Item $zipName, $shaName -ErrorAction SilentlyContinue
 $zipCreated = $false
 $zipAttempts = 60
-$zipCode = "import shutil; shutil.make_archive('PoENavi', 'zip', root_dir='dist', base_dir='PoENavi')"
+$zipCode = "import shutil; shutil.make_archive('$artifactBase', 'zip', root_dir='dist', base_dir='PoENavi')"
 for ($attempt = 1; $attempt -le $zipAttempts; $attempt++) {
     try {
         & $Python -c $zipCode
@@ -135,7 +208,7 @@ for ($attempt = 1; $attempt -le $zipAttempts; $attempt++) {
         break
     }
     catch {
-        Remove-Item PoENavi.zip -ErrorAction SilentlyContinue
+        Remove-Item $zipName -ErrorAction SilentlyContinue
         if ($attempt -eq $zipAttempts) {
             throw "PoENaviUpdater.exe remained locked for 3 minutes. Close PoENavi/PoENaviUpdater if running, then check Windows Security protection history or add the PoENavi build folder as a temporary exclusion before retrying. Original error: $($_.Exception.Message)"
         }
@@ -146,17 +219,57 @@ for ($attempt = 1; $attempt -le $zipAttempts; $attempt++) {
 }
 
 if (-not $zipCreated) {
-    throw "PoENavi.zip was not created"
+    throw "$zipName was not created"
 }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path PoENavi.zip))
+$archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipName))
 try {
     $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
-    foreach ($requiredName in @("LICENSE", "README.md", "THIRD_PARTY_NOTICES.md", "mod_metadata.json", "pseudo_relations.json", "pseudo_definitions.json")) {
+    foreach ($requiredName in @(
+        "LICENSE",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+        "THIRD_PARTY_LICENSES/README.md",
+        "THIRD_PARTY_LICENSES/Python-LICENSE.txt",
+        "ExpeditionWindowsOcr.exe",
+        "expedition_region_example.png",
+        "desecration_region_example.png",
+        "heist_curio_manual_selection_example.png",
+        "heist_curio_settings.png",
+        "expedition_ocr_items.json",
+        "desecration_tiers.json",
+        "mod_metadata.json",
+        "pseudo_relations.json",
+        "pseudo_definitions.json",
+        "map_mods.json",
+        "NotoSansJP[wght].ttf",
+        "ui-checkbox-checked.svg",
+        "ui-radio-checked.svg",
+        "TriskelionShattered.png",
+        "TriskelionReforged.png",
+        "MessageInABottle.png",
+        "hideout_focus_notification.wav",
+        "hideout_notification_2.wav",
+        "hideout_notification_3.wav",
+        "hideout_notification_4.wav",
+        "hideout_notification_5.mp3"
+    )) {
         if (-not ($entryNames | Where-Object { $_ -match "(^|/)$([regex]::Escape($requiredName))$" })) {
             throw "Release audit failed: missing $requiredName"
         }
+    }
+    $cffiBackendEntries = @($entryNames | Where-Object {
+        $_ -match "(^|/)_cffi_backend(?:\.[^/]+)?\.pyd$"
+    })
+    if ($cffiBackendEntries.Count -lt 1) {
+        throw "Release audit failed: missing _cffi_backend Python extension"
+    }
+    $thirdPartyLicenseFiles = @($entryNames | Where-Object {
+        $_ -match "(^|/)THIRD_PARTY_LICENSES/.+/(LICENSE|LICENCE|COPYING|NOTICE)"
+    })
+    if ($thirdPartyLicenseFiles.Count -lt 10) {
+        throw "Release audit failed: expected complete third-party license texts, found $($thirdPartyLicenseFiles.Count)"
     }
     $forbidden = @($entryNames | Where-Object {
         $_ -match "(^|/)(tests|build|__pycache__)/" -or
@@ -169,17 +282,33 @@ try {
     if ($null -eq $metadataEntry -or $metadataEntry.Length -gt 8MB) {
         throw "Release audit failed: mod_metadata.json is missing or exceeds 8 MiB"
     }
+    $hasDiagnosticFlag = @($entryNames | Where-Object {
+        $_ -match "(^|/)expedition-diagnostics\.flag$"
+    }).Count -gt 0
+    if ($Diagnostic -and -not $hasDiagnosticFlag) {
+        throw "Release audit failed: diagnostic marker is missing"
+    }
+    if (-not $Diagnostic -and $hasDiagnosticFlag) {
+        throw "Release audit failed: diagnostic marker leaked into normal release"
+    }
+    $totalUncompressed = ($archive.Entries | Measure-Object -Property Length -Sum).Sum
+    if ($totalUncompressed -gt 512MB) {
+        throw "Release audit failed: updater-compatible archive exceeds 512 MiB after extraction"
+    }
+    if ($entryNames | Where-Object { $_ -match "(^|/)(PoENaviNdlOcr\.exe|.+\.onnx)$" }) {
+        throw "Release audit failed: high-accuracy OCR runtime leaked into PoENavi.zip"
+    }
 }
 finally {
     $archive.Dispose()
 }
 
-$hash = (Get-FileHash PoENavi.zip -Algorithm SHA256).Hash.ToLower()
-Set-Content -Path PoENavi.zip.sha256 -Value "$hash  PoENavi.zip" -Encoding ascii
+$hash = (Get-FileHash $zipName -Algorithm SHA256).Hash.ToLower()
+Set-Content -Path $shaName -Value "$hash  $zipName" -Encoding ascii
 
-Write-Output "Built PoENavi"
-$zipPath = (Resolve-Path PoENavi.zip).Path
-$shaPath = (Resolve-Path PoENavi.zip.sha256).Path
+Write-Output "Built $artifactBase"
+$zipPath = (Resolve-Path $zipName).Path
+$shaPath = (Resolve-Path $shaName).Path
 Write-Output "Release artifacts (do not move or re-zip dist\\PoENavi):"
 Write-Output "  ZIP: $zipPath"
 Write-Output "  SHA256: $shaPath"

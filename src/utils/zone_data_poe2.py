@@ -243,7 +243,7 @@ DEFAULT_ZONE_DATA_POE2 = {
         {
             "id": "poe2_act3_area05",
             "zone": "アザク湿原",
-            "level": 36,
+            "level": 40,
             "zone_en": "The Azak Bog"
         },
         {
@@ -415,6 +415,12 @@ DEFAULT_ZONE_DATA_POE2 = {
             "zone": "部族の中心",
             "level": 53,
             "zone_en": "Heart of the Tribe"
+        },
+        {
+            "id": "poe2_act4_area17",
+            "zone": "略奪の岬",
+            "level": 0,
+            "zone_en": "Plunder's Point"
         }
     ],
     "幕間 1": [

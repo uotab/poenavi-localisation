@@ -30,6 +30,7 @@ DEFAULT_GUIDE = {
 
 _GUIDE_DATA_CACHE: dict[str, tuple[int, dict]] = {}
 
+
 def get_guide_dir():
     """ガイドデータファイルのディレクトリ（exeフォルダ優先 → _MEIPASS）"""
     if getattr(sys, 'frozen', False):
@@ -86,14 +87,23 @@ def save_guide_data(data: dict, poe_version: str = POE1, language: str = DEFAULT
     path = get_guide_path(poe_version, language)
     try:
         if (
-            poe_version == POE1
-            and os.environ.get("POENAVI_ACT1_GUIDE_DEV") == "1"
-            and os.path.exists(path)
-        ):
+            (
+                poe_version == POE1
+                and (
+                    os.environ.get("POENAVI_ACT1_GUIDE_DEV") == "1"
+                    or bool(os.environ.get("POENAVI_GUIDE_DEV_ZONE_ID", "").strip())
+                )
+            )
+            or (
+                poe_version != POE1
+                and os.environ.get("POENAVI_POE2_GUIDE_DEV") == "1"
+            )
+        ) and os.path.exists(path):
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            guide_stem = os.path.splitext(os.path.basename(path))[0]
             backup_path = os.path.join(
                 os.path.dirname(path),
-                f"guide_data.backup-before-act1-guide-edit-{timestamp}.json",
+                f"{guide_stem}.backup-before-guide-edit-{timestamp}.json",
             )
             shutil.copy2(path, backup_path)
             print(f"[GuideData] Backup: {backup_path}")
@@ -462,22 +472,10 @@ def _safe_html(text: str) -> str:
     return escaped
 
 
-def format_guide_html(guide: dict, font_size: int = 12, show_direction: bool = True, guide_detail_level: str = "beginner") -> str:
+def format_guide_html(guide: dict, font_size: int = 12, show_direction: bool = True) -> str:
     """ガイドデータをHTML形式にフォーマット"""
     if not guide:
         return ""
-    
-    summary = guide.get("summary", "")
-    if guide_detail_level == "intermediate" and summary:
-        summary_html = _safe_html(summary.strip()).replace("\n", "<br>")
-        summary_html = summary_html.replace("　", "&nbsp;&nbsp;")
-        summary_html = summary_html.replace("  ", "&nbsp;&nbsp;")
-        return (
-            f"<p style='margin:0;'>"
-            f"<b style='color:#b0ff7b; font-size:{font_size}px;'>{tr('guide.heading.summary')}</b><br>"
-            f"<span style='color:#ffffff;'>{summary_html}</span>"
-            f"</p>"
-        )
     
     parts = []
     

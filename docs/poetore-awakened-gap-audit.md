@@ -1,7 +1,7 @@
 # Awakened価格チェック機能 最終ギャップ監査
 
-監査日: 2026-07-21  
-比較対象: Awakened PoE Trade `fa31bfbbe99e04e386b4af2d71d633e2b6823c0f`
+監査日: 2026-07-31
+比較対象: Awakened PoE Trade `3c8e0320ab3ea22d6dccc6cad48b5efaf94d1fe2`
 
 ## 結論
 
@@ -11,8 +11,10 @@ Awakened相当まで実装済み。意図的に対象外とした旧Bulk Exchang
 
 専用Exactプリセットのカテゴリ別・初期ON/OFF監査は
 `docs/poetore-exact-preset-audit.md`を正本とする。
-今後のUI再設計、実機検証、保守性改善を含む残タスクは
-`docs/poetore-pending-tasks.md`を正本とする。
+値の境界、プリセット別の初期ON/OFF、ぽえとれ独自仕様まで含む規則単位の比較は
+`docs/poetore-awakened-filter-rule-audit.csv`を正本とし、解説は
+`docs/poetore-awakened-filter-rule-audit.md`を参照する。
+今後のUI再設計、実機検証、保守性改善は、現行コード・回帰テストとGitHub Issuesで管理する。
 
 判定基準:
 
@@ -31,6 +33,7 @@ Awakened相当まで実装済み。意図的に対象外とした旧Bulk Exchang
 - 通貨条件（任意、Chaos、Divine、Chaos＋Divine）
 - 件数、先頭出品、通貨別中央値、rate-limit表示
 - 429 `Retry-After`バックオフ
+- 関連素材・同系統／報酬・派生品のpoe.ninja参考価格一覧
 
 Awakenedとの差: リーグ内オンラインの細分化、販売者情報の詳細、
 アプリ側/API側の重複出品集約切替は未対応。
@@ -39,7 +42,7 @@ Awakenedとの差: リーグ内オンラインの細分化、販売者情報の�
 
 - 日本語ベースタイプ、レアリティ、ユニーク名
 - 完成品／クラフトベースのプリセット
-- item level、品質、ソケット、リンク、白ソケット
+- item level、品質、ソケット、リンク
 - 武器のtotal DPS／pDPS／eDPS／APS／crit（品質20%換算を含む）
 - 防具のArmour／Evasion／ES／Ward（ハイブリッドを含む）
 - 空きPrefix／Suffix
@@ -58,6 +61,7 @@ Magic JewelのAdorned向けrarity／corrupted厳密条件まで対応済み。
 - Anointment 470候補のOil構成とAwakened準拠の初期表示・選択規則
 - AND／NOT／COUNT検索グループのUI編集とTrade query生成
 - Veiled 20候補、Searing Exarch／Eater of Worlds状態、Eldritch等の生成元表示
+- Essence由来は「エッセンス」、Infamous由来は「悪名高い」と種別欄へ表示
 
 装備価格チェック範囲の差分は解消済み。Filled Coffin固有のNecropolis ModとImbued Gemは、
 後続の特殊アイテム／Gem対応側に残る。
@@ -75,14 +79,14 @@ Magic JewelのAdorned向けrarity／corrupted厳密条件まで対応済み。
 - crafted Chaos Resistance単独候補の非表示、crafted/通常Modの合算
 - 完成品とクラフトベースの候補分離、固定rollと初期選択規則
 
-詳細な実装タスクは `docs/poetore-pseudo-mod-tasks.md` を参照。
+現行のpseudo Mod定義と採否は生成済みメタデータと回帰テストを正本とする。
 
 ### 5. ユニーク・Variant・特殊状態 — 実装済み
 
 - 未鑑定ユニーク候補解決、Legacy discriminator選択
 - 固定Mod除外、可変Mod数による初期選択、完璧／低いほど良いroll
 - Corrupted、Mirrored、Split、Fractured、Synthesised
-- 1～2 Influence、Foil、Foulborn
+- 1～2 Influence、Foil、Foulborn、Vestigial（痕跡）
 - Enchant、特殊Implicit、Synthesised Implicitのstat ID経路
 - 未鑑定Watcher's Eyeのitem level固定
 - Agnerod系のitem levelを75／78／80／82へ正規化
@@ -131,8 +135,26 @@ Cluster Jewelはitem level帯、最適Passive数、Jewel Socket Mod非表示に�
 
 ## 優先度付き残課題
 
-専用Exactは、意図的な対象外5項目を除いてAwakened `fa31bfb` のカテゴリ分岐、
+専用Exactは、意図的な対象外5項目を除いてAwakened `3c8e032` のカテゴリ分岐、
 条件構成、初期ON/OFFへ準拠済み。
+
+## `fa31bfb`から`3c8e032`までの再監査
+
+価格チェックに関係する変更をコミット単位で確認した。
+
+- Essence／Infamous由来表示: 今回ぽえとれへ反映
+- Expedition Logbook解析修正、翻訳名を含むコピー解析、Trade option仕様変更、
+  3.29ゲームデータ更新: 2026-07-28のメタデータ更新・日本語詳細コピー対応で反映済み
+- 白ソケット専用フィルター削除: 今回ぽえとれへ反映
+- 詳細Modボタン操作不要化: ぽえとれは単一詳細コピーを直接取得するため対応済み
+- Captcha後のリーグ一覧取得: Awakened内蔵WebView固有。外部ブラウザ方式の
+  ぽえとれには適用しない
+- Trade結果キャッシュ時間修正: ぽえとれは独自の5分キャッシュであり、
+  Awakened旧6時間キャッシュ問題の影響を受けない
+- アイコンのclipping修正、サイトversion、既定設定: ぽえとれ機能への移植対象外
+
+この範囲で、Essence／Infamous表示以外に未反映だった新しい価格検索機能はない。
+関連アイテム価格一覧は`3c8e032`より前から存在する既存差分で、今回あわせて実装した。
 
 ## 総合判定
 
@@ -142,3 +164,25 @@ Cluster Jewelはitem level帯、最適Passive数、Jewel Socket Mod非表示に�
   Mod判断、pseudo、ユニーク、Gem、Map、Heist等に対応」
 
 この監査はソース比較であり、Windows実機の配布ZIP／Alt+D最終確認は別の未完了項目として残す。
+
+## 2026-08-10 追加同期
+
+リリース前監査としてAwakened PoE Trade `1e2225af8cfe04ccc5676d00eede81d7ee071240`
+（同日時点master）までを再比較した。内蔵WebView／Captcha、開発文書、中国語専用解析、
+内部リファクタリングはぽえとれへ直接移植する対象外とした。
+
+価格検索へ影響する差分は次のとおり反映した。
+
+- Stat台帳へ、公式日本語Trade APIにも存在する新規ID 315件を追加
+- `items.ndjson`由来のGem、Unique固定Mod・アイコン、透視のオーブを含むアイテム定義を更新
+- `item-drop.json`由来の関連ドロップ・派生品グループを更新
+- Area Modカタログは229件を維持（公式TradeのMapカテゴリに存在しない
+  `Unaffected by Poison`は誤分類として除外）
+- Standardの完成品検索だけSplit品を自動除外せず、Exact相当のベース検索は非Splitへ限定
+
+入力commit、取得URL、SHA-256は`scripts/poetore-sources.lock.json`へ固定し、復旧用原本は
+`vendor-sources/awakened-poe-trade-1e2225af.tar.gz`へ更新した。
+
+この同期ではChartを追加し、3種の海図、公式Tradeの全16海域、Area Level、数量、
+レアリティ、Pack Size、死人の硫黄、未鑑定、海図種別完全一致／同一海域検索へ対応した。
+Map／Chart BulkプリセットとMerchant出品集約は今回の対象外として維持する。

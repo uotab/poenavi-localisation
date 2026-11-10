@@ -2,307 +2,223 @@
 
 [日本語](README.md) | [English](README.en.md)
 
-PoENavi is a lightweight leveling guide and timer for Path of Exile 1 and
-Path of Exile 2. It watches the game’s `Client.txt` log, identifies area
-changes, and displays guides, map images, and an RTA timer.
+A Windows play-support tool for Path of Exile 1 and Path of Exile 2.
 
-> This product is not affiliated with or endorsed by Grinding Gear Games in
-> any way.
+At startup you choose between **PoENavi**, which supports campaign progression and levelling, and **Poetrieve**, which helps with item price checks and trade searches.
 
-## Features
+> [!IMPORTANT]
+> This product is not affiliated with or endorsed by Grinding Gear Games in any way.
 
-- PoE1 and PoE2 area guides with objectives, layout information, tips, and
-  basic direction arrows.
-- Map image thumbnails with click-to-zoom and keyboard navigation.
-- Mini Navi overlay for PoE1, including quests, bosses, waypoints, portals,
-  notes, and experience-level advice.
-- Automatic area detection from the PoE `Client.txt` log, including Japanese
-  and English client output.
-- RTA timer with automatic Act/lap transitions, manual controls, and saved
-  timer state.
-- Gem acquisition tracking from imported Path of Building data. Search text
-  remains canonical English so it can be pasted into the PoE search field.
-- Poetrieve price checking for PoE1 items through the official Trade API,
-  with optional poe.ninja reference prices.
-- Editable Japanese and English guide datasets. User notes, presets, imported
-  PoB data, and run history remain user-owned content.
+## PoENavi features
 
-## Installation
+- Automatic detection of area changes, level-ups and Act progression in PoE1 / PoE2
+- Campaign guides, map images and experience-efficiency hints
+- RTA timer with automatic laps
+- Compact "Mini Navi" overlay (PoE1 / PoE2)
+- Mini Navi voice guidance with VOICEVOX (PoE2)
+- Gem acquisition list generated from Path of Building (PoE1)
+- Area notes and detachable helper panels
+<img width="2314" height="1219" alt="poenavi2" src="https://github.com/user-attachments/assets/fa1232cb-707c-432d-b4cd-d08e8611ea9f" />
 
-Download the latest Windows release, extract `PoENavi.zip`, and launch
-`PoENavi.exe`. On the first run, choose 日本語 or English before the other
-startup dialogs. Existing installations remain Japanese unless a language is
-selected in Settings. Language changes take effect after restarting PoENavi.
+## Poetrieve features
 
-The application needs access to the PoE `Client.txt` file. Configure the log
-path in Settings if it is not detected automatically.
+- Parses items copied in game and searches them through the official Trade API (PoE1 / PoE2)
+- Adjust modifiers, value ranges, item states and search presets on screen
+- Price list, price trends and reference prices for related items
+- Configurable search hotkeys, with an interactive mode and AUTO-HIDE
+- Notes, image management and Cheat sheets
+- Dedicated search results window for OBS streaming
+- Map mod check (PoE1)
+- Reads Expedition rewards and shows poe.ninja prices converted to Exalted Orbs (PoE2)
+- Reads the Abyss desecrated modifier Unveil screen and shows each modifier's tier (PoE2)
+<img width="2090" height="1319" alt="poetore2" src="https://github.com/user-attachments/assets/9f3f0da0-d9be-42e8-831b-9eaf921207fa" />
 
-## Configuration and controls
+## Shared features
 
-Open Settings from the gear button or the tray/menu action. Configure PoE1 or
-PoE2, the client log paths, hotkeys, guide detail, timer size, overlays,
-window behavior, maps, routes, and language there.
+- Choose PoE1 / PoE2 and the PoENavi / Poetrieve startup mode
+- Minimise to and restore from the system tray
+- Automatic updates
+- Japanese or English interface (see [First-time setup](#first-time-setup))
 
-The default hotkeys are:
+Detailed feature explanations and illustrated how-to guides are available in these articles (Japanese):
 
-- `F7`: start/stop timer
-- `F8`: reset timer
-- `F9`: next Act/lap
-- Undo lap: unassigned
-- `F4`: return to Character Selection with `/exit`
-- `F5`: fast logout by disconnecting PoE's TCP connection
-- `F6`: toggle click-through
-- `F11`: `/hideout`
-- `F12`: `/monastery`
-- `Alt+D`: Poetrieve price check (PoE1)
-- `Shift+Space`: show or hide Cheat sheets
+- [How to use PoENavi](https://note.com/buri8857/n/nd1e6a07b8a29)
+- [How to use Poetrieve](https://note.com/buri8857/n/n8a5047edab08)
 
-The F5 TCP logout requires administrator privileges. F4 sends `/exit` through
-chat and does not disconnect the game connection.
+## Download
 
-### Cheat sheets
+1. Download the latest `PoENavi.zip` from [Releases](../../releases)
+2. Right-click the ZIP and extract it with Windows' built-in "Extract All"
+3. Run `PoENavi.exe` from the extracted folder
 
-Use the image button in the main window to add reference images, rename or
-remove them, choose the overlay opacity, and switch between them. PNG, JPEG,
-WebP, BMP, and GIF files are copied into PoENavi's user-data directory, so the
-overlay does not depend on the original file remaining in place. The overlay
-opens centered on the Path of Exile monitor and can be moved by dragging its
-image title.
+No Python installation is needed. Settings and notes are stored in `%APPDATA%\PoENavi\`, so they carry over when you update the app.
 
-### PoE1: Poetrieve price checking
+> [!WARNING]
+> The current release is not signed with a code-signing certificate. Because of the internal structure of PyInstaller apps and limited download history, SmartScreen warnings or false positives from some antivirus products may occur.
+>
+> If SmartScreen appears, confirm that the publisher and download source are this repository, then run it via "More info". If you are unsure, do not run it; start the app directly from the public source instead.
 
-With PoENavi running in PoE1 mode, hover over an item in your stash or
-inventory and press `Alt+D`. Poetrieve captures the item's normal and detailed
-copy text, then opens a price-check window where you can review the parsed
-item, modifiers, league, listing age, currency, and other search filters.
+### Virus scanning of release files
 
-Poetrieve is an independent implementation for the Japanese Path of Exile
-client, informed by the public specifications, UI, and search logic of
-[Awakened PoE Trade](https://github.com/SnosMe/awakened-poe-trade). Data
-sources and licenses are detailed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Each release's `PoENavi.zip` is scanned on VirusTotal, and the scan result URL and SHA-256 are posted on the corresponding Release page.
 
-Searches use the official Path of Exile Trade API, with poe.ninja prices shown
-as an additional reference where available. Identified Unique items can show
-roll-range sliders for adjusting modifier searches, while the title bar can
-show the current poe.ninja Divine Orb-to-Chaos Orb rate and a compact
-conversion table. Currency icons identify applicable reference prices.
+VirusTotal is a third-party service that checks the same file with multiple security products, including Microsoft's, and shows their verdicts together.
+<img width="2168" height="1119" alt="poenavi" src="https://github.com/user-attachments/assets/e272273b-1273-4a7e-b7a1-a1daa59e33de" />
+A matching SHA-256 also confirms that the scanned file and the released file are identical.
 
-Poetrieve reads copied item text; it does not connect to the game client or
-read game memory. The window leaves Path of Exile focused after a capture, so
-you can move to another item and press `Alt+D` again. Click inside Poetrieve
-when you want to edit its filters. The hotkey can be changed or cleared under
-**Settings → Hotkeys → Poetrieve price check**.
+VirusTotal results do not fully guarantee safety, but they are published as independent supporting evidence.
 
-> [!NOTE]
-> - Poetrieve is available only for PoE1.
-> - Searches require network access to the official Trade API; poe.ninja
->   reference prices also require access to poe.ninja.
-> - Valdo's Puzzle Box reward conditions, Inscribed Ultimatum challenge and
->   reward conditions, and unidentified Unique candidate selection are not
->   supported in this release. Poetrieve explains unsupported conditions in
->   the window and omits them where a useful search can still be made.
+See [Releases](../../releases) for the latest results.
 
-## Guide and map data
+### Code signing
 
-The official datasets are `guide_data.json`, `guide_data_poe2.json`,
-`guide_data_en.json`, and `guide_data_poe2_en.json`. Japanese filenames and
-the existing Japanese map folders are intentionally preserved for
-compatibility. English display names come from the stable zone master data;
-map lookup continues to use the Japanese asset folders.
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
 
-Guide edits are saved only to the currently selected locale’s file. The
-application keeps zone IDs, route keys, visit variants, flags, mini-Navi
-tokens, and progression logic locale-neutral.
+PoENavi has applied to the SignPath Foundation open-source code signing program to sign future Windows releases. Until the review and setup are complete, current releases are unsigned.
 
-## Development
+## First-time setup
 
-```powershell
-python -m pip install -r requirements.txt pytest pytest-qt
-$env:QT_QPA_PLATFORM="offscreen"
-python -m pytest -q
-python scripts/validate_locales.py
+1. On first launch, choose 日本語 or English. Existing installations stay in Japanese; the language can be changed later in Settings and takes effect after restarting PoENavi.
+2. Choose PoE1 or PoE2
+3. Choose "PoENavi" or "Poetrieve"
+4. If you use PoENavi, check the location of `Client.txt` in Settings
+5. If you use PoENavi, enable the "Local" chat channel in PoE's chat settings
+
+To use Poetrieve, copy an item's information in game and press the search hotkey. The PoE2 Expedition reward price check is disabled by default; enable it from the dedicated button at the top of Poetrieve and set the read area to match your setup.
+
+`Client.txt` is usually in one of the following locations and is normally detected automatically.
+
+```text
+PoE1 Steam: C:\Program Files (x86)\Steam\steamapps\common\Path of Exile\logs\Client.txt
+PoE2 Steam: C:\Program Files (x86)\Steam\steamapps\common\Path of Exile 2\logs\Client.txt
 ```
 
-For localization architecture, translation maintenance, validation, and
-upstream review guidance, see [Localization Development](docs/localization.md).
+## Supported environments and limitations
 
-Build a Windows release with:
+- Officially supported: Windows 10 / 11
+- Games: Path of Exile 1 / Path of Exile 2
+- Poetrieve: PoE1 / PoE2
+- PoB import: PoE1 only
+- VOICEVOX narration: PoE2 only (VOICEVOX itself must be running)
+- Expedition reward price check: PoE2 Poetrieve on Windows 10 / 11 only
+- Linux: unofficial support; some Windows-specific features are not guaranteed to work
+- If PoE's local chat log is disabled, some automatic laps and guide switching cannot be detected
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_release.ps1 -Python python
-```
+## Safety and external communications
 
-The build creates `PoENavi.zip` and `PoENavi.zip.sha256` and packages both
-locale catalogs plus all four guide datasets.
+PoENavi runs independently from the game, and its source code is publicly available in this repository.
 
-## Disclaimer
+### Information read locally
 
-Path of Exile and its assets are property of Grinding Gear Games. PoENavi is
-an independent community tool and is not affiliated with, endorsed by, or
-approved by Grinding Gear Games.
+- PoE's `Client.txt`: used to detect areas, levels, and Act progression
+- Item information copied by the user: used for trade searches in Poetrieve
+- The PoE window position and process name: used to identify the target window
+- Images of PoE2 screen regions selected by the user: used for local OCR of Expedition rewards and Abyss Desecration modifiers
 
-## License and credits
+Settings, notes, timer records, price caches, screenshots, and OCR processing remain on the user's PC. The contents of `Client.txt`, personal notes, captured images, and OCR text are not uploaded.
 
-MIT License — see [LICENSE](LICENSE).
+### What PoENavi does not do
 
-- [Path of Exile](https://www.pathofexile.com/) by Grinding Gear Games
-- Built with ❤️ by [Buri](https://github.com/buri34)
-- Poetrieve data sources and third-party licenses are documented in
-  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- Read or modify game memory
+- Inject code into the game process
+- Modify the game client or game files
+- Intercept or alter network packets
+- Automate combat, movement, or item interaction
+- Collect PoE account credentials or session information
 
-## Support
+### OCR-based screen reading
 
-- [OFUSE](https://ofuse.me/48eca107)
-- [Ko-fi](https://ko-fi.com/buri8857)
+The PoE2 Expedition reward price checker and Abyss Desecration modifier Tier checker run only when the user presses the configured shortcut.
 
-## Feature details
+1. A user-configured region of the PoE screen is captured through the operating system's screen-capture API.
+2. Text is recognized locally using Windows OCR.
+   - For an Abyss Desecration modifier only, if Windows OCR has a stable body but is missing a number, the automatically downloaded high-accuracy OCR pack (NDLOCR-Lite) rechecks that row locally.
+3. The result is shown in a separate PoENavi window.
 
-### Guides and area detection
+These OCR features do not read game memory or files, inject code, or interact with the game process. OCR results are never used to click, press keys, select modifiers, or perform any other in-game action automatically.
 
-PoENavi watches `Client.txt` and recognizes both Japanese and English area
-messages. The detected area is resolved by its stable ID, so the client
-language and PoENavi display language can be chosen independently. The guide
-view supports objectives, route-specific visits, flag-specific branches,
-summaries, layout notes, direction arrows, and level advice.
+Captured images and recognized text are not sent to an external server. Expedition reference prices are obtained from poe.ninja, while Abyss Desecration modifier Tiers are determined using data bundled with PoENavi.
 
-![Main guide window](docs/screenshot1.png)
+PoENavi's OCR features are designed with the Path of Exile Developer Policy in mind: they are manually initiated, read-only, processed locally, and displayed in a separate application window. This statement does not mean that PoENavi has been individually reviewed, endorsed, or approved by Grinding Gear Games. Please refer to the current official policies:
 
-### Mini Navi overlay
+- [Path of Exile Developer Policy](https://www.pathofexile.com/developer/docs/index#policy)
+- [Path of Exile Terms of Use](https://www.pathofexile.com/legal/terms-of-use-and-privacy-policy)
 
-The PoE1 Mini Navi can stay above the game while the main window is minimized.
-It shows short quest and boss steps, town/waypoint/portal markers, notes, and
-the current experience penalty state.
+### External connections
 
-![Mini Navi overlay](docs/screenshot3.png)
+- GitHub Releases: checking for and downloading updates
+- Official Path of Exile Trade API: submitting item names, modifiers, values, and other search conditions
+- poe.ninja: obtaining reference prices for currencies and items
+- Official Path of Exile CDN and related services: downloading item images
 
-### Timer and progression
+Some non-OCR features can send search text or chat commands to PoE, but only in response to an explicit user action. OCR results never initiate keyboard or mouse input to the game. When the logout feature is enabled and its shortcut is pressed, PoENavi disconnects the PoE client's TCP connection.
 
-The RTA timer records elapsed time and supports manual lap controls, automatic
-Act transitions, Act 1-5 / Act 6-10 mode selection, and saved timer state. The
-default controls are listed above; every hotkey can be changed or cleared in
-Settings.
+## Updates
 
-For PoE 1, pressing `Ready` with a reset timer waits for the new character to
-enter **The Twilight Strand**, then starts the timer automatically when that
-entry appears in `Client.txt`. While Ready is active, the log polling interval
-temporarily changes to 100 ms and returns to normal after the timer starts.
-Press `Ready` again to cancel; Ready state is not retained across restarts.
-Reset any existing timer data before enabling Ready. Manual Start remains
-available. Path of Exile must have **Local** chat logging enabled for the area
-entry to be detected.
+At startup, PoENavi checks GitHub Releases for the latest stable version. Choosing "Update now" downloads the ZIP, verifies its SHA-256, updates the files and restarts PoENavi.
 
-![RTA timer](docs/screenshot6.png)
+To check manually, use "App info → Check for updates" in Settings.
 
-### Gem tracking and search
+## Uninstalling
 
-PoB import creates a gem-acquisition checklist for the active character. Gem
-identity, checked-state keys, ordering, and PoE search paste values remain
-English-canonical in both UI languages. Japanese mode shows Japanese names
-with English secondary labels; English mode shows the canonical English
-labels.
+PoENavi does not use an installer or a Windows service. To uninstall it, close PoENavi and delete the extracted `PoENavi` folder.
 
-![Gem tracker](docs/screenshot11.png)
+To also delete settings, notes and timer records, delete `%APPDATA%\PoENavi\`. Back up anything you want to keep first.
 
-### Maps, notes, and accessibility
+## Bug reports and requests
 
-- Map thumbnails are loaded from `maps/PoE1/<Japanese zone>/` and
-  `maps/PoE2/<Japanese zone>/`; the existing folder names are preserved.
-- Click a thumbnail to zoom and use keyboard navigation to move between
-  layouts.
-- Area notes, game notes, search presets, and imported PoB data are saved as
-  user content and are never translated automatically.
-- Window opacity, click-through mode, always-on-top behavior, collapsible
-  panels, multi-monitor placement, and text selection/copy are supported.
-- The TCP logout helper only disconnects matching PoE connections and reports
-  its result before the application exits.
+Report issues on [GitHub Issues](../../issues) with the following information:
 
-![Map layout viewer](docs/screenshot5.png)
+- PoENavi version
+- PoE1 / PoE2, and whether you were using PoENavi or Poetrieve
+- Steps to reproduce and the behaviour you expected
+- Error messages or screenshots
 
-## Installation details
+Do not post personal information, PoE credentials, API keys or similar.
 
-### Windows release
+## Running from source
 
-1. Download the newest release from the [GitHub Releases](../../releases)
-   page.
-2. Extract `PoENavi.zip` to a folder where the user can run applications.
-3. Start `PoENavi.exe`.
-4. On a new installation, choose Japanese or English in the bilingual first
-   dialog. Existing installations keep Japanese behavior unless a language
-   is selected in Settings.
-
-The updater is included as `PoENaviUpdater.exe`. It verifies the downloaded
-SHA-256 checksum, preserves user data, replaces only official release files,
-and rolls back safely if the new application cannot start.
-
-### Running from source
-
-```powershell
-git clone https://github.com/buri34/poenavi.git
-Set-Location poenavi
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+```bash
+git clone <this repository's URL>
+cd <repository folder>
+pip install -r requirements.txt
 python main.py
 ```
 
-On Windows, normal user data is stored in `%APPDATA%\PoENavi`. For isolated
-development or test runs, set `POENAVI_USER_DATA_DIR` to a temporary folder.
-The bundled official files remain beside the application; user-edited data
-is kept in the user-data directory.
+Run the tests with:
 
-## Guide editing and data compatibility
-
-Guide editors are available from Settings. Select PoE version, locale, zone,
-visit, route, or flag branch before editing. Japanese edits are saved to
-`guide_data.json` or `guide_data_poe2.json`; English edits are saved to the
-matching `_en` file. The files retain the same stable IDs, route keys, visit
-branches, direction values, mini-navigation tokens, and HTML color spans.
-
-Do not rename the Japanese guide files or map folders. If you distribute a
-modified guide, keep the JSON structure and protected command tokens intact.
-Run the read-only locale validator before packaging:
-
-```powershell
-python scripts/validate_locales.py
-```
-
-## Safety and transparency
-
-PoENavi is designed to keep progression and update behavior explicit:
-
-- It parses local client-log output and does not send game credentials to a
-  server.
-- It does not automate gameplay, inject code, or modify game files.
-- It keeps route logic, stable IDs, flags, timers, notes, presets, and user
-  guide edits locale-neutral.
-- Release archives are checksum-verified before the updater replaces files.
-
-## Roadmap
-
-Possible future work includes more map assets, additional editor ergonomics,
-and further guide maintenance. Additional UI languages and live
-retranslation are intentionally outside the current localization design;
-language changes require an application restart so state is not lost.
-
-## Maintainer release checklist
-
-From a clean working tree, update the version, run the full test suite, run
-`scripts/validate_locales.py`, and build the archive:
-
-```powershell
-$env:QT_QPA_PLATFORM="offscreen"
+```bash
 python -m pytest -q
-python scripts/validate_locales.py
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_release.ps1 -Python python
-python -m zipfile -l PoENavi.zip
 ```
 
-The resulting `PoENavi.zip.sha256` must be distributed with the archive. The
-release contains both locale catalogs and all four guide datasets under the
-packaged application's `_internal` directory.
+For the localization architecture, translation maintenance and validation, see [Localization Development](docs/localization.md).
 
-The build also pins the packaged updater to a GitHub repository. It uses an
-explicit `-ReleaseRepository owner/repo`, then `GITHUB_REPOSITORY` in Actions,
-then the local `origin` URL. The release build fails if none is valid, so fork
-artifacts cannot silently update from a different repository.
+## Technology
+
+- Python 3.12+
+- PySide6 (Qt 6)
+- pynput / Windows API
+- urllib3
+- miniaudio (playback of WAV / MP3 notification sounds)
+- Windows OCR (PoE2 Expedition reward reading)
+- NDLOCR-Lite 1.3.1 (fallback only when digits are missing from PoE2 Abyss desecrated modifiers)
+- PyInstaller
+
+## License, disclaimer and credits
+
+- [MIT License](LICENSE)
+- [Third-party licenses and data sources](THIRD_PARTY_NOTICES.md)
+- [Privacy policy](PRIVACY.md)
+- [Code signing policy](docs/CODE_SIGNING_POLICY.md)
+- [Path of Exile](https://www.pathofexile.com/) by Grinding Gear Games
+- Built with ❤️ by [Buri](https://github.com/buri34)
+
+Path of Exile, in-game names, items and related game data are the property of Grinding Gear Games.
+
+## Support
+
+If you like PoENavi, support for maintaining and improving its development environment would be greatly appreciated.
+
+- [OFUSE](https://ofuse.me/48eca107)
+- [Ko-fi](https://ko-fi.com/buri8857)
+- [Patreon](https://www.patreon.com/cw/Buri8857)

@@ -1,0 +1,1065 @@
+#!/usr/bin/env python3
+"""Build compact bilingual PoE2 identity/stat indexes from locked snapshots."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_LOCK = ROOT / "scripts" / "poetore-poe2-sources.lock.json"
+OUTPUT = ROOT / "data" / "poetore" / "poe2"
+IDENTITY_JAPANESE_OVERRIDES = ROOT / "scripts" / "poetore-poe2-identity-japanese-overrides.json"
+RELATED_JAPANESE_OVERRIDES = ROOT / "scripts" / "poetore-poe2-related-japanese-overrides.json"
+EE2_SOUL_CORE_REVISION = "cf58adf17a06fe453da47f3672803a33594abcf6"
+EE2_REPOSITORY = "Kvan7/Exiled-Exchange-2"
+IDENTITY_REVIEW_REPORT = ROOT / "build" / "poe2-identity-review.json"
+EE2_SOUL_CORE_IDENTITIES = {
+    "Atziri's Soul Core of Alacrity", "Atziri's Soul Core of Devotion",
+    "Atziri's Soul Core of Inoculation", "Atziri's Soul Core of Vitality",
+    "Jiquani's Soul Core of Abundance", "Jiquani's Soul Core of Automation",
+    "Jiquani's Soul Core of Malediction", "Jiquani's Soul Core of Munitions",
+    "Jiquani's Soul Core of Quaking", "Jiquani's Soul Core of Radiance",
+    "Jiquani's Soul Core of Rallying", "Jiquani's Soul Core of Rippling",
+    "Jiquani's Soul Core of Severing", "Jiquani's Soul Core of Snares",
+    "Jiquani's Soul Core of Squalls", "Jiquani's Soul Core of Targeting",
+    "Jiquani's Soul Core of Thundering",
+}
+EE2_SOUL_CORE_CHANGED_AUGMENTS = {
+    "Atmohua's Soul Core of Retreat", "Cholotl's Soul Core of War",
+    "Citaqualotl's Thesis", "Emergent Possibility",
+    "Estazunti's Soul Core of Convalescence", "Jiquani's Thesis",
+    "Katla's Gloom", "Legacy of Chernobog's Pillar", "Soul Core of Atmohua",
+    "Soul Core of Cholotl", "Soul Core of Citaqualotl", "Soul Core of Jiquani",
+    "Soul Core of Opiloti", "Soul Core of Puhuarte", "Soul Core of Tacati",
+    "Soul Core of Ticaba", "Soul Core of Topotante", "Soul Core of Tzamoto",
+    "Soul Core of Xopec", "Soul Core of Zalatl", "Soul Core of Zantipi",
+    "Uhtred's Sidereus", "Uromoti's Soul Core of Attenuation",
+}
+EE2_REVIEWED_V0161_AUGMENTS = {
+    "Idol of Alira", "Idol of Egrin", "Idol of Kraityn", "Idol of Oak",
+    "Legacy of Horns of Bynden", "Legacy of The Sentry",
+}
+EE2_REVIEWED_V0161_LEGACY_AUGMENTS = {
+    "Legacy of Alkem Eira", "Legacy of Amor Mandragora",
+    "Legacy of Bramblejack", "Legacy of Bristleboar", "Legacy of Bushwhack",
+    "Legacy of Deidbell", "Legacy of Dionadair", "Legacy of Dunkelhalt",
+    "Legacy of Elevore", "Legacy of Kingsguard", "Legacy of Legionstride",
+    "Legacy of Oaksworn", "Legacy of Obern's Bastion", "Legacy of Serle's Grit",
+    "Legacy of The Blood Thorn", "Legacy of The Knight-errant",
+    "Legacy of The Smiling Knight", "Legacy of The Vile Knight",
+    "Legacy of Tyranny's Grip",
+}
+EE2_REVIEWED_V0161_IDENTITIES = {
+    ("ITEM", "Liquid Verisium", ""),
+    ("ITEM", "Tethering Bands", ""),
+    ("UNIQUE", "The Master's Reach", "Tethering Bands"),
+}
+EE2_REVIEWED_V0161_STAT_IDS = {
+    "rune.stat_1228682002", "rune.stat_1573130764",
+    "rune.stat_1881314095", "rune.stat_1984310483",
+    "rune.stat_2174462855", "rune.stat_2511217560",
+    "rune.stat_2211478554", "rune.stat_2709367754",
+    "rune.stat_2861770798",
+    "rune.stat_2916861134", "rune.stat_2968503605",
+    "rune.stat_2995914769", "rune.stat_3537994888",
+    "rune.stat_3686997387",
+    "rune.stat_3824372849", "rune.stat_4226127445",
+}
+EE2_REVIEWED_RUNEFORGED_IDENTITIES = {
+    ("ITEM", "Runeforged Warden Bow", ""),
+    ("UNIQUE", "Ironbound", "Warden Bow"),
+    ("UNIQUE", "Ironbound", "Runeforged Warden Bow"),
+}
+EE2_SOUL_CORE_STAT_IDS = {
+    "rune.stat_1195319608", "rune.stat_138373935", "rune.stat_1519474779",
+    "rune.stat_1839315243", "rune.stat_2139847597", "rune.stat_2203195791",
+    "rune.stat_2305301734", "rune.stat_2336703514", "rune.stat_2487305362",
+    "rune.stat_2527686725", "rune.stat_2621116283", "rune.stat_3148103963",
+    "rune.stat_3174700878", "rune.stat_3268281424", "rune.stat_3791899485",
+    "rune.stat_3985867204", "rune.stat_4081947835", "rune.stat_4169430079",
+    "rune.stat_653358410", "rune.stat_995044379",
+}
+EE2_SOUL_CORE_OFFICIAL_STATS = {
+    "rune.stat_1992191903": {
+        "en": "# to Level of all Mark Skills",
+        "ja": "全ての呪印スキルのレベル #",
+    },
+    "rune.stat_2148999925": {
+        "en": "# to Level of all Warcry Skill Gems",
+        "ja": "全てのウォークライスキルジェムのレベル #",
+    },
+    "rune.stat_2296009672": {
+        "en": "# to Level of all Plant Skill Gems",
+        "ja": "全てのプラントスキルジェムのレベル #",
+    },
+    "rune.stat_1062190843": {
+        "en": "# to Level of all Storm Skill Gems",
+        "ja": "全てのストームスキルジェムのレベル #",
+    },
+}
+REVIEWED_OFFICIAL_STAT_OVERRIDES = {
+    "explicit.stat_3520418269": {
+        "type": "explicit", "text": {
+            "en": "Monsters from Verisium Remnants drop #% increased Verisium",
+            "ja": "ヴェリシウムレムナントのモンスターがドロップするヴェリシウムが#%増加する",
+        },
+    },
+    "explicit.stat_1183698646": {
+        "type": "explicit", "text": {
+            "en": "Expeditions contain 1 Additional Boss encased in ice in Map",
+            "ja": "マップのエクスペディションに氷に包まれたボスが追加で1体出現する",
+        },
+    },
+    "explicit.stat_1109460697": {
+        "type": "explicit", "text": {
+            "en": "Expeditions contain 1 Additional Verisium Sentry in Map",
+            "ja": "マップのエクスペディションにヴェリシウムセントリーが追加で1体出現する",
+        },
+    },
+    "explicit.stat_2905096233": {
+        "type": "explicit", "text": {
+            "en": "#% increased Expedition Monster Rarity in Map",
+            "ja": "マップでエクスペディションのモンスターレアリティが#%増加する",
+        },
+    },
+    "explicit.stat_2852112245": {
+        "type": "explicit", "text": {
+            "en": "Expeditions contain 1 Vaal Relic in Map",
+            "ja": "Expeditions contain 1 Vaal Relic in Map",
+        },
+    },
+    "explicit.stat_181823691": {
+        "type": "explicit", "text": {
+            "en": "Expeditions contain 1 buried Strongbox in Map",
+            "ja": "マップのエクスペディションに埋められたストロングボックスが1個出現する",
+        },
+    },
+    "explicit.stat_3653794255": {
+        "type": "explicit", "text": {
+            "en": "Expeditions have +#% Surpassing chance to contain an additional Verisium Remnant",
+            "ja": "エクスペディションに+#%の超過可能確率でヴェリシウムレムナントが追加で1個出現する",
+        },
+    },
+    "explicit.stat_3871299443": {
+        "type": "explicit", "text": {
+            "en": "Verisium Remnants have +#% chance to add an additional Runic Modifier in Map",
+            "ja": "マップのヴェリシウムレムナントは+#%の確率でルーンモッドを追加で1個持つ",
+        },
+    },
+    "explicit.stat_3039133122": {
+        "type": "explicit", "text": {
+            "en": "#% increased Expedition Explosive Area of Effect in Map",
+            "ja": "#% increased Expedition Explosive Area of Effect in Map",
+        },
+    },
+    "explicit.stat_3963944561": {
+        "type": "explicit", "text": {
+            "en": "The first unearthed Runic Monster will be a Rare Monster in Map",
+            "ja": "マップで最初に発掘される1体のルーニックモンスターはレアモンスターになる",
+        },
+    },
+    "explicit.stat_779964546": {
+        "type": "explicit",
+        "text": {
+            "en": "Expeditions have +#% Surpassing chance to Duplicate Runic Monsters in Map",
+            "ja": "マップのエクスペディションは+#%の超過可能確率でルーニックモンスターを複製する",
+        },
+    },
+}
+EE2_WEAPON_CATEGORIES = [
+    "Bow", "Claw", "Crossbow", "Dagger", "Flail", "One Hand Axe",
+    "One Hand Mace", "One Hand Sword", "Spear", "Talisman", "Two Hand Axe",
+    "Two Hand Mace", "Two Hand Sword", "Warstaff", "Wand", "Staff", "Sceptre",
+]
+EE2_SOUL_CORE_EXTRA_AUGMENTS = {
+    "Jiquani's Soul Core of Targeting": {
+        "ref_name": "Jiquani's Soul Core of Targeting",
+        "names": {
+            "en": "Jiquani's Soul Core of Targeting",
+            "ja": "ジクアニの照準のソウルコア",
+        },
+        "effects": [{
+            "categories": ["Wand", "Staff", "Sceptre"],
+            "text": {
+                "en": "# to Level of all Mark Skills",
+                "ja": "全ての呪印スキルのレベル #",
+            },
+            "values": [1], "trade_ids": ["rune.stat_1992191903"],
+            "socket_bound": False,
+        }],
+    },
+    "Jiquani's Soul Core of Rallying": {
+        "ref_name": "Jiquani's Soul Core of Rallying",
+        "names": {
+            "en": "Jiquani's Soul Core of Rallying",
+            "ja": "ジクアニの決起のソウルコア",
+        },
+        "effects": [{
+            "categories": EE2_WEAPON_CATEGORIES,
+            "text": {
+                "en": "# to Level of all Warcry Skill Gems",
+                "ja": "全てのウォークライスキルジェムのレベル #",
+            },
+            "values": [1], "trade_ids": ["rune.stat_2148999925"],
+            "socket_bound": False,
+        }],
+    },
+    "Jiquani's Soul Core of Abundance": {
+        "ref_name": "Jiquani's Soul Core of Abundance",
+        "names": {
+            "en": "Jiquani's Soul Core of Abundance",
+            "ja": "ジクアニの豊富さのソウルコア",
+        },
+        "effects": [{
+            "categories": EE2_WEAPON_CATEGORIES,
+            "text": {
+                "en": "# to Level of all Plant Skill Gems",
+                "ja": "全てのプラントスキルジェムのレベル #",
+            },
+            "values": [1], "trade_ids": ["rune.stat_2296009672"],
+            "socket_bound": False,
+        }],
+    },
+    "Jiquani's Soul Core of Thundering": {
+        "ref_name": "Jiquani's Soul Core of Thundering",
+        "names": {
+            "en": "Jiquani's Soul Core of Thundering",
+            "ja": "ジクアニの雷鳴のソウルコア",
+        },
+        "effects": [{
+            "categories": EE2_WEAPON_CATEGORIES,
+            "text": {
+                "en": "# to Level of all Storm Skill Gems",
+                "ja": "全てのストームスキルジェムのレベル #",
+            },
+            "values": [1], "trade_ids": ["rune.stat_1062190843"],
+            "socket_bound": False,
+        }],
+    },
+}
+
+
+def _related_japanese_overrides() -> tuple[dict, ...]:
+    payload = json.loads(RELATED_JAPANESE_OVERRIDES.read_text(encoding="utf-8"))
+    return tuple(payload.get("overrides", ()))
+
+
+def _related_identity_aliases() -> dict[str, str]:
+    payload = json.loads(RELATED_JAPANESE_OVERRIDES.read_text(encoding="utf-8"))
+    return {row["from"]: row["to"] for row in payload.get("aliases", ())}
+
+
+def _identity_japanese_overrides() -> tuple[dict, ...]:
+    payload = json.loads(IDENTITY_JAPANESE_OVERRIDES.read_text(encoding="utf-8"))
+    return tuple(payload.get("overrides", ()))
+
+
+def resolve_ee2_revision(
+    ee2_root: Path, *, expected_revision: str | None = None,
+) -> str:
+    """Return the real EE2 checkout HEAD and reject untrusted source roots."""
+    try:
+        top_level = subprocess.check_output(
+            ["git", "-C", str(ee2_root), "rev-parse", "--show-toplevel"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        revision = subprocess.check_output(
+            ["git", "-C", str(ee2_root), "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("EE2 source must be a Git checkout") from exc
+    if Path(top_level).resolve() != ee2_root.resolve():
+        raise ValueError("EE2 source must be the Git checkout root")
+    if expected_revision is not None and revision != expected_revision:
+        raise ValueError(
+            f"EE2 checkout {revision} does not match expected revision "
+            f"{expected_revision}"
+        )
+    return revision
+
+
+def _ee2_source(component: str, revision: str, *, reason: str = "direct build") -> dict:
+    return {
+        "repository": EE2_REPOSITORY,
+        "revision": revision,
+        "component": component,
+        "reason": reason,
+    }
+
+
+class IdentityReviewRequired(ValueError):
+    def __init__(self, anomalies: list[dict]):
+        self.anomalies = anomalies
+        kinds = sorted({str(row.get("kind", "unknown")) for row in anomalies})
+        super().__init__(
+            "EE2 bilingual identity review required: " + ", ".join(kinds)
+        )
+
+
+def _ee2_identity_key(row: dict) -> tuple[str, str, str]:
+    namespace = str(row.get("namespace", ""))
+    ref_name = str(row.get("refName", ""))
+    base_ref = str((row.get("unique") or {}).get("base", ""))
+    return namespace, ref_name, base_ref
+
+
+def _indexed_ee2_rows(rows: list[dict], language: str) -> dict[tuple[str, str, str], dict]:
+    indexed: dict[tuple[str, str, str], dict] = {}
+    anomalies = []
+    for row in rows:
+        key = _ee2_identity_key(row)
+        if not key[1]:
+            continue
+        if not key[0]:
+            anomalies.append({
+                "kind": "missing_namespace", "language": language,
+                "ref_name": key[1],
+            })
+            continue
+        if key in indexed:
+            anomalies.append({
+                "kind": "duplicate_key", "language": language,
+                "key": list(key),
+            })
+            continue
+        indexed[key] = row
+    if anomalies:
+        raise IdentityReviewRequired(anomalies)
+    return indexed
+
+
+def _paired_ee2_rows(
+    localized: dict[str, list[dict]], *, require_augment: bool = False,
+    ref_names: set[str] | None = None,
+) -> list[tuple[dict, dict]]:
+    augment_keys = {
+        _ee2_identity_key(row)
+        for row in localized["en"]
+        if bool(row.get("augment"))
+    }
+    selected = {
+        language: [
+            row for row in rows
+            if (not require_augment or _ee2_identity_key(row) in augment_keys)
+            and (ref_names is None or row.get("refName") in ref_names)
+        ]
+        for language, rows in localized.items()
+    }
+    english = _indexed_ee2_rows(selected["en"], "English")
+    japanese = _indexed_ee2_rows(selected["ja"], "Japanese")
+    if english.keys() != japanese.keys():
+        missing_ja = sorted(english.keys() - japanese.keys())
+        missing_en = sorted(japanese.keys() - english.keys())
+        raise IdentityReviewRequired([
+            *({"kind": "missing_japanese_key", "key": list(key)} for key in missing_ja),
+            *({"kind": "missing_english_key", "key": list(key)} for key in missing_en),
+        ])
+    return [(english[key], japanese[key]) for key in english]
+
+
+def _verified_identity_names(entries: list[dict] | None) -> dict[tuple[str, str, str], str]:
+    if entries is None:
+        path = OUTPUT / "identity_index.json"
+        entries = json.loads(path.read_text(encoding="utf-8"))["entries"] if path.exists() else []
+    return {
+        (
+            str(row.get("namespace", "")), str(row.get("ref_name", "")),
+            str(row.get("base_ref", "")),
+        ): str((row.get("names") or {}).get("ja", ""))
+        for row in entries
+    }
+
+
+def _reject_unreviewed_japanese_changes(
+    entries: list[dict], verified_entries: list[dict] | None,
+) -> None:
+    verified = _verified_identity_names(verified_entries)
+    approved = {
+        (
+            str(row.get("namespace", "")), str(row.get("ref_name", "")),
+            str(row.get("base_ref", "")),
+        ): str(row.get("japanese", ""))
+        for row in (*_identity_japanese_overrides(), *_related_japanese_overrides())
+    }
+    anomalies = []
+    for row in entries:
+        key = (
+            str(row.get("namespace", "")), str(row.get("ref_name", "")),
+            str(row.get("base_ref", "")),
+        )
+        candidate = str((row.get("names") or {}).get("ja", ""))
+        previous = verified.get(key)
+        if previous and candidate != previous and approved.get(key) != candidate:
+            anomalies.append({
+                "kind": "unreviewed_japanese_name_change", "key": list(key),
+                "previous": previous, "candidate": candidate,
+            })
+    if anomalies:
+        raise IdentityReviewRequired(anomalies)
+
+
+def _write_identity_review_report(
+    path: Path, *, revision: str | None, anomalies: list[dict],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "status": "blocked",
+        "source": {
+            "repository": EE2_REPOSITORY,
+            "revision": revision,
+        },
+        "anomalies": anomalies,
+    }
+    handle, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _append_source_revision(
+    payload: dict, *, component: str, revision: str, reason: str,
+) -> None:
+    rows = payload.setdefault("source_revisions", [])
+    source = _ee2_source(component, revision, reason=reason)
+    if source not in rows:
+        rows.append(source)
+
+
+def _apply_japanese_identity_overrides(
+    entries: list[dict], overrides: tuple[dict, ...],
+) -> None:
+    by_key = {(row.get("namespace"), row.get("ref_name")): row for row in entries}
+    for override in overrides:
+        key = (override["namespace"], override["ref_name"])
+        row = by_key.get(key)
+        if row is None:
+            row = {
+                "namespace": override["namespace"],
+                "ref_name": override["ref_name"],
+                "names": {"en": override["ref_name"]},
+            }
+            if override.get("base_ref"):
+                row["base_ref"] = override["base_ref"]
+            if override.get("category"):
+                row["category"] = override["category"]
+            entries.append(row)
+            by_key[key] = row
+        row.setdefault("names", {})["ja"] = override["japanese"]
+        if override.get("base_ref"):
+            row["base_ref"] = override["base_ref"]
+        if override.get("category"):
+            row["category"] = override["category"]
+
+
+def _apply_reviewed_identity_overrides(entries: list[dict]) -> None:
+    deprecated = {
+        (row["namespace"], row["name"])
+        for value in _related_identity_aliases()
+        for row in (_related_identity(value),)
+    }
+    entries[:] = [
+        row for row in entries
+        if (row.get("namespace"), row.get("ref_name")) not in deprecated
+    ]
+    _apply_japanese_identity_overrides(entries, _related_japanese_overrides())
+    _apply_japanese_identity_overrides(entries, _identity_japanese_overrides())
+
+
+def resolve_locked_source(
+    source_id: str,
+    lock_path: Path = SOURCE_LOCK,
+    root: Path = ROOT,
+) -> Path:
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    source = (lock.get("sources") or {}).get(source_id)
+    if source is None:
+        raise KeyError(f"source lock does not contain {source_id}")
+    path = root / source["path"]
+    if not path.is_file():
+        raise FileNotFoundError(f"locked source does not exist: {path}")
+    return path
+
+
+def _load(name: str) -> dict:
+    return json.loads(resolve_locked_source(Path(name).stem).read_text(encoding="utf-8"))
+
+
+def _signature(entry: dict) -> tuple:
+    flags = entry.get("flags") or {}
+    return (
+        str(entry.get("disc", "")), bool(entry.get("name")),
+        bool(flags.get("unique")), tuple(sorted(flags)),
+    )
+
+
+def _aligned(english: list[dict], japanese: list[dict]):
+    ei = ji = 0
+    while ei < len(english) and ji < len(japanese):
+        en, ja = english[ei], japanese[ji]
+        if _signature(en) == _signature(ja):
+            yield en, ja
+            ei += 1
+            ji += 1
+            continue
+        lookahead = 8
+        en_skip = next((n for n in range(1, lookahead + 1)
+                        if ei + n < len(english) and _signature(english[ei + n]) == _signature(ja)), None)
+        ja_skip = next((n for n in range(1, lookahead + 1)
+                        if ji + n < len(japanese) and _signature(japanese[ji + n]) == _signature(en)), None)
+        if en_skip is not None and (ja_skip is None or en_skip < ja_skip):
+            ei += en_skip
+        elif ja_skip is not None and (en_skip is None or ja_skip < en_skip):
+            ji += ja_skip
+        else:
+            ei += 1
+            ji += 1
+
+
+def build_identity_index(
+    ee2_root: Path | None = None, *, expected_revision: str | None = None,
+    verified_entries: list[dict] | None = None,
+    ref_names: set[str] | None = None,
+) -> dict:
+    if ee2_root is not None:
+        revision = resolve_ee2_revision(
+            ee2_root, expected_revision=expected_revision,
+        )
+        localized = {}
+        for language in ("en", "ja"):
+            path = ee2_root / "renderer" / "public" / "data" / language / "items.ndjson"
+            localized[language] = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        entries = []
+        for en, ja in _paired_ee2_rows(localized, ref_names=ref_names):
+            row = {
+                "namespace": en["namespace"], "ref_name": en["refName"],
+                "names": {"en": en["name"], "ja": ja["name"]},
+            }
+            # Keep the EE2 base variant fingerprint.  Several PoE2 bases share
+            # the same localized name (and occasionally even the same refName),
+            # so flattening these fields makes exact Trade2 identity resolution
+            # impossible for copied rare/magic equipment.
+            if en.get("tags"):
+                row["tags"] = list(en["tags"])
+            if en.get("armour"):
+                row["armour"] = {
+                    key: list(value) for key, value in en["armour"].items()
+                }
+            if en.get("craftable", {}).get("category"):
+                row["category"] = en["craftable"]["category"]
+            if en.get("unique"):
+                row["base_ref"] = en["unique"].get("base", "")
+            entries.append(row)
+        _apply_reviewed_identity_overrides(entries)
+        _reject_unreviewed_japanese_changes(entries, verified_entries)
+        return {
+            "schema_version": 2,
+            "source": _ee2_source("identity", revision),
+            "entries": entries,
+        }
+
+    en_groups = {row["id"]: row["entries"] for row in _load("items_en.json")["result"]}
+    ja_groups = {row["id"]: row["entries"] for row in _load("items_ja.json")["result"]}
+    entries = []
+    seen = set()
+    for group_id, english in en_groups.items():
+        for en, ja in _aligned(english, ja_groups.get(group_id, [])):
+            base = str(en.get("type", "")).strip()
+            ja_base = str(ja.get("type", "")).strip()
+            name = str(en.get("name", "")).strip()
+            ja_name = str(ja.get("name", "")).strip()
+            if base and ("ITEM", base) not in seen:
+                entries.append({
+                    "namespace": "ITEM", "ref_name": base, "group": group_id,
+                    "names": {"en": base, "ja": ja_base or base},
+                })
+                seen.add(("ITEM", base))
+            if name and ("UNIQUE", name) not in seen:
+                entries.append({
+                    "namespace": "UNIQUE", "ref_name": name, "base_ref": base,
+                    "group": group_id, "names": {"en": name, "ja": ja_name or name},
+                })
+                seen.add(("UNIQUE", name))
+    _apply_reviewed_identity_overrides(entries)
+    return {"schema_version": 2, "source": "scripts/poetore-poe2-sources.lock.json", "entries": entries}
+
+
+def apply_reviewed_identity_overrides() -> None:
+    identity = json.loads((OUTPUT / "identity_index.json").read_text(encoding="utf-8"))
+    _apply_reviewed_identity_overrides(identity["entries"])
+    (OUTPUT / "identity_index.json").write_text(
+        json.dumps(identity, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def build_stat_index() -> dict:
+    en = {entry["id"]: entry for group in _load("stats_en.json")["result"] for entry in group["entries"]}
+    ja = {entry["id"]: entry for group in _load("stats_ja.json")["result"] for entry in group["entries"]}
+    entries = []
+    for stat_id, english in en.items():
+        japanese = ja.get(stat_id)
+        if japanese is None:
+            continue
+        entries.append({
+            "id": stat_id,
+            "type": str(english.get("type", "")),
+            "text": {"en": str(english.get("text", "")), "ja": str(japanese.get("text", ""))},
+        })
+    by_id = {entry["id"]: entry for entry in entries}
+    for stat_id, override in REVIEWED_OFFICIAL_STAT_OVERRIDES.items():
+        by_id[stat_id] = {"id": stat_id, **override}
+    entries = list(by_id.values())
+    return {"schema_version": 1, "source": "scripts/poetore-poe2-sources.lock.json", "entries": entries}
+
+
+def build_augment_index(
+    ee2_root: Path, *, expected_revision: str | None = None,
+) -> dict:
+    """Build the compact bilingual Rune/Soul Core editor index from fixed EE2 data."""
+    revision = resolve_ee2_revision(
+        ee2_root, expected_revision=expected_revision,
+    )
+    localized = {}
+    for language in ("en", "ja"):
+        path = ee2_root / "renderer" / "public" / "data" / language / "items.ndjson"
+        localized[language] = [
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line
+        ]
+    entries = []
+    for en, ja in _paired_ee2_rows(localized, require_augment=True):
+        effects = en.get("augment") or ()
+        if not effects:
+            continue
+        ja_effects = ja.get("augment") or ()
+        built_effects = []
+        for index, effect in enumerate(effects):
+            trade_ids = tuple(str(value) for value in effect.get("tradeId") or () if value)
+            if not trade_ids:
+                continue
+            localized_effect = ja_effects[index] if index < len(ja_effects) else {}
+            built_effects.append({
+                "categories": list(effect.get("categories") or ()),
+                "text": {
+                    "en": str(effect.get("string", "")),
+                    "ja": str(localized_effect.get("string") or effect.get("string", "")),
+                },
+                "values": list(effect.get("values") or ()),
+                "trade_ids": list(trade_ids),
+                "socket_bound": bool(effect.get("socketBound")),
+            })
+        if built_effects:
+            repeated_values = [tuple(effect["values"]) for effect in built_effects]
+            if len(built_effects) > 1 and len(set(repeated_values)) == 1:
+                shared = repeated_values[0]
+                widths = [max(1, effect["text"]["en"].count("#")) for effect in built_effects]
+                if sum(widths) == len(shared):
+                    offset = 0
+                    for effect, width in zip(built_effects, widths):
+                        effect["values"] = list(shared[offset:offset + width])
+                        offset += width
+            entry = {
+                "ref_name": str(en.get("refName", "")),
+                "names": {"en": str(en.get("name", "")), "ja": str(ja.get("name", ""))},
+                "effects": built_effects,
+            }
+            if entry["ref_name"].startswith("Legacy of "):
+                entry["max_count"] = 1
+            if entry["ref_name"] == "Legacy of Serle's Grit":
+                entry["effects"][0]["text"]["ja"] = "品質の最大値 #%"
+            entries.append(entry)
+    return {
+        "schema_version": 1,
+        "source": _ee2_source("augment", revision),
+        "entries": entries,
+    }
+
+
+def apply_reviewed_ee2_updates(ee2_root: Path) -> None:
+    """Merge reviewed EE2 v0.16.1/v0.16.2 selections into runtime indexes."""
+    resolve_ee2_revision(ee2_root, expected_revision=EE2_SOUL_CORE_REVISION)
+
+    identity = json.loads((OUTPUT / "identity_index.json").read_text(encoding="utf-8"))
+    candidate_identity = build_identity_index(
+        ee2_root, expected_revision=EE2_SOUL_CORE_REVISION,
+        ref_names=(
+            EE2_SOUL_CORE_IDENTITIES
+            | {row[1] for row in EE2_REVIEWED_RUNEFORGED_IDENTITIES}
+            | {row[1] for row in EE2_REVIEWED_V0161_IDENTITIES}
+            | {"Legacy of Bramblejack"}
+        ),
+    )
+    selected_identity = {
+        row["ref_name"]: row for row in candidate_identity["entries"]
+        if row["ref_name"] in EE2_SOUL_CORE_IDENTITIES
+    }
+    if selected_identity.keys() != EE2_SOUL_CORE_IDENTITIES:
+        raise ValueError("reviewed Soul Core identity set is incomplete")
+    identity["entries"] = [
+        row for row in identity["entries"]
+        if row["ref_name"] not in EE2_SOUL_CORE_IDENTITIES
+    ] + [selected_identity[name] for name in sorted(selected_identity)]
+    runeforged_rows = [
+        row for row in candidate_identity["entries"]
+        if (
+            row.get("namespace"), row.get("ref_name"), row.get("base_ref", "")
+        ) in EE2_REVIEWED_RUNEFORGED_IDENTITIES
+    ]
+    if {
+        (row.get("namespace"), row.get("ref_name"), row.get("base_ref", ""))
+        for row in runeforged_rows
+    } != EE2_REVIEWED_RUNEFORGED_IDENTITIES:
+        raise ValueError("reviewed Runeforged Warden Bow identity set is incomplete")
+    identity["entries"] = [
+        row for row in identity["entries"]
+        if (
+            row.get("namespace"), row.get("ref_name"), row.get("base_ref", "")
+        ) not in EE2_REVIEWED_RUNEFORGED_IDENTITIES
+    ] + runeforged_rows
+    reviewed_identity_rows = [
+        row for row in candidate_identity["entries"]
+        if (
+            row.get("namespace"), row.get("ref_name"), row.get("base_ref", "")
+        ) in EE2_REVIEWED_V0161_IDENTITIES
+    ]
+    if {
+        (row.get("namespace"), row.get("ref_name"), row.get("base_ref", ""))
+        for row in reviewed_identity_rows
+    } != EE2_REVIEWED_V0161_IDENTITIES:
+        raise ValueError("reviewed v0.16.1 identity remainder is incomplete")
+    identity["entries"] = [
+        row for row in identity["entries"]
+        if (
+            row.get("namespace"), row.get("ref_name"), row.get("base_ref", "")
+        ) not in EE2_REVIEWED_V0161_IDENTITIES
+    ] + reviewed_identity_rows
+    bramblejack = next(
+        row for row in candidate_identity["entries"]
+        if row.get("namespace") == "ITEM"
+        and row.get("ref_name") == "Legacy of Bramblejack"
+    )
+    bramblejack["aliases"] = {"ja": ["ブランブルジャック"]}
+    identity["entries"] = [
+        row for row in identity["entries"]
+        if not (
+            row.get("namespace") == "ITEM"
+            and row.get("ref_name") == "Legacy of Bramblejack"
+        )
+    ] + [bramblejack]
+    selection_source = f"selected EE2 {EE2_SOUL_CORE_REVISION} reviewed updates"
+    if isinstance(identity.get("source"), str):
+        if EE2_SOUL_CORE_REVISION not in identity["source"]:
+            identity["source"] += f" + {selection_source}"
+        else:
+            identity["source"] = identity["source"].replace(
+                f"selected EE2 {EE2_SOUL_CORE_REVISION} Soul Cores", selection_source,
+            )
+    _append_source_revision(
+        identity, component="reviewed identity selection",
+        revision=EE2_SOUL_CORE_REVISION,
+        reason="Buri-reviewed v0.16.1/v0.16.2 identity subset",
+    )
+
+    augment = json.loads((OUTPUT / "augment_index.json").read_text(encoding="utf-8"))
+    candidate_augment = {
+        row["ref_name"]: row for row in build_augment_index(
+            ee2_root, expected_revision=EE2_SOUL_CORE_REVISION,
+        )["entries"]
+    }
+    candidate_augment.update(EE2_SOUL_CORE_EXTRA_AUGMENTS)
+    selected_augments = (
+        (EE2_SOUL_CORE_IDENTITIES & candidate_augment.keys())
+        | EE2_SOUL_CORE_CHANGED_AUGMENTS
+        | EE2_REVIEWED_V0161_AUGMENTS
+        | EE2_REVIEWED_V0161_LEGACY_AUGMENTS
+    )
+    if not selected_augments <= candidate_augment.keys():
+        raise ValueError("reviewed Soul Core augment set is incomplete")
+    by_augment = {row["ref_name"]: row for row in augment["entries"]}
+    by_augment.update({name: candidate_augment[name] for name in selected_augments})
+    for ref_name, row in by_augment.items():
+        if ref_name.startswith("Legacy of "):
+            row["max_count"] = 1
+    augment["entries"] = list(by_augment.values())
+    if isinstance(augment.get("source"), str):
+        if EE2_SOUL_CORE_REVISION not in augment["source"]:
+            augment["source"] += f" + {selection_source}"
+        else:
+            augment["source"] = augment["source"].replace(
+                f"selected EE2 {EE2_SOUL_CORE_REVISION} Soul Cores", selection_source,
+            )
+    _append_source_revision(
+        augment, component="reviewed augment selection",
+        revision=EE2_SOUL_CORE_REVISION,
+        reason="Buri-reviewed v0.16.1/v0.16.2 augment subset",
+    )
+
+    localized_stats = {}
+    for language in ("en", "ja"):
+        path = ee2_root / "renderer" / "public" / "data" / language / "stats.ndjson"
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        localized_stats[language] = {}
+        for row in rows:
+            for stat_id in ((row.get("trade") or {}).get("ids") or {}).get("rune", ()):
+                if stat_id in EE2_SOUL_CORE_STAT_IDS | EE2_REVIEWED_V0161_STAT_IDS:
+                    localized_stats[language][stat_id] = row["matchers"][0]["string"]
+    reviewed_stat_ids = EE2_SOUL_CORE_STAT_IDS | EE2_REVIEWED_V0161_STAT_IDS
+    if any(set(rows) != reviewed_stat_ids for rows in localized_stats.values()):
+        raise ValueError("reviewed EE2 Stat ID set is incomplete")
+    stats = json.loads((OUTPUT / "stat_index.json").read_text(encoding="utf-8"))
+    by_stat = {row["id"]: row for row in stats["entries"]}
+    by_stat.pop("rune.stat_3170380905", None)
+    for stat_id in sorted(reviewed_stat_ids):
+        by_stat[stat_id] = {
+            "id": stat_id, "type": "augment",
+            "text": {lang: localized_stats[lang][stat_id] for lang in ("en", "ja")},
+        }
+    for stat_id, text in EE2_SOUL_CORE_OFFICIAL_STATS.items():
+        by_stat[stat_id] = {"id": stat_id, "type": "augment", "text": text}
+    stats["entries"] = list(by_stat.values())
+    if isinstance(stats.get("source"), str) and EE2_SOUL_CORE_REVISION not in stats["source"]:
+        stats["source"] += f" + {selection_source} Rune stats"
+    _append_source_revision(
+        stats, component="reviewed Rune Stat selection",
+        revision=EE2_SOUL_CORE_REVISION,
+        reason="Buri-reviewed v0.16.1/v0.16.2 Stat subset",
+    )
+
+    related = json.loads((OUTPUT / "related_item_groups.json").read_text(encoding="utf-8"))
+    reviewed_related_names = {
+        ("ITEM", "Legacy of Bramblejack"): "ブランブルジャックの遺産",
+    }
+    for group in related.get("groups", ()):
+        for row in (*group.get("query", ()), *group.get("items", ())):
+            key = (str(row.get("namespace", "")), str(row.get("name", "")))
+            if key in reviewed_related_names:
+                row["display_name"] = reviewed_related_names[key]
+    _append_source_revision(
+        related, component="reviewed related-item localization",
+        revision=EE2_SOUL_CORE_REVISION,
+        reason="Buri-reviewed v0.16.1 official Japanese name",
+    )
+
+    for name, payload in (
+        ("identity_index.json", identity), ("augment_index.json", augment),
+        ("stat_index.json", stats), ("related_item_groups.json", related),
+    ):
+        (OUTPUT / name).write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+
+def _related_identity(value: str) -> dict:
+    namespace, identity = value.split("::", 1)
+    name, separator, variant = identity.partition(" // ")
+    row = {"id": value, "namespace": namespace, "name": name}
+    if separator:
+        row["variant"] = variant
+    return row
+
+
+def _poe2_ninja_type(row: dict, identities: dict[tuple[str, str], list[dict]]) -> str | None:
+    namespace, name = row["namespace"], row["name"]
+    matches = identities.get((namespace, name), ())
+    if namespace == "GEM":
+        return "LineageSupportGems"
+    if namespace == "UNIQUE":
+        base = row.get("variant") or next(
+            (match.get("unique", {}).get("base") for match in matches if match.get("unique")), ""
+        )
+        bases = identities.get(("ITEM", base), ())
+        category = next(
+            ((match.get("craftable") or {}).get("category") for match in bases
+             if (match.get("craftable") or {}).get("category")), ""
+        )
+        if category in {"Ring", "Amulet", "Belt", "Talisman"}:
+            return "UniqueAccessories"
+        if category in {"Flask"}:
+            return "UniqueFlasks"
+        if category in {"Jewel"}:
+            return "UniqueJewels"
+        if category in {"Tablet"}:
+            return "UniqueTablets"
+        if category in {"SanctumRelic", "Relic"}:
+            return "UniqueSanctumRelics"
+        if category in {
+            "Bow", "Crossbow", "Spear", "Flail", "Staff", "Quarterstaff", "Warstaff",
+            "Wand", "Sceptre", "OneHandMace", "TwoHandMace", "One Hand Mace",
+            "Two Hand Mace", "OneHandSword", "TwoHandSword", "One Hand Sword",
+            "Two Hand Sword", "OneHandAxe", "TwoHandAxe", "One Hand Axe",
+            "Two Hand Axe", "Dagger",
+        }:
+            return "UniqueWeapons"
+        return "UniqueArmours" if category else None
+    if namespace != "ITEM":
+        return None
+    category = next(
+        ((match.get("craftable") or {}).get("category") for match in matches
+         if (match.get("craftable") or {}).get("category")), ""
+    )
+    tags = {tag for match in matches for tag in match.get("tags", ())}
+    if category == "SoulCore":
+        return "SoulCores"
+    if category == "Omen":
+        return "Ritual"
+    if category in {"VaultKey", "MapFragment", "PinnacleKey", "MiscMapItem"}:
+        return "Fragments"
+    if "catalyst" in tags or "breachstone_splinter" in tags:
+        return "Breach"
+    if "mushrune" in tags or "affliction_orb" in tags:
+        return "Delirium"
+    if any(tag.startswith("expedition_currency") for tag in tags):
+        return "Expedition"
+    if not tags and any(token in name for token in ("Collarbone", "Jawbone", "Rib", "Cranium", "Vertebrae")):
+        return "Abyss"
+    return "Currency" if category == "Currency" else None
+
+
+def build_related_item_groups(
+    ee2_root: Path, *, expected_revision: str | None = None,
+) -> dict:
+    revision = resolve_ee2_revision(
+        ee2_root, expected_revision=expected_revision,
+    )
+    data_root = ee2_root / "renderer" / "public" / "data"
+    localized = {}
+    identity_rows: dict[tuple[str, str], list[dict]] = {}
+    for language in ("en", "ja"):
+        localized[language] = [
+            json.loads(line) for line in (data_root / language / "items.ndjson").read_text(
+                encoding="utf-8"
+            ).splitlines() if line
+        ]
+    for row in localized["en"]:
+        identity_rows.setdefault((row.get("namespace", ""), row.get("refName", "")), []).append(row)
+    for override in _related_japanese_overrides():
+        if override.get("category"):
+            identity_rows.setdefault(
+                (override["namespace"], override["ref_name"]), []
+            ).append({"craftable": {"category": override["category"]}})
+    aliases = _related_identity_aliases()
+    for old_value, new_value in aliases.items():
+        old = _related_identity(old_value)
+        new = _related_identity(new_value)
+        old_key = (old["namespace"], old["name"])
+        new_key = (new["namespace"], new["name"])
+        if old_key in identity_rows and new_key not in identity_rows:
+            identity_rows[new_key] = identity_rows[old_key]
+    japanese = {
+        (row.get("namespace", ""), row.get("refName", "")): row.get("name", "")
+        for row in localized["ja"]
+    }
+    japanese.update({
+        (row["namespace"], row["ref_name"]): row["japanese"]
+        for row in _related_japanese_overrides()
+    })
+
+    def enrich(value: str) -> dict:
+        value = aliases.get(value, value)
+        row = _related_identity(value)
+        display = japanese.get((row["namespace"], row["name"]))
+        if display:
+            row["display_name"] = display
+        ninja_type = _poe2_ninja_type(row, identity_rows)
+        if ninja_type:
+            row["ninja_type"] = ninja_type
+        return row
+
+    raw_groups = json.loads((data_root / "item-drop.json").read_text(encoding="utf-8"))
+    groups = [{
+        "query": [enrich(value) for value in group.get("query", ())],
+        "items": [enrich(value) for value in group.get("items", ())],
+    } for group in raw_groups]
+    return {
+        "schema_version": 1,
+        "source": _ee2_source("related items", revision),
+        "source_revisions": [
+            _ee2_source(
+                "reviewed related identity selection", EE2_SOUL_CORE_REVISION,
+                reason="Buri-reviewed related-identity overrides",
+            ),
+        ],
+        "groups": groups,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ee2-root", type=Path)
+    parser.add_argument("--expected-ee2-revision")
+    parser.add_argument("--identity-review-report", type=Path, default=IDENTITY_REVIEW_REPORT)
+    parser.add_argument("--augment-only", action="store_true")
+    parser.add_argument("--related-only", action="store_true")
+    parser.add_argument("--reviewed-ee2-updates", action="store_true")
+    parser.add_argument("--v0162-soul-cores", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--reviewed-identity-overrides", action="store_true")
+    args = parser.parse_args()
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    if (
+        args.ee2_root is not None
+        and not (args.reviewed_ee2_updates or args.v0162_soul_cores)
+        and not args.expected_ee2_revision
+    ):
+        parser.error("--ee2-root requires --expected-ee2-revision")
+    try:
+        if args.reviewed_ee2_updates or args.v0162_soul_cores:
+            if args.ee2_root is None:
+                parser.error("--reviewed-ee2-updates requires --ee2-root")
+            apply_reviewed_ee2_updates(args.ee2_root)
+            return
+        if args.reviewed_identity_overrides:
+            apply_reviewed_identity_overrides()
+            return
+        if args.augment_only or args.related_only:
+            if args.ee2_root is None:
+                parser.error("--augment-only/--related-only requires --ee2-root")
+            if args.augment_only:
+                payloads = (("augment_index.json", build_augment_index(
+                    args.ee2_root, expected_revision=args.expected_ee2_revision,
+                )),)
+            else:
+                payloads = (("related_item_groups.json", build_related_item_groups(
+                    args.ee2_root, expected_revision=args.expected_ee2_revision,
+                )),)
+        else:
+            payloads = (
+                ("identity_index.json", build_identity_index(
+                    args.ee2_root, expected_revision=args.expected_ee2_revision,
+                )),
+                ("stat_index.json", build_stat_index()),
+            )
+    except IdentityReviewRequired as exc:
+        _write_identity_review_report(
+            args.identity_review_report,
+            revision=args.expected_ee2_revision,
+            anomalies=exc.anomalies,
+        )
+        parser.exit(2, f"{exc}; report={args.identity_review_report}\n")
+    for name, payload in payloads:
+        (OUTPUT / name).write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+
+if __name__ == "__main__":
+    main()

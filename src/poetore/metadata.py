@@ -13,6 +13,19 @@ from typing import Iterable
 INDEX_PATH = Path(__file__).resolve().parents[2] / "data" / "poetore" / "mod_metadata.json"
 PSEUDO_RELATIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "poetore" / "pseudo_relations.json"
 PSEUDO_DEFINITIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "poetore" / "pseudo_definitions.json"
+MULTI_VALUE_RULES_PATH = Path(__file__).resolve().parents[2] / "data" / "poetore" / "multi_value_rules.json"
+
+
+# Timeless Jewelの詳細コピーは人物名の後ろへ、そのジュエルで取り得る
+# 人物範囲を括弧書きする。公式Tradeの日本語statにはこの注記がないため、
+# Awakenedのadvanced matcherと同じく照合時だけ取り除く。
+_TIMELESS_JEWEL_ADVANCED_RANGE = re.compile(
+    r"\s*[（(](?:"
+    r"アフアナ|アコヤ|アセナス|アヴァリウス|カディロ|カディーロ|ヴォラナ"
+    r")[\-‐‑‒–—―−ー－](?:"
+    r"シバクア|ラキアタ|ナシマ|マクサリウス|ヴィクタリオ|メドヴェッド"
+    r")[）)]"
+)
 
 
 @lru_cache(maxsize=4)
@@ -54,6 +67,65 @@ def unique_fixed_stats(name: str, path: Path | None = None) -> frozenset[str] | 
     return frozenset(str(ref) for ref in records[key])
 
 
+def unique_icon_url(name: str, path: Path | None = None) -> str | None:
+    """固定済みAwakened itemsからPoE公式CDNのUniqueアイコンURLを返す。"""
+    path = (path or Path(os.environ.get("POETORE_METADATA_PATH", INDEX_PATH))).resolve()
+    if not name or not path.exists():
+        return None
+    value = _load_payload(str(path)).get("unique_icons", {}).get(name.strip().casefold())
+    return str(value) if value else None
+
+
+def unique_disenchant_value(
+    name: str, base_type: str, path: Path | None = None,
+) -> float | None:
+    """Unique名・基底種に対応する解呪ダストの基礎値を返す。"""
+    path = (path or Path(os.environ.get("POETORE_METADATA_PATH", INDEX_PATH))).resolve()
+    if not name or not path.exists():
+        return None
+    variants = _load_payload(str(path)).get("unique_disenchant_values", {}).get(
+        name.strip().casefold(), {}
+    )
+    if not isinstance(variants, dict) or not variants:
+        return None
+    value = variants.get(base_type.strip().casefold()) if base_type else None
+    if value is None:
+        values = {float(candidate) for candidate in variants.values()}
+        if len(values) != 1:
+            return None
+        value = values.pop()
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric > 0 else None
+
+
+def related_item_group(
+    namespace: str, name: str, variant: str | None = None, path: Path | None = None,
+) -> dict | None:
+    """英語Trade識別子に対応するAwakened由来の関連素材・報酬グループを返す。"""
+    path = (path or Path(os.environ.get("POETORE_METADATA_PATH", INDEX_PATH))).resolve()
+    if not namespace or not name or not path.exists():
+        return None
+    wanted_namespace = namespace.strip().upper()
+    wanted_name = name.strip().casefold()
+    wanted_variant = (variant or "").strip().casefold()
+    for group in _load_payload(str(path)).get("related_item_groups", ()):
+        for item in group.get("query", ()):
+            if (
+                str(item.get("namespace", "")).upper() == wanted_namespace
+                and str(item.get("name", "")).casefold() == wanted_name
+                and (
+                    not wanted_variant
+                    or not item.get("variant")
+                    or str(item.get("variant", "")).casefold() == wanted_variant
+                )
+            ):
+                return dict(group)
+    return None
+
+
 def pseudo_relations(path: Path | None = None) -> tuple[dict, ...]:
     """Awakened固定commitから機械抽出したpseudo間関係を返す。"""
     path = (path or PSEUDO_RELATIONS_PATH).resolve()
@@ -68,6 +140,17 @@ def pseudo_definitions(path: Path | None = None) -> tuple[dict, ...]:
     if not path.exists():
         return ()
     return tuple(dict(row) for row in _load_payload(str(path)).get("definitions", ()))
+
+
+def multi_value_rule(stat_id: str, path: Path | None = None) -> dict | None:
+    """レビュー済みの複数可変値Stat解釈ルールを返す。"""
+    path = (path or MULTI_VALUE_RULES_PATH).resolve()
+    if not stat_id or not path.exists():
+        return None
+    for row in _load_payload(str(path)).get("rules", ()):
+        if str(row.get("stat_id", "")) == stat_id:
+            return dict(row)
+    return None
 
 
 def validate_pseudo_payload(payload: dict, official_stat_ids: set[str] | None = None) -> list[str]:
@@ -116,6 +199,7 @@ def diff_pseudo_payloads(previous: dict, candidate: dict) -> dict[str, int]:
 
 def normalize_stat_text(text: str) -> str:
     text = text.replace("（", "(").replace("）", ")")
+    text = _TIMELESS_JEWEL_ADVANCED_RANGE.sub("", text)
     text = re.sub(r"\([^)]*(?:\d|implicit|crafted|enchant|ローカル)[^)]*\)", "", text, flags=re.I)
     text = re.sub(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?", "#", text)
     text = text.replace("+#", "#").replace("-#", "#")
@@ -148,11 +232,13 @@ class ModMetadata:
     japanese: tuple[str, ...]
     better: int = 1
     inverted: bool = False
+    negated: bool = False
     exact: bool = False
     local: bool = False
     decimal: bool = False
     tiers: tuple[TierRange, ...] = ()
     options: tuple[OptionValue, ...] = ()
+    category_select: str | None = None
 
     def search_bounds(self, value: float | None, roll_min: float | None = None,
                       roll_max: float | None = None, relaxation: float = 0.10
@@ -226,6 +312,89 @@ class MetadataIndex:
             return matches[0], None, 0.75
         return None, None, 0.0
 
+    def match_for_item_category(
+        self, text: str, kind: str, item_category: str,
+        generation: str | None = None,
+    ) -> tuple[ModMetadata | None, OptionValue | None, float]:
+        """アイテム種別・生成種別を使い、表示文が同じTrade statを解決する。"""
+        key = ("explicit" if kind in {"prefix", "suffix"} else kind, normalize_stat_text(text))
+        matches = self._by_match.get(key, ())
+        if generation == "foulborn":
+            mutated = [
+                record for record in matches
+                if any(
+                    (tier.mod_id or "").casefold().startswith("mutatedunique")
+                    for tier in record.tiers
+                )
+            ]
+            if len(mutated) == 1:
+                return mutated[0], None, 1.0
+        category = {
+            "weapon": "WEAPON",
+            "armour": "ARMOUR",
+            "heist_equipment": "HEIST_EQUIPMENT",
+            "tincture": "Tincture",
+            "sanctum_relic": "Sanctum Relic",
+        }.get(item_category)
+        selected = ([
+            record for record in matches
+            if record.category_select == category
+        ] if category is not None else [])
+        if len(selected) == 1:
+            return selected[0], None, 1.0
+        fallback = [record for record in matches if record.category_select == ""]
+        if len(fallback) == 1:
+            return fallback[0], None, 1.0
+        return self.match_with_option(text, kind)
+
+    def match_directional_inverse(
+        self, text: str, kind: str, item_category: str = "",
+        generation: str | None = None,
+    ) -> tuple[ModMetadata | None, OptionValue | None, float]:
+        """方向が逆の日本語表記を、同じ文型の公式statへ安全に照合する。
+
+        公式Tradeが ``increased`` statの負数として持つModは、日本語の詳細
+        コピーでは「減少する」「低下する」と表示されることがある。数値位置が
+        一つで、方向語を相互変換した候補が一意な場合だけ対応させる。
+        """
+        normalized = normalize_stat_text(text)
+        if normalized.count("#") != 1:
+            return None, None, 0.0
+        candidates = []
+        for source, targets in (
+            ("減少する", ("増加する",)),
+            ("低下する", ("増加する",)),
+            ("増加する", ("減少する", "低下する")),
+            ("遅くなる", ("速くなる",)),
+            ("速くなる", ("遅くなる",)),
+        ):
+            if source in normalized:
+                candidates.extend(normalized.replace(source, target) for target in targets)
+        resolved = []
+        for candidate in candidates:
+            if item_category:
+                record, option, confidence = self.match_for_item_category(
+                    candidate, kind, item_category, generation,
+                )
+                if record is not None and confidence == 1.0:
+                    resolved.append((record, option))
+                continue
+            key = ("explicit" if kind in {"prefix", "suffix"} else kind, candidate)
+            option_matches = self._by_option.get(key, ())
+            matches = self._by_match.get(key, ())
+            if len(option_matches) == 1 and not matches:
+                resolved.append(option_matches[0])
+            if len(matches) == 1 and not option_matches:
+                resolved.append((matches[0], None))
+        unique = {
+            (record.stat_id, option.value if option else None): (record, option)
+            for record, option in resolved
+        }
+        if len(unique) == 1:
+            record, option = next(iter(unique.values()))
+            return record, option, 1.0
+        return None, None, 0.0
+
     @classmethod
     def load(cls, path: Path = INDEX_PATH) -> "MetadataIndex":
         if not path.exists():
@@ -243,9 +412,13 @@ class MetadataIndex:
                 ref=row["ref"], stat_id=row["stat_id"], kind=row["kind"],
                 japanese=tuple(row.get("japanese", ())), better=int(row.get("better", 1)),
                 inverted=bool(row.get("inverted", False)), exact=bool(row.get("exact", False)),
+                negated=bool(row.get("negated", False)),
                 local=bool(row.get("local", False)),
                 decimal=bool(row.get("decimal", False)),
                 tiers=tiers, options=options,
+                category_select=("" if row.get("category_select") is None
+                                 and "category_select" in row
+                                 else row.get("category_select")),
             ))
         return cls(records)
 

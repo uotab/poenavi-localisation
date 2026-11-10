@@ -65,7 +65,7 @@ def main() -> int:
             startup_check=startup_stable,
         )
     except UpdateApplyError as exc:
-        suffix = f"\n{tr('errors.backup')}: {exc.backup}" if exc.backup else ""
+        suffix = f"\n\n{tr('errors.backup')}:\n{exc.backup}" if exc.backup else ""
         show_error(f"{exc}{suffix}")
         return 4
 

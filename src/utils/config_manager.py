@@ -6,6 +6,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from src.poetore.exchange_rate_settings import ensure_rate_pair_config
+from src.poetore.hideout_notification import (
+    normalize_hideout_notification_settings,
+)
 from src.utils.poe_version_data import POE1
 from src.utils.i18n import DEFAULT_LOCALE, normalize_locale
 
@@ -15,7 +19,12 @@ class ConfigManager:
     DEFAULT_CONFIG_FILE = "default_config.json"
     APP_NAME = "PoENavi"
     ENV_USER_DATA_DIR = "POENAVI_USER_DATA_DIR"
-    CURRENT_SCHEMA_VERSION = 5
+    # Schema 18 was published in v4.3.2. Keep the version monotonic even
+    # though the shared OCR hotkey feature has been withdrawn. Schema 19 adds
+    # the PoE-version-scoped Currency Exchange rate-pair lists. Schema 20 adds
+    # the opt-in PoETore hideout-stay notification settings. Schema 21 replaces
+    # the two Heist OCR actions with one opt-in manual-selection action.
+    CURRENT_SCHEMA_VERSION = 22
     POE1_ROUTE_ACT3_DEFAULT = "library_detour"
     POE1_ROUTE_ACT8_DEFAULT = "standard"
     POE1_ROUTE_ACT3_OLD_DEFAULT = "library_detour"
@@ -407,6 +416,178 @@ class ConfigManager:
                 if str(hotkeys.get("search_string_test", "")).lower() == "f4":
                     hotkeys["search_string_test"] = "none"
                 hotkeys.setdefault("exit", "F4")
+
+        if schema_version < 5:
+            hotkeys = migrated.get("hotkeys")
+            if isinstance(hotkeys, dict):
+                # v2.6.2までの既定値だけを新しい配置へ移す。
+                # ユーザーが別のキーへ変更済みの場合は保持する。
+                if str(hotkeys.get("lap", "")).lower() == "f9":
+                    hotkeys["lap"] = "none"
+                if str(hotkeys.get("logout", "")).lower() == "f5":
+                    hotkeys["logout"] = "none"
+                if str(hotkeys.get("exit", "")).lower() == "f4":
+                    hotkeys["exit"] = "F5"
+                if str(hotkeys.get("search_string_test", "")).lower() in {"", "none"}:
+                    hotkeys["search_string_test"] = "F4"
+
+        if schema_version < 6:
+            hotkeys = migrated.get("hotkeys")
+            if isinstance(hotkeys, dict):
+                # 未公開機能の旧既定値だけを左Altへ移す。
+                # CapsLock以外へ変更済みの割り当ては保持する。
+                if str(hotkeys.get("gem_shop_search", "")).lower() == "capslock":
+                    hotkeys["gem_shop_search"] = "Left Alt"
+
+        if schema_version < 7:
+            hotkeys = migrated.get("hotkeys")
+            if isinstance(hotkeys, dict):
+                # 未公開機能の旧既定値だけをF2へ移す。
+                if str(hotkeys.get("gem_shop_search", "")).lower() == "left alt":
+                    hotkeys["gem_shop_search"] = "F2"
+                    # F2を隠れ家へ割り当てていた場合は重複を避ける。
+                    if str(hotkeys.get("hideout", "")).lower() == "f2":
+                        hotkeys["hideout"] = "none"
+
+        if schema_version < 8:
+            startup = migrated.get("startup")
+            if not isinstance(startup, dict):
+                startup = {}
+            startup.setdefault("preferred_mode", "poenavi")
+            startup.setdefault("show_mode_selector", True)
+            migrated["startup"] = startup
+
+        if schema_version < 9:
+            # ログ未設定案内は現在のPoEバージョンのログパスだけで判定する。
+            # 旧「初回セットアップ完了」フラグは表示条件に使われなくなったため廃止。
+            migrated.pop("setup_completed", None)
+
+        if schema_version < 10:
+            hotkeys = migrated.get("hotkeys")
+            if isinstance(hotkeys, dict):
+                # PoEクライアント本体で隠れ家ホットキーが利用可能になったため廃止。
+                hotkeys.pop("hideout", None)
+
+        if schema_version < 11:
+            # PoE2ガイドは詳細版へ統一したため、旧選択状態をconfigから撤去する。
+            migrated.pop("guide_detail_level", None)
+            migrated.pop("guide_detail_level_selected", None)
+
+        if schema_version < 12:
+            cheat_sheets = migrated.get("cheat_sheets")
+            if isinstance(cheat_sheets, dict):
+                if "opacity" in cheat_sheets:
+                    cheat_sheets["image_transparency"] = (
+                        100 - int(cheat_sheets.pop("opacity"))
+                    )
+                if "background_opacity" in cheat_sheets:
+                    cheat_sheets["background_transparency"] = (
+                        100 - int(cheat_sheets.pop("background_opacity"))
+                    )
+
+        if schema_version < 13:
+            cheat_sheets = migrated.get("cheat_sheets")
+            if isinstance(cheat_sheets, dict):
+                # PoENaviの既存「透明率」と同じく、0%=完全透明、100%=不透明へ統一する。
+                if "image_transparency" in cheat_sheets:
+                    cheat_sheets["image_transparency"] = (
+                        100 - int(cheat_sheets["image_transparency"])
+                    )
+                if "background_transparency" in cheat_sheets:
+                    cheat_sheets["background_transparency"] = (
+                        100 - int(cheat_sheets["background_transparency"])
+                    )
+
+        if schema_version == 13:
+            cheat_sheets = migrated.get("cheat_sheets")
+            if isinstance(cheat_sheets, dict):
+                # 未公開の試作版で保存された値を、新しい初期値へ一度だけ揃える。
+                cheat_sheets["image_transparency"] = 100
+                cheat_sheets["background_transparency"] = 0
+
+        if schema_version < 15:
+            mini_navi = migrated.get("mini_guide_overlay")
+            if isinstance(mini_navi, dict):
+                legacy_always_on_top = mini_navi.pop("always_on_top", None)
+                mini_navi["topmost_mode"] = (
+                    "never" if legacy_always_on_top is False else "poe_only"
+                )
+
+        if schema_version < 16:
+            startup = migrated.get("startup")
+            if not isinstance(startup, dict):
+                startup = {}
+            startup.setdefault("windows_autostart_poetore", False)
+            migrated["startup"] = startup
+
+        if schema_version < 17:
+            poetore = migrated.get("poetore")
+            if not isinstance(poetore, dict):
+                poetore = {}
+            expedition = poetore.get("expedition_reward_overlay")
+            if not isinstance(expedition, dict):
+                expedition = {}
+            screen_reading = poetore.get("screen_reading")
+            if not isinstance(screen_reading, dict):
+                screen_reading = {}
+            screen_reading.setdefault("enabled", bool(expedition.get("enabled", False)))
+            expedition.pop("enabled", None)
+            poetore["screen_reading"] = screen_reading
+            poetore["expedition_reward_overlay"] = expedition
+            poetore.setdefault("desecration_tier_overlay", {})
+            migrated["poetore"] = poetore
+
+            hotkeys = migrated.get("hotkeys")
+            if not isinstance(hotkeys, dict):
+                hotkeys = {}
+            hotkeys.setdefault("desecration_tier_ocr", "alt+r")
+            migrated["hotkeys"] = hotkeys
+
+        if schema_version < 21:
+            poetore = migrated.get("poetore")
+            if not isinstance(poetore, dict):
+                poetore = {}
+            heist = poetore.get("heist_curio_ocr")
+            if not isinstance(heist, dict):
+                heist = {}
+            heist.setdefault("enabled", False)
+            poetore["heist_curio_ocr"] = heist
+            migrated["poetore"] = poetore
+
+            hotkeys = migrated.get("hotkeys")
+            if not isinstance(hotkeys, dict):
+                hotkeys = {}
+            manual_hotkey = hotkeys.pop("heist_curio_manual_ocr", None)
+            current_hotkey = str(hotkeys.get("heist_curio_ocr", "")).strip()
+            if manual_hotkey:
+                hotkeys["heist_curio_ocr"] = manual_hotkey
+            elif not current_hotkey or current_hotkey.lower() == "alt+h":
+                hotkeys["heist_curio_ocr"] = "alt+e"
+            migrated["hotkeys"] = hotkeys
+
+        if schema_version == 21:
+            # The Heist OCR feature was still unreleased when its initial
+            # default changed.  Migrate only that saved prototype default;
+            # every other user-selected key remains untouched.
+            hotkeys = migrated.get("hotkeys")
+            if not isinstance(hotkeys, dict):
+                hotkeys = {}
+            current_hotkey = str(hotkeys.get("heist_curio_ocr", "")).strip()
+            if current_hotkey.lower() == "alt+shift+h":
+                hotkeys["heist_curio_ocr"] = "alt+e"
+            migrated["hotkeys"] = hotkeys
+
+        # Missing keys mean first use and receive the initial pair. Explicit
+        # empty lists are retained so deleting every row survives a restart.
+        ensure_rate_pair_config(migrated)
+
+        poetore = migrated.get("poetore")
+        if not isinstance(poetore, dict):
+            poetore = {}
+        poetore["hideout_notification"] = normalize_hideout_notification_settings(
+            poetore.get("hideout_notification")
+        )
+        migrated["poetore"] = poetore
 
         if "poe1_route_selected" not in migrated:
             migrated["poe1_route_selected"] = cls._infer_poe1_route_selected(config)

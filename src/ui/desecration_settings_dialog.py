@@ -1,0 +1,401 @@
+"""Settings UI for the PoE2 Abyss Desecration tier overlay."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDialog,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+
+from src.poetore.window_position import path_of_exile_client_rect
+from src.ui.dialog_theme import (
+    POETORE_DIALOG_THEME,
+    apply_dialog_theme,
+    build_dialog_stylesheet,
+)
+from src.ui.expedition_settings_dialog import (
+    ClickableImageLabel,
+    ExpeditionRegionSelector,
+    RegionPreview,
+    valid_normalized_region,
+)
+from src.ui.high_accuracy_ocr_pack_group import HighAccuracyOcrPackGroup
+from src.ui.settings_dialog import AutoHideHotkeyWidget
+from src.utils.i18n import tr_ui
+
+DEFAULT_EXAMPLE_IMAGE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "assets"
+    / "images"
+    / "desecration_region_example.png"
+)
+EXAMPLE_POPUP_SIZE = QSize(1350, 700)
+EXAMPLE_POPUP_IMAGE_SIZE = QSize(1290, 945)
+
+
+class DesecrationRegionSelector(ExpeditionRegionSelector):
+    def __init__(self, client_rect, parent=None):
+        super().__init__(client_rect, parent)
+        self.setWindowTitle(tr_ui("アビス冒涜Modの読取範囲を指定"))
+
+
+class DesecrationSettingsDialog(QDialog):
+    def __init__(
+        self,
+        parent=None,
+        desecration_config=None,
+        hotkey="alt+r",
+        screen_reading_enabled=False,
+        example_image_path=None,
+        client_rect_getter=path_of_exile_client_rect,
+        selector_class=DesecrationRegionSelector,
+        ocr_pack_controller=None,
+    ):
+        super().__init__(parent)
+        self._config = dict(desecration_config or {})
+        self._regions = {
+            "inventory_open_region": valid_normalized_region(
+                self._config.get("inventory_open_region")
+            ),
+            "inventory_closed_region": valid_normalized_region(
+                self._config.get("inventory_closed_region")
+            ),
+        }
+        self._client_rect_getter = client_rect_getter
+        self._selector_class = selector_class
+        self._example_image_path = Path(
+            example_image_path or DEFAULT_EXAMPLE_IMAGE_PATH
+        )
+        self._ocr_pack_controller = ocr_pack_controller
+        self._section_widgets = {}
+        self.setWindowTitle(tr_ui("アビス冒涜Modティアチェック設定"))
+        self.setMinimumSize(620, 820)
+        self.theme = POETORE_DIALOG_THEME
+        apply_dialog_theme(self, self.theme)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 12)
+        root.setSpacing(10)
+        self.title_label = QLabel(tr_ui("アビス冒涜Modティアチェック設定"))
+        self.title_label.setProperty("uiRole", "title")
+        root.addWidget(self.title_label)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("desecrationSettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content_widget = QWidget()
+        content = QVBoxLayout(content_widget)
+        content.setContentsMargins(4, 4, 4, 4)
+        content.setSpacing(10)
+        scroll.setWidget(content_widget)
+        root.addWidget(scroll, 1)
+
+        basic_group, basic = self._section_group("1. 基本設定", "basicSettingsGroup")
+        reading_toggle_row = QHBoxLayout()
+        reading_toggle_row.setSpacing(8)
+        self.enabled_checkbox = QCheckBox(tr_ui("ゲーム画面の読み取り機能を有効にする"))
+        self.enabled_checkbox.setChecked(bool(screen_reading_enabled))
+        reading_toggle_row.addWidget(self.enabled_checkbox)
+        self.enable_required_hint = QLabel(tr_ui("※使用するにはチェックをONにしてください"))
+        self.enable_required_hint.setObjectName("screenReadingEnableRequiredHint")
+        reading_toggle_row.addWidget(self.enable_required_hint)
+        reading_toggle_row.addStretch()
+        basic.addLayout(reading_toggle_row)
+        shared_hint = QLabel(
+            tr_ui("エクスペ報酬価格チェックとアビス冒涜Modティアチェックで共通の設定です。")
+        )
+        shared_hint.setWordWrap(True)
+        shared_hint.setProperty("uiRole", "muted")
+        basic.addWidget(shared_hint)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 2, 0, 0)
+        self.hotkey_widget = AutoHideHotkeyWidget(
+            hotkey,
+            theme=self.theme,
+            allow_no_modifier=True,
+            allow_multiple_modifiers=True,
+            allow_shift=True,
+        )
+        self.hotkey_widget.key_button.setStyleSheet("")
+        form.addRow("読取ショートカット:", self.hotkey_widget)
+        basic.addLayout(form)
+        content.addWidget(basic_group)
+
+        pack_group = HighAccuracyOcrPackGroup(self._ocr_pack_controller, self)
+        self.ocr_pack_status = pack_group.status_label
+        self.ocr_pack_progress = pack_group.progress_bar
+        self.ocr_pack_retry = pack_group.retry_button
+        content.addWidget(pack_group)
+
+        range_group, ranges = self._section_group("3. 読取範囲", "readRegionsGroup")
+        instruction = QLabel(
+            tr_ui("タイトル・装備画像・確認ボタンを含めず、3つのMod選択肢部分だけを囲んでください。\n"
+            "読取時は「インベントリを開いた状態」を先に確認し、読取に失敗した場合は"
+            "「閉じた状態」を確認します。")
+        )
+        instruction.setWordWrap(True)
+        instruction.setObjectName("desecrationRegionInstruction")
+        instruction.setProperty("uiRole", "muted")
+        ranges.addWidget(instruction)
+        size_warning = QLabel(
+            tr_ui("PoE2のウィンドウサイズを変更した場合、位置が変わるため再設定が必要です。")
+        )
+        size_warning.setWordWrap(True)
+        size_warning.setObjectName("screenSizeRegionWarning")
+        size_warning.setProperty("state", "warning")
+        ranges.addWidget(size_warning)
+        self._add_region_section(
+            ranges,
+            "inventory_open_region",
+            "インベントリを開いた状態",
+            required=True,
+        )
+        self._add_region_section(
+            ranges,
+            "inventory_closed_region",
+            "インベントリを閉じた状態（任意）",
+            note="※インベントリを閉じると位置がずれて読取に失敗するため",
+        )
+        heading = QHBoxLayout()
+        example_heading = QLabel(tr_ui("指定例"))
+        example_heading.setObjectName("desecrationExampleHeading")
+        example_heading.setProperty("uiRole", "section")
+        heading.addWidget(example_heading)
+        hint = QLabel(tr_ui("※以下の画像をクリックするとポップアップで拡大表示します"))
+        hint.setProperty("uiRole", "muted")
+        heading.addWidget(hint)
+        heading.addStretch()
+        ranges.addLayout(heading)
+        self.example_thumbnail = ClickableImageLabel()
+        self.example_thumbnail.setObjectName("desecrationExampleThumbnail")
+        self.example_thumbnail.setProperty("uiRole", "surface")
+        self.example_thumbnail.setAlignment(Qt.AlignCenter)
+        self.example_thumbnail.setFixedHeight(130)
+        self.example_thumbnail.setCursor(Qt.PointingHandCursor)
+        self.example_thumbnail.clicked.connect(self._show_example_popup)
+        ranges.addWidget(self.example_thumbnail)
+        self._load_example_thumbnail()
+        content.addWidget(range_group)
+
+        display_group, display = self._section_group(
+            "4. 表示設定", "displaySettingsGroup"
+        )
+        self.show_ranges_checkbox = QCheckBox(tr_ui("Tierの数値範囲を表示する（例：15–25%）"))
+        self.show_ranges_checkbox.setChecked(
+            bool(self._config.get("show_tier_ranges", True))
+        )
+        display.addWidget(self.show_ranges_checkbox)
+        content.addWidget(display_group)
+        content.addStretch()
+
+        self.footer_layout = QHBoxLayout()
+        self.footer_layout.addStretch()
+        self.cancel_button = QPushButton(tr_ui("キャンセル"))
+        self.cancel_button.setProperty("buttonRole", "secondary")
+        self.cancel_button.clicked.connect(self.reject)
+        self.save_button = QPushButton(tr_ui("保存"))
+        self.save_button.setProperty("buttonRole", "primary")
+        self.save_button.setDefault(True)
+        self.save_button.clicked.connect(self.accept)
+        self.footer_layout.addWidget(self.cancel_button)
+        self.footer_layout.addWidget(self.save_button)
+        root.addLayout(self.footer_layout)
+        self.enable_required_hint.setProperty("state", "warning")
+        self._clear_legacy_control_styles()
+        self._refresh_all()
+
+    @staticmethod
+    def _section_group(title: str, object_name: str):
+        group = QGroupBox(title)
+        group.setObjectName(object_name)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(12, 18, 12, 12)
+        layout.setSpacing(8)
+        return group, layout
+
+    def _add_region_section(self, root, key, title, *, required=False, note=""):
+        heading = QHBoxLayout()
+        heading.setSpacing(4)
+        title_label = QLabel(title)
+        title_label.setObjectName(f"{key}Title")
+        title_label.setProperty("uiRole", "section")
+        heading.addWidget(title_label)
+        if required:
+            required_label = QLabel(tr_ui("（必須）"))
+            required_label.setObjectName("desecrationRequiredLabel")
+            required_label.setProperty("state", "warning")
+            heading.addWidget(required_label)
+        if note:
+            note_label = QLabel(note)
+            note_label.setObjectName("desecrationClosedRegionNote")
+            note_label.setProperty("uiRole", "muted")
+            heading.addWidget(note_label)
+        heading.addStretch()
+        root.addLayout(heading)
+        status = QLabel()
+        preview = RegionPreview(theme=self.theme)
+        preview.setMinimumHeight(82)
+        preview.set_region(self._regions[key])
+        root.addWidget(status)
+        root.addWidget(preview)
+        row = QHBoxLayout()
+        choose = QPushButton()
+        choose.clicked.connect(
+            lambda _checked=False, item=key: self._choose_region(item)
+        )
+        reset = QPushButton(tr_ui("読取範囲をリセット"))
+        reset.setProperty("buttonRole", "danger")
+        reset.clicked.connect(lambda _checked=False, item=key: self._reset_region(item))
+        row.addWidget(choose)
+        row.addWidget(reset)
+        root.addLayout(row)
+        self._section_widgets[key] = (status, preview, choose, reset)
+
+    def settings(self) -> tuple[dict, str, bool]:
+        config = dict(self._config)
+        config["show_tier_ranges"] = self.show_ranges_checkbox.isChecked()
+        for key, region in self._regions.items():
+            if region is None:
+                config.pop(key, None)
+            else:
+                config[key] = dict(region)
+        return config, self.hotkey_widget.key_text, self.enabled_checkbox.isChecked()
+
+    def _choose_region(self, key):
+        client_rect = self._client_rect_getter()
+        if client_rect is None:
+            QMessageBox.warning(
+                self,
+                tr_ui("PoE2が見つかりません"),
+                tr_ui("PoE2を起動して冒涜Modの3択画面を表示してから、もう一度お試しください。"),
+            )
+            return
+        windows = [self]
+        owner = self.parentWidget()
+        if owner is not None and owner.isWindow():
+            windows.append(owner)
+        opacities = [window.windowOpacity() for window in windows]
+        for window in windows:
+            window.setWindowOpacity(0.0)
+        QApplication.processEvents()
+        try:
+            selector = self._selector_class(QRect(client_rect), self)
+            result = selector.exec()
+        finally:
+            for window, opacity in reversed(list(zip(windows, opacities))):
+                window.setWindowOpacity(opacity)
+            self.raise_()
+            self.activateWindow()
+        if result != QDialog.Accepted:
+            return
+        region = valid_normalized_region(selector.selected_region)
+        if region is None:
+            QMessageBox.warning(
+                self, tr_ui("範囲を確認してください"), tr_ui("選択した範囲を保存できませんでした。")
+            )
+            return
+        self._regions[key] = region
+        self._refresh_all()
+
+    def _reset_region(self, key):
+        self._regions[key] = None
+        self._refresh_all()
+
+    def _refresh_all(self):
+        for key, (status, preview, choose, reset) in self._section_widgets.items():
+            configured = self._regions[key] is not None
+            required = key == "inventory_open_region"
+            if configured:
+                text, state = "設定済み", "success"
+            elif required:
+                text, state = "未設定（読取ショートカットは無効）", "warning"
+            else:
+                text, state = "未設定", "muted"
+            status.setText(text)
+            if state == "muted":
+                status.setProperty("uiRole", "muted")
+                self._set_label_state(status, "")
+            else:
+                status.setProperty("uiRole", None)
+                self._set_label_state(status, state)
+            preview.set_region(self._regions[key])
+            choose.setText("読取範囲を再設定" if configured else "読取範囲を設定")
+            reset.setEnabled(configured)
+
+    def _load_example_thumbnail(self):
+        pixmap = QPixmap(str(self._example_image_path))
+        if pixmap.isNull():
+            self.example_thumbnail.setText(
+                tr_ui("指定例画像は準備中です\n（画像追加後、ここをクリックすると拡大表示します）")
+            )
+            return
+        self.example_thumbnail.setPixmap(
+            pixmap.scaled(QSize(540, 120), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+
+    def _show_example_popup(self):
+        popup = QDialog(self)
+        popup.setWindowTitle(tr_ui("読取範囲の指定例"))
+        popup.resize(EXAMPLE_POPUP_SIZE)
+        apply_dialog_theme(popup, self.theme)
+        layout = QVBoxLayout(popup)
+        image = QLabel()
+        image.setObjectName("desecrationExamplePopupImage")
+        image.setAlignment(Qt.AlignCenter)
+        pixmap = QPixmap(str(self._example_image_path))
+        image.setText(
+            tr_ui("指定例画像は準備中です。")
+        ) if pixmap.isNull() else image.setPixmap(
+            pixmap.scaled(
+                EXAMPLE_POPUP_IMAGE_SIZE,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+        )
+        layout.addWidget(image)
+        close = QPushButton(tr_ui("閉じる"))
+        close.setProperty("buttonRole", "secondary")
+        close.clicked.connect(popup.accept)
+        layout.addWidget(close, alignment=Qt.AlignRight)
+        popup.exec()
+
+    @staticmethod
+    def _style_sheet():
+        return build_dialog_stylesheet(POETORE_DIALOG_THEME)
+
+    @staticmethod
+    def _set_label_state(label: QLabel, state: str) -> None:
+        label.setProperty("state", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def _clear_legacy_control_styles(self) -> None:
+        """対象設定内だけ、旧インラインQSSを共通テーマへ委譲する。"""
+        for widget_type in (
+            QCheckBox,
+            QGroupBox,
+            QProgressBar,
+            QPushButton,
+            QScrollArea,
+        ):
+            for widget in self.findChildren(widget_type):
+                widget.setStyleSheet("")

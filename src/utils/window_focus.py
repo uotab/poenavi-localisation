@@ -2,6 +2,60 @@
 
 import sys
 import time
+from pathlib import PureWindowsPath
+
+
+SW_RESTORE = 9
+
+
+def _restore_window_if_minimized(user32, hwnd) -> bool:
+    """Restore hwnd only when Windows reports that it is minimized."""
+    if not user32.IsIconic(hwnd):
+        return False
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    return True
+
+
+def is_path_of_exile_process_name(process_name: str) -> bool:
+    """Path of Exileの実行ファイル名だけを安全な送信先として受け入れる。"""
+    name = PureWindowsPath(process_name or "").name.lower()
+    return name.startswith("pathofexile") and name.endswith(".exe")
+
+
+def is_path_of_exile_window(hwnd) -> bool:
+    """指定ウィンドウがPath of Exileプロセスのものか確認する。"""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+        if not pid.value:
+            return False
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not process:
+            return False
+        try:
+            size = wintypes.DWORD(32768)
+            path = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size)):
+                return False
+            return is_path_of_exile_process_name(path.value)
+        finally:
+            kernel32.CloseHandle(process)
+    except Exception as exc:
+        print(f"[WINDOW] Path of Exile process check failed: {exc}")
+        return False
 
 
 def get_foreground_window():
@@ -19,6 +73,28 @@ def get_foreground_window():
         return None
 
 
+def get_window_rect(hwnd):
+    """Return a window's outer bounds as (x, y, width, height)."""
+    if sys.platform != "win32" or not hwnd:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        return (
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        )
+    except Exception as exc:
+        print(f"[WINDOW] GetWindowRect failed: {exc}")
+        return None
+
+
 def focus_window(hwnd, wait_seconds=0.12):
     """Best-effort foreground restore for a previously captured HWND."""
     if sys.platform != "win32" or not hwnd:
@@ -33,6 +109,8 @@ def focus_window(hwnd, wait_seconds=0.12):
 
         user32.GetForegroundWindow.restype = wintypes.HWND
         user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
         user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         user32.BringWindowToTop.argtypes = [wintypes.HWND]
         user32.SetForegroundWindow.argtypes = [wintypes.HWND]
@@ -47,8 +125,7 @@ def focus_window(hwnd, wait_seconds=0.12):
             print("[WINDOW] target window no longer exists")
             return False
 
-        SW_RESTORE = 9
-        user32.ShowWindow(hwnd, SW_RESTORE)
+        _restore_window_if_minimized(user32, hwnd)
 
         foreground = user32.GetForegroundWindow()
         current_thread = kernel32.GetCurrentThreadId()

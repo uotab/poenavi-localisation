@@ -1,6 +1,13 @@
 import unittest
 
 from src.poetore import ItemParseError, parse_item_text
+from src.poetore.metadata import ModMetadata
+from src.poetore.models import apply_roll_increase
+from src.poetore.parser import (
+    _modifier_header_details,
+    _modifier_values,
+    _values_for_matched_template,
+)
 from src.utils.i18n import EN, JA, set_locale
 
 
@@ -23,6 +30,370 @@ RARE_JP = """アイテムクラス: 指輪
 
 
 class PoetoreParserTest(unittest.TestCase):
+    def test_single_placeholder_ignores_fixed_number_before_roll(self):
+        item = parse_item_text("""アイテムクラス: 靴
+レアリティ: レア
+狂喜の要請
+リヴァイアサングリーヴ
+--------
+アイテムレベル: 86
+--------
+{ イーター・オブ・ワールズ 暗黙モッド 「特大」 — ライフ }
+エンデュランスチャージ1個ごとに毎秒ライフの0.2%を自動回復する
+--------
+""")
+
+        modifier = item.modifiers[0]
+        self.assertEqual(modifier.stat_id, "implicit.stat_989800292")
+        self.assertEqual(modifier.values, (0.2,))
+
+    def test_added_damage_range_uses_average_of_placeholders(self):
+        template = "プレイヤーおよび近くの味方は青ソケット1個ごとに#から#の追加雷ダメージを獲得する"
+        metadata = ModMetadata(
+            ref="test", stat_id="explicit.test", kind="explicit",
+            japanese=(template,),
+        )
+
+        self.assertEqual(
+            _modifier_values(
+                "プレイヤーおよび近くの味方は青ソケット1個ごとに3から60の追加雷ダメージを獲得する",
+                metadata,
+            ),
+            (31.5,),
+        )
+
+    def test_other_multiple_placeholders_keep_legacy_values_until_reviewed(self):
+        template = "効果は#秒間持続し効果が#%増加する"
+        metadata = ModMetadata(
+            ref="test", stat_id="explicit.test", kind="explicit",
+            japanese=(template,),
+        )
+
+        self.assertEqual(
+            _modifier_values("効果は4秒間持続し効果が20%増加する", metadata),
+            (4.0, 20.0),
+        )
+
+    def test_reviewed_multiple_placeholder_rules_are_applied(self):
+        cases = (
+            (
+                "crafted.stat_1445684883",
+                "ブロック時に#から#の物理ダメージをアタックしてきた敵に反射する",
+                "ブロック時に6から12の物理ダメージをアタックしてきた敵に反射する",
+                (6.0,),
+            ),
+            (
+                "explicit.stat_1445684883",
+                "ブロック時に#から#の物理ダメージをアタックしてきた敵に反射する",
+                "ブロック時に6から12の物理ダメージをアタックしてきた敵に反射する",
+                (9.0,),
+            ),
+            (
+                "explicit.stat_3102860761",
+                "トラップを投げると#秒間移動スピードが#%増加する",
+                "トラップを投げると4秒間移動スピードが20%増加する",
+                (20.0,),
+            ),
+            (
+                "explicit.stat_3595254837",
+                "移動中に地面に燃焼領域を生成し、毎秒#の火ダメージを#秒間与える",
+                "移動中に地面に燃焼領域を生成し、毎秒100の火ダメージを4秒間与える",
+                (),
+            ),
+        )
+        for stat_id, template, line, expected in cases:
+            metadata = ModMetadata(
+                ref="test", stat_id=stat_id, kind=stat_id.split(".", 1)[0],
+                japanese=(template,),
+            )
+            with self.subTest(stat_id=stat_id):
+                self.assertEqual(_modifier_values(line, metadata), expected)
+
+    def test_template_extraction_ignores_roll_range(self):
+        self.assertEqual(
+            _values_for_matched_template(
+                "最大ライフ +99(85-99)", ("最大ライフ +#",),
+            ),
+            (99.0,),
+        )
+
+    def test_japanese_forbidden_shako_random_support_mods_use_indexable_stats(self):
+        for name in ("禁断のシャコー帽", "禁断のシャコー帽（レプリカ）"):
+            item = parse_item_text(f"""アイテムクラス: 兜
+レアリティ: ユニーク
+{name}
+グレートクラウン
+--------
+アイテムレベル: 85
+--------
+{{ ユニークモッド }}
+ソケットされたジェムはレベル8(1-10)クリティカルダメージ増加によりサポートされる
+{{ ユニークモッド }}
+ソケットされたジェムはレベル29(25-35)ミニオンスピードによりサポートされる
+{{ ユニークモッド — 能力値 }}
+全ての能力値 +29(25-30)
+--------
+""")
+
+            with self.subTest(name=name):
+                by_id = {modifier.stat_id: modifier for modifier in item.modifiers}
+                self.assertEqual(
+                    by_id["explicit.indexable_support_67"].values[0], 8.0
+                )
+                self.assertEqual(
+                    by_id["explicit.indexable_support_62"].values[0], 29.0
+                )
+                self.assertEqual(
+                    by_id["explicit.indexable_support_67"].roll_min, 1.0
+                )
+                self.assertEqual(
+                    by_id["explicit.indexable_support_62"].roll_max, 35.0
+                )
+                self.assertNotIn(None, by_id)
+
+    def test_japanese_forbidden_shako_supports_ignore_advanced_copy_suffix(self):
+        item = parse_item_text("""アイテムクラス: 兜
+レアリティ: ユニーク
+禁断のシャコー帽
+グレートクラウン
+--------
+アイテムレベル: 85
+--------
+{ ユニークモッド — ジェム }
+ソケットされたジェムはレベル10(1-10)投射物追加(グレーター投射物追加-聖別)によりサポートされる
+{ ユニークモッド — ジェム }
+ソケットされたジェムはレベル25(25-35)元素伝染(グレーター投射物追加-聖別)によりサポートされる
+--------
+""")
+
+        by_id = {modifier.stat_id: modifier for modifier in item.modifiers}
+        self.assertEqual(by_id["explicit.indexable_support_55"].values[0], 10.0)
+        self.assertEqual(by_id["explicit.indexable_support_89"].values[0], 25.0)
+        self.assertEqual(by_id["explicit.indexable_support_55"].roll_min, 1.0)
+        self.assertEqual(by_id["explicit.indexable_support_89"].roll_max, 35.0)
+        self.assertNotIn(None, by_id)
+
+    def test_japanese_dragonfang_random_skill_mod_uses_indexable_skill_stat(self):
+        for name in ("竜の牙の飛翔", "竜の牙の飛翔（レプリカ）"):
+            for skill, stat_id in (
+                ("ブレードブラスト", "explicit.indexable_skill_217"),
+                ("ブレードヴォーテックス", "explicit.indexable_skill_138"),
+            ):
+                item = parse_item_text(f"""アイテムクラス: アミュレット
+レアリティ: ユニーク
+{name}
+オニキスのアミュレット
+--------
+アイテムレベル: 85
+--------
+{{ ユニークモッド }}
+全ての{skill}(ファイヤーボール-マナインフューズスタッフ)ジェムのレベル +3
+--------
+""")
+
+                with self.subTest(name=name, skill=skill):
+                    modifier = item.modifiers[0]
+                    self.assertEqual(modifier.stat_id, stat_id)
+                    self.assertEqual(modifier.values, (3.0,))
+                    self.assertEqual(modifier.better, 1)
+
+    def test_flask_hybrid_reduced_effect_uses_flask_directional_stat(self):
+        item = parse_item_text("""アイテムクラス: ユーティリティフラスコ
+レアリティ: マジック
+割り当てられた クリスタルの ダイヤモンドフラスコ
+--------
+6秒間持続
+使用時に40中20チャージを消費
+現在0チャージ
+グローバルクリティカル率が100%増加する
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「割り当てられた」 (ティア: 2) }
+チャージ回復量が60(55-60)%増加する
+効果が25%減少する
+{ サフィックスモッド 「クリスタルの」 (ティア: 3) — 元素, 耐性 }
+効果中は13(12-14)%の元素耐性が追加される
+""")
+
+        reduced_effect = next(
+            modifier for modifier in item.modifiers
+            if modifier.text == "効果が25%減少する"
+        )
+        self.assertEqual(reduced_effect.stat_id, "explicit.stat_2448920197")
+        self.assertTrue(reduced_effect.inverted)
+        self.assertEqual(reduced_effect.better, 1)
+
+    def test_itemised_spectre_corpse_is_detected_and_help_text_is_ignored(self):
+        item = parse_item_text("""アイテムクラス: 死体
+レアリティ: カレンシー
+完全体のドルイド錬金術師
+--------
+死体レベル: 85
+モンスターカテゴリー: 人型
+--------
+アイテムレベル: 85
+--------
+ポイゾナスコンコクションを投げる
+フラスコの効果が200％増加する
+所有者は3秒ごとにライフフラスコのチャージを1得る
+--------
+このアイテムを右クリックしてこの死体を生成する。
+""")
+
+        self.assertEqual(item.category, "corpse")
+        self.assertEqual(item.item_level, 85)
+        self.assertEqual(item.properties["死体レベル"], "85")
+        self.assertEqual(len(item.modifiers), 3)
+        self.assertFalse(any("右クリック" in mod.text for mod in item.modifiers))
+
+    def test_embryonic_gift_is_detected_and_fixed_help_text_is_ignored(self):
+        item = parse_item_text("""アイテムクラス: 母胎ギフト
+レアリティ: カレンシー
+古代の母胎ギフト
+--------
+アイテムレベル: 83
+1790のハイヴブラッドが必要
+--------
+創生の樹でユニークアイテムに成長させられる
+--------
+このアイテムを創生の樹の割り当て済みのユニークアイテムの母胎に配置する。右クリックで創生の樹から取り除ける。
+""")
+
+        self.assertEqual(item.category, "incubator")
+        self.assertEqual(item.base_type, "古代の母胎ギフト")
+        self.assertEqual(item.item_level, 83)
+        self.assertEqual(item.modifiers, ())
+
+    def test_cluster_jewel_parenthetical_enchant_help_is_not_an_unresolved_mod(self):
+        item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: ノーマル
+クラスタージュエル (中)
+--------
+アイテムレベル: 83
+--------
+パッシブスキルを4個追加する (enchant)
+(追加されたパッシブスキルは他のジュエルの範囲内にあるとみなされることはない) (enchant)
+(追加されるパッシブスキルは別途明記されない限り通常パッシブである) (enchant)
+ジュエルソケット1個がパッシブスキルに追加される (enchant)
+追加される通常パッシブスキルは付与: 非ダメージ性状態異常の効果が10%増加する (enchant)
+(特殊パッシブ、マスタリー、キーストーン、ジュエルソケット以外のパッシブスキルを通常パッシブという) (enchant)
+--------
+パッシブツリーで割り当てられたジュエルソケット(大)または(中)にはめる。追加されたパッシブは他の半径を持つジュエルと相互作用しない。右クリックしてソケットから取り外すことができる。
+""")
+
+        self.assertEqual(item.category, "cluster_jewel")
+        self.assertFalse(any(mod.stat_id is None for mod in item.modifiers))
+        self.assertFalse(any(mod.text.startswith("(") for mod in item.modifiers))
+        base_effect = next(
+            mod for mod in item.modifiers
+            if mod.stat_id == "enchant.stat_3948993189"
+        )
+        self.assertEqual(base_effect.option_value, 23)
+
+    def test_large_cluster_jewel_size_specific_socket_help_is_not_a_modifier(self):
+        item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: ノーマル
+クラスタージュエル (大)
+--------
+アイテムレベル: 83
+--------
+パッシブスキルを12個追加する (enchant)
+(追加されたパッシブスキルは他のジュエルの範囲内にあるとみなされることはない) (enchant)
+(追加されるパッシブスキルは別途明記されない限り通常パッシブである) (enchant)
+ジュエルソケット2個がパッシブスキルに追加される (enchant)
+追加される通常パッシブスキルは付与: アタックダメージが10%増加する (enchant)
+(特殊パッシブ、マスタリー、キーストーン、ジュエルソケット以外のパッシブスキルを通常パッシブという) (enchant)
+--------
+パッシブツリーで割り当てられたジュエルソケット(大)にはめる。追加されたパッシブは他の半径を持つジュエルと相互作用しない。右クリックしてソケットから取り外すことができる。
+""")
+
+        self.assertEqual(item.category, "cluster_jewel")
+        self.assertEqual(len(item.modifiers), 3)
+        self.assertFalse(any(mod.stat_id is None for mod in item.modifiers))
+        self.assertEqual(
+            {mod.stat_id for mod in item.modifiers},
+            {
+                "enchant.stat_3086156145",
+                "enchant.stat_4079888060",
+                "enchant.stat_3948993189",
+            },
+        )
+
+    def test_combines_multiline_cluster_jewel_enchant_option(self):
+        item = parse_item_text("""アイテムクラス: ジュエル
+レアリティ: レア
+竜の石
+クラスタージュエル (大)
+--------
+アイテムレベル: 83
+--------
+パッシブスキルを10個追加する (enchant)
+ジュエルソケット2個がパッシブスキルに追加される (enchant)
+追加される通常パッシブスキルは付与: スタッフによるアタックのヒットおよび状態異常のダメージが12%増加する (enchant)
+追加される通常パッシブスキルは付与: メイスまたはセプターによるアタックのヒットおよび状態異常のダメージが12%増加する (enchant)
+--------
+{ プレフィックスモッド「健康な」 (ティア: 2) — ライフ }
+追加されるスモールパッシブスキルはさらに付与: 最大ライフ +5(4-7)
+""")
+
+        self.assertFalse(any(mod.stat_id is None for mod in item.modifiers))
+        base_effect = next(
+            mod for mod in item.modifiers
+            if mod.stat_id == "enchant.stat_3948993189"
+        )
+        self.assertEqual(base_effect.option_value, 2)
+        self.assertIn("\n", base_effect.text)
+        life = next(
+            mod for mod in item.modifiers
+            if mod.stat_id == "explicit.stat_3819827377"
+        )
+        self.assertEqual(life.kind, "prefix")
+        self.assertEqual(life.tier, 2)
+
+    def test_combines_multiline_flask_suffix_using_official_metadata(self):
+        item = parse_item_text("""アイテムクラス: ライフフラスコ
+レアリティ: マジック
+防水の 神々しいライフフラスコ
+--------
+アイテムレベル: 84
+--------
+{ サフィックスモッド 「防水の」 (ティア: 4) }
+出血状態で使用すると出血の完全無効化を8(6-8)秒間付与する
+穢れた血の影響下で使用すると穢れた血の完全無効化を8(6-8)秒間付与する
+--------
+右クリックして飲む。
+""")
+        self.assertEqual(len(item.modifiers), 1)
+        modifier = item.modifiers[0]
+        self.assertEqual(modifier.stat_id, "explicit.stat_182714578")
+        self.assertEqual(modifier.kind, "suffix")
+        self.assertEqual(modifier.tier, 4)
+        self.assertIn("\n", modifier.text)
+
+    def test_combines_dark_monarch_holy_armaments_variant(self):
+        item = parse_item_text("""アイテムクラス: 兜
+レアリティ: ユニーク
+闇の王
+リッチのサークレット
+--------
+アイテムレベル: 86
+--------
+{ ユニークモッド }
+スケルトン召喚(アニメイトウェポン-ホーリーアーマメント)の最大数が二倍になる
+スケルトン召喚(アニメイトウェポン-ホーリーアーマメント)以外のミニオンを召喚できない
+""")
+
+        self.assertEqual(len(item.modifiers), 1)
+        modifier = item.modifiers[0]
+        self.assertEqual(modifier.stat_id, "explicit.stat_56473917|16")
+        self.assertEqual(
+            modifier.ref,
+            "Maximum number of Holy Armaments is Doubled\n"
+            "Cannot have Minions other than Holy Armaments",
+        )
+        self.assertIn("\n", modifier.text)
+
     def test_captured_beast_is_detected_by_class_and_help_text(self):
         by_class = parse_item_text("""Item Class: Captured Beasts
 Rarity: Rare
@@ -140,6 +511,60 @@ Corsair Sword
         self.assertEqual(item.name, "地獄の破滅")
         self.assertEqual(item.base_type, "略奪者の剣")
 
+    def test_ignores_unmet_requirements_warning_before_rare_name(self):
+        item = parse_item_text("""アイテムクラス: 鎧
+レアリティ: レア
+このアイテムを使用できません。アイテムの効果は無視されます
+--------
+ゴーレムの甲羅
+黄昏のレガリア
+--------
+品質: +20% (augmented)
+エナジーシールド: 560 (augmented)
+幽体化度: 39%
+--------
+装備要求:
+レベル: 84
+筋力: 111
+器用さ: 159 (unmet)
+知性: 293 (unmet)
+--------
+ソケット: B-B-B-G-W-W
+--------
+アイテムレベル: 86
+--------
+明示防御力モッドの強さが8%増加する (enchant)
+--------
+{ シアリング・エグザーク 暗黙モッド 「特大」 }
+雷耐性の最大値 +2%
+(Maximum Resistance: 耐性の最大値は90%より大きい値にはならない)
+{ イーター・オブ・ワールズ 暗黙モッド 「特大」 }
+アタックブロック率が7%
+--------
+{ プレフィックスモッド「きらびやかな」 (ティア: 1) — 防御, エナジーシールド - 8%増加 }
+最大エナジーシールド +92(91-100)
+{ プレフィックスモッド「極上の」 (ティア: 1) — ライフ }
+最大ライフ +180(175-189)
+{ マスタークラフト プレフィックスモッド「上級」 — ライフ, 防御, エナジーシールド - 8%増加 }
+エナジーシールドが19(18-21)%増加する
+最大ライフ +18(17-19)
+{ サフィックスモッド 「バメスの」 (ティア: 1) — 混沌, 耐性 }
+混沌耐性 +35(31-35)%
+{ サフィックスモッド 「ハーストの」 (ティア: 1) — 元素, 冷気, 耐性 }
+冷気耐性 +48(46-48)%
+{ サフィックスモッド 「火山の」 (ティア: 3) — 元素, 火, 耐性 }
+火耐性 +40(36-41)%
+シアリング・エグザークのアイテム
+イーター・オブ・ワールズのアイテム
+""")
+
+        self.assertEqual(item.name, "ゴーレムの甲羅")
+        self.assertEqual(item.base_type, "黄昏のレガリア")
+        self.assertEqual(item.category, "armour")
+        self.assertEqual(item.item_level, 86)
+        self.assertIn("searing_item", item.flags)
+        self.assertIn("tangled_item", item.flags)
+
     def test_rejects_non_item_text(self):
         with self.assertRaises(ItemParseError):
             parse_item_text("ただの文章です")
@@ -210,6 +635,40 @@ Map (Tier 16)
 """)
         self.assertEqual(item.category, "map")
         self.assertEqual(item.properties["Map Tier"], "16")
+
+    def test_japanese_scarab_is_distinguished_from_other_map_fragments(self):
+        item = parse_item_text("""アイテムクラス: マップフラグメント
+レアリティ: ノーマル
+豊富な占いのスカラベ
+--------
+スタック数: 12/20
+個数制限: 5
+--------
+エリアには占いカードをドロップする確率が1000%増加した
+""")
+
+        self.assertEqual(item.category, "scarab")
+
+    def test_english_scarab_is_distinguished_from_other_map_fragments(self):
+        item = parse_item_text("""Item Class: Map Fragments
+Rarity: Normal
+Divination Scarab of Plenty
+--------
+Stack Size: 12/20
+Limit: 5
+""")
+
+        self.assertEqual(item.category, "scarab")
+
+    def test_non_scarab_map_fragment_remains_a_map(self):
+        item = parse_item_text("""アイテムクラス: マップフラグメント
+レアリティ: ノーマル
+ミノタウロスの迷路
+--------
+スタック数: 1/10
+""")
+
+        self.assertEqual(item.category, "map")
 
     def test_strips_unscalable_value_and_ignores_recently_glossary_in_japanese(self):
         item = parse_item_text("""アイテムクラス: 胴体防具
@@ -397,7 +856,134 @@ Iron Ring
             ["implicit", "explicit", "explicit", "explicit", "explicit"],
         )
         self.assertEqual(item.modifiers[-1].generation, "foulborn")
+
+    def test_detailed_catalyst_quality_marks_only_affected_modifier(self):
+        item = parse_item_text("""アイテムクラス: 指輪
+レアリティ: ユニーク
+ファウルボーン 皆を繋ぐもの
+鉄の指輪
+--------
+品質 (防御力モッド): +10% (augmented)
+--------
+アイテムレベル: 71
+--------
+{ ユニークモッド — 能力値 }
+全ての能力値 +13(10-30)
+{ ファウルボーンユニークモッド — 防御 - 10%増加 }
+グローバル防御力が25(10-30)%増加する
+{ ファウルボーンユニークモッド — ダメージ, クリティカル }
+グローバルクリティカルダメージ倍率 +22(10-30)%
+""")
+
+        attributes, defences, critical = item.modifiers
+        self.assertFalse(attributes.quality_affected)
+        self.assertTrue(defences.quality_affected)
+        self.assertEqual(defences.roll_increase, 10)
+        self.assertEqual(defences.values, (27,))
+        self.assertEqual((defences.roll_min, defences.roll_max), (11, 33))
+        self.assertFalse(critical.quality_affected)
+
+    def test_detailed_resistance_catalyst_uses_same_roll_increase_path(self):
+        item = parse_item_text("""アイテムクラス: 指輪
+レアリティ: ユニーク
+皆を繋ぐもの
+鉄の指輪
+--------
+品質 (耐性モッド): +10% (augmented)
+--------
+アイテムレベル: 71
+--------
+{ ユニークモッド — 能力値 }
+全ての能力値 +13(10-30)
+{ ユニークモッド — 元素, 耐性 - 10%増加 }
+全ての元素耐性 +22(10-30)%
+""")
+
+        attributes, resistances = item.modifiers
+        self.assertFalse(attributes.quality_affected)
+        self.assertTrue(resistances.quality_affected)
+        self.assertEqual(resistances.roll_increase, 10)
+        self.assertEqual(resistances.values, (24,))
+        self.assertEqual((resistances.roll_min, resistances.roll_max), (11, 33))
+
+    def test_roll_increase_matches_awakened_truncation(self):
+        self.assertEqual(apply_roll_increase(25, 10), 27)
+        self.assertEqual(apply_roll_increase(22, 10), 24)
+        self.assertEqual(apply_roll_increase(0.25, 10, decimal=True), 0.27)
+
+    def test_japanese_vestigial_unique_uses_normal_base_and_marks_implicit(self):
+        item = parse_item_text("""アイテムクラス: 靴
+レアリティ: ユニーク
+ララケシュの短気
+痕跡 リベットブーツ
+--------
+アーマー: 65
+エナジーシールド: 14
+--------
+装備要求:
+レベル: 40
+筋力: 35
+知性: 35
+--------
+ソケット: B
+--------
+アイテムレベル: 86
+--------
+{ 痕跡暗黙モッド — 元素, 火, 状態異常 }
+近くの敵は焦げ状態になる
+(Scorch: 焦げた敵は元素耐性が-10%される)
+--------
+{ ユニークモッド — 元素, 冷気, 耐性 }
+冷気耐性 +21(15-25)%
+{ ユニークモッド — 混沌, 耐性 }
+混沌耐性 +20(15-25)%
+{ ユニークモッド — スピード }
+移動スピードが18(15-25)%増加する
+{ ユニークモッド — 物理, 状態異常 }
+穢れた血を付与されることがない
+{ ユニークモッド }
+パワーチャージを最大数持っているとして見なされる
+--------
+不死者にとって、
+時代と瞬間に違いはあるのか？
+--------
+メモ: ~b/o 10 mirror
+""")
+
+        self.assertEqual(item.name, "ララケシュの短気")
+        self.assertEqual(item.base_type, "リベットブーツ")
+        self.assertIn("vestigial", item.flags)
+        self.assertEqual(item.modifiers[0].kind, "implicit")
+        self.assertEqual(item.modifiers[0].generation, "vestigial")
+        self.assertEqual(
+            item.modifiers[0].stat_id, "implicit.stat_3733114005",
+        )
+        self.assertEqual(len(item.modifiers), 6)
         self.assertTrue(all(modifier.stat_id for modifier in item.modifiers))
+
+    def test_vestigial_parser_is_generic_across_base_and_implicit_modifier(self):
+        item = parse_item_text("""アイテムクラス: 手袋
+レアリティ: ユニーク
+マリガロの妙技
+痕跡 ディアストーカーの手袋
+--------
+アイテムレベル: 86
+--------
+{ 痕跡暗黙モッド — 物理 }
+プレイヤーが倒した出血状態の敵は爆発し、その最大ライフの5%を物理ダメージとして与える
+--------
+{ ユニークモッド }
+グローバルクリティカル率が50%増加する
+""")
+
+        self.assertEqual(item.name, "マリガロの妙技")
+        self.assertEqual(item.base_type, "ディアストーカーの手袋")
+        self.assertIn("vestigial", item.flags)
+        self.assertEqual(item.modifiers[0].kind, "implicit")
+        self.assertEqual(item.modifiers[0].generation, "vestigial")
+        self.assertEqual(
+            item.modifiers[0].stat_id, "implicit.stat_3133323410",
+        )
 
     def test_replica_dragonfang_reduced_requirements_resolves_signed_stat(self):
         item = parse_item_text("""アイテムクラス: アミュレット
@@ -417,6 +1003,23 @@ Onyx Amulet
         self.assertEqual(requirements.stat_id, "explicit.stat_752930724")
         self.assertTrue(requirements.inverted)
         self.assertEqual((requirements.roll_min, requirements.roll_max), (5.0, 10.0))
+
+    def test_unique_flask_lower_duration_resolves_generic_signed_stat(self):
+        item = parse_item_text("""アイテムクラス: ユーティリティフラスコ
+レアリティ: ユニーク
+オロスの決意
+ルビーフラスコ
+--------
+アイテムレベル: 84
+--------
+{ ユニークモッド }
+持続時間が36(39-35)%低下する
+""")
+        duration = item.modifiers[0]
+        self.assertEqual(duration.stat_id, "explicit.stat_1256719186")
+        self.assertEqual(duration.ref, "#% increased Duration")
+        self.assertTrue(duration.inverted)
+        self.assertEqual((duration.roll_min, duration.roll_max), (35.0, 39.0))
 
     def test_unique_flavour_text_after_separator_is_not_parsed_as_modifiers(self):
         item = parse_item_text("""アイテムクラス: アミュレット
@@ -478,6 +1081,31 @@ Synthesised Item
 """)
         self.assertEqual(japanese.flags, ("influence:hunter", "synthesised"))
 
+    def test_eldritch_item_markers_are_flags_not_modifier_text(self):
+        item = parse_item_text("""アイテムクラス: 鎧
+レアリティ: レア
+血守護者
+ロイヤルプレート
+--------
+アイテムレベル: 85
+--------
+{ シアリング・エグザーク 暗黙モッド 「小」 }
+ウォークライのバフの効果が19(19-20)%増加する
+{ イーター・オブ・ワールズ 暗黙モッド 「小」 — 物理, 元素, 雷 }
+ヒットによる物理ダメージの10%を雷ダメージとして受ける
+--------
+{ プレフィックスモッド「堅固な」 (ティア: 2) — 防御, アーマー }
+アーマーが99(92-100)%増加する
+--------
+シアリング・エグザークのアイテム
+イーター・オブ・ワールズのアイテム
+""")
+        self.assertEqual(item.flags, ("searing_item", "tangled_item"))
+        self.assertEqual(len(item.modifiers), 3)
+        self.assertEqual(item.modifiers[0].generation, "eldritch")
+        self.assertEqual(item.modifiers[1].generation, "eldritch")
+        self.assertFalse(any("のアイテム" in mod.text for mod in item.modifiers))
+
     def test_parses_modifier_generation_for_ui_details(self):
         item = parse_item_text("""アイテムクラス: 鎧
 レアリティ: レア
@@ -492,6 +1120,66 @@ Synthesised Item
         modifier = item.modifiers[0]
         self.assertEqual(modifier.affix, "prefix")
         self.assertEqual(modifier.generation, "crusader")
+
+    def test_parses_essence_and_infamous_modifier_generations(self):
+        essence = _modifier_header_details(
+            '{ Prefix Modifier "Essences" (Tier: 1) — Life }'
+        )
+        infamous = _modifier_header_details(
+            '{ Suffix Modifier "of Infamy" (Tier: 1) — Attack }'
+        )
+        self.assertEqual(essence[3], "essence")
+        self.assertEqual(infamous[3], "infamous")
+
+    def test_parses_special_implicit_and_legacy_modifier_generations(self):
+        cases = (
+            ('{ Corrupted Implicit Modifier }', "corrupted"),
+            ('{ Eldritch Implicit Modifier }', "eldritch"),
+            ('{ Synthesised Implicit Modifier }', "synthesised"),
+            ('{ Prefix Modifier "Delve" }', "delve"),
+            ('{ Prefix Modifier "Incursion" }', "incursion"),
+        )
+
+        for header, expected in cases:
+            with self.subTest(header=header):
+                details = _modifier_header_details(header)
+                self.assertIsNotNone(details)
+                self.assertEqual(details[3], expected)
+
+    def test_infamous_slower_rage_loss_resolves_signed_trade_stat(self):
+        item = parse_item_text("""アイテムクラス: 兜
+レアリティ: レア
+恐ろしい堅塁
+征服者のヘルメット
+--------
+アーマー: 615 (augmented)
+--------
+装備要求:
+レベル: 78
+筋力: 194
+--------
+ソケット: W-W-W-W
+--------
+アイテムレベル: 85
+--------
+{ プレフィックスモッド「悪名高い」 (ティア: 1) }
+憤怒の固有効果による喪失が20%遅くなる
+(この効果は直近にヒット受けていないか憤怒を獲得していない時の憤怒の減少にのみ影響を与える)
+{ プレフィックスモッド「雲丹の」 (ティア: 2) — ライフ, 防御, アーマー }
+アーマー +46(33-48)
+最大ライフ +28(24-28)
+{ プレフィックスモッド「頑健な」 (ティア: 5) — ライフ }
+最大ライフ +72(70-84)
+{ サフィックスモッド 「碩学の」 (ティア: 4) — 能力値 }
+知性 +39(38-42)
+--------
+メモ: ~b/o 1 chaos
+""")
+        infamous = item.modifiers[0]
+        self.assertEqual(infamous.stat_id, "explicit.stat_3645269560")
+        self.assertEqual(infamous.ref, "Inherent loss of Rage is #% faster")
+        self.assertEqual(infamous.generation, "infamous")
+        self.assertTrue(infamous.inverted)
 
     def test_ignores_flask_usage_help_text_in_japanese_and_english(self):
         japanese = parse_item_text("""アイテムクラス: ユーティリティフラスコ
@@ -575,6 +1263,134 @@ def test_other_vaal_gem_is_detected_without_name_specific_logic():
 
     assert item.name == "Vaal Arc"
     assert item.base_type == "Vaal Arc"
+
+
+def test_japanese_vaal_gem_uses_the_second_skill_name_as_trade_identity():
+    item = parse_item_text("""アイテムクラス: スキルジェム
+レアリティ: ジェム
+グレース
+--------
+オーラ, スペル, 範囲効果, 持続時間, ヴァール
+レベル: 1
+リザーブ: 50% マナ
+--------
+使用者とその仲間に回避力を付与するオーラを纏う。
+--------
+ヴァールグレース
+--------
+クールダウン時間: 0.50秒
+使用ごとの必要ソウル: 50
+1回分保持可能
+--------
+基礎持続時間は6.00秒
+--------
+経験値: 1/118,383
+--------
+コラプト状態
+""")
+
+    assert item.name == "Vaal Grace"
+    assert item.base_type == "Vaal Grace"
+    assert "corrupted" in item.flags
+
+
+def test_scrying_orb_keeps_its_map_area_property():
+    item = parse_item_text("""アイテムクラス: スタック可能カレンシー
+レアリティ: カレンシー
+透視のオーブ
+--------
+マップエリア: 岸辺
+--------
+アトラス上のマップを透視する
+--------
+このアイテムを右クリックして、アトラス上のマップを左クリックする。
+--------
+メモ: ~b/o 4 chaos
+""")
+
+    assert item.category == "currency"
+    assert item.base_type == "透視のオーブ"
+    assert item.properties["マップエリア"] == "岸辺"
+
+
+def test_unique_amulet_uses_global_attack_speed_like_awakened():
+    item = parse_item_text("""アイテムクラス: アミュレット
+レアリティ: ユニーク
+歪んだ砂時計
+ターコイズのアミュレット
+--------
+装備要求:
+レベル: 50
+--------
+アイテムレベル: 80
+--------
+{ 暗黙モッド — 能力値 }
+器用さおよび知性 +17(16-24)
+--------
+{ ユニークモッド — アタック, スピード }
+アタックスピードが10(10-25)%増加する
+{ ユニークモッド — キャスター, スピード }
+キャストスピードが10(10-25)%増加する
+""")
+
+    attack_speed = next(
+        mod for mod in item.modifiers if mod.text.startswith("アタックスピード")
+    )
+    assert item.category == "accessory"
+    assert attack_speed.stat_id == "explicit.stat_681332047"
+    assert attack_speed.confidence == 1.0
+
+
+def test_synthesised_weapon_uses_global_evasion_implicit_like_awakened():
+    item = parse_item_text("""アイテムクラス: セプター
+レアリティ: ユニーク
+シンセサイズされた 虚無のセプター
+--------
+セプター
+物理ダメージ: 50-76
+クリティカル率: 7.30%
+秒間アタック回数: 1.33 (augmented)
+武器攻撃距離：1.1 メートル
+--------
+装備要求:
+筋力: 104
+知性: 122
+--------
+ソケット: W W
+--------
+アイテムレベル: 87
+--------
+{ 暗黙モッド — 防御, 回避力 }
+回避力が7(7-9)%増加する
+{ 暗黙モッド — アタック, スピード }
+アタックスピードが6(5-6)%増加する
+{ 暗黙モッド — 能力値 }
+器用さ +9(9-11)
+--------
+未鑑定
+--------
+シンセシスアイテム""")
+
+    evasion = next(mod for mod in item.modifiers if mod.text.startswith("回避力"))
+    assert evasion.stat_id == "implicit.stat_2106365538"
+    assert evasion.confidence == 1.0
+
+    armour = parse_item_text("""アイテムクラス: ブーツ
+レアリティ: レア
+風の足跡
+シャークスキンブーツ
+--------
+回避力: 180 (augmented)
+--------
+アイテムレベル: 87
+--------
+{ 暗黙モッド — 防御, 回避力 }
+回避力が7(7-9)%増加する""")
+    armour_evasion = next(
+        mod for mod in armour.modifiers if mod.text.startswith("回避力")
+    )
+    assert armour_evasion.stat_id == "implicit.stat_124859000"
+    assert armour_evasion.confidence == 1.0
 
 
 if __name__ == "__main__":

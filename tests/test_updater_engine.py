@@ -1,9 +1,9 @@
-from pathlib import Path
 import zipfile
+from pathlib import Path
 
 import pytest
-import src.update.updater_engine as updater_engine
 
+from src.update import updater_engine
 from src.update.updater_engine import (
     UpdateApplyError,
     apply_update,
@@ -17,12 +17,26 @@ def make_release(path: Path, marker="new", guide="new guide"):
         archive.writestr("PoENavi/PoENavi.exe", marker)
         archive.writestr("PoENavi/PoENaviUpdater.exe", "updater")
         archive.writestr("PoENavi/guide_data.json", guide)
+        archive.writestr(
+            "PoENavi/_internal/tools/ExpeditionWindowsOcr/ExpeditionWindowsOcr.exe",
+            "ocr-helper",
+        )
+        archive.writestr(
+            "PoENavi/_internal/data/poetore/poe2/expedition_ocr_items.json",
+            '{"items": []}',
+        )
 
 
 def make_root_release(path: Path, marker="new"):
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("PoENavi.exe", marker)
         archive.writestr("PoENaviUpdater.exe", "updater")
+
+
+def make_install(path: Path, marker="old"):
+    path.mkdir(parents=True)
+    (path / "PoENavi.exe").write_text(marker, encoding="utf-8")
+    (path / "PoENaviUpdater.exe").write_text("updater", encoding="utf-8")
 
 
 def test_wait_for_process_exit_stops_when_process_finishes():
@@ -70,8 +84,7 @@ def test_retry_transient_file_operation_raises_after_limit():
 
 def test_apply_update_replaces_install_and_launches_new_exe(tmp_path):
     install = tmp_path / "ぽえなび" / "PoENavi"
-    install.mkdir(parents=True)
-    (install / "PoENavi.exe").write_text("old", encoding="utf-8")
+    make_install(install)
     archive = tmp_path / "PoENavi.zip"
     make_release(archive)
     launched = []
@@ -84,14 +97,28 @@ def test_apply_update_replaces_install_and_launches_new_exe(tmp_path):
     )
 
     assert (install / "PoENavi.exe").read_text(encoding="utf-8") == "new"
+    assert (
+        install
+        / "_internal"
+        / "tools"
+        / "ExpeditionWindowsOcr"
+        / "ExpeditionWindowsOcr.exe"
+    ).read_text(encoding="utf-8") == "ocr-helper"
+    assert (
+        install
+        / "_internal"
+        / "data"
+        / "poetore"
+        / "poe2"
+        / "expedition_ocr_items.json"
+    ).is_file()
     assert launched == [install / "PoENavi.exe"]
     assert backup.exists()
 
 
 def test_apply_update_accepts_build_script_root_layout(tmp_path):
     install = tmp_path / "PoENavi"
-    install.mkdir()
-    (install / "PoENavi.exe").write_text("old", encoding="utf-8")
+    make_install(install)
     archive = tmp_path / "PoENavi.zip"
     make_root_release(archive)
 
@@ -102,8 +129,7 @@ def test_apply_update_accepts_build_script_root_layout(tmp_path):
 
 def test_apply_update_replaces_old_official_guide_with_release_guide(tmp_path):
     install = tmp_path / "PoENavi"
-    install.mkdir()
-    (install / "PoENavi.exe").write_text("old", encoding="utf-8")
+    make_install(install)
     (install / "guide_data.json").write_text("user-edited old guide", encoding="utf-8")
     archive = tmp_path / "PoENavi.zip"
     make_release(archive, guide="latest official guide")
@@ -115,8 +141,7 @@ def test_apply_update_replaces_old_official_guide_with_release_guide(tmp_path):
 
 def test_apply_update_does_not_touch_external_user_data(tmp_path):
     install = tmp_path / "PoENavi"
-    install.mkdir()
-    (install / "PoENavi.exe").write_text("old", encoding="utf-8")
+    make_install(install)
     user_data = tmp_path / "AppData" / "PoENavi"
     user_data.mkdir(parents=True)
     area_notes = user_data / "area_notes_poe1.json"
@@ -134,15 +159,14 @@ def test_apply_update_does_not_touch_external_user_data(tmp_path):
 
 def test_apply_update_restores_old_install_when_launch_fails(tmp_path):
     install = tmp_path / "PoENavi"
-    install.mkdir()
-    (install / "PoENavi.exe").write_text("old", encoding="utf-8")
+    make_install(install)
     archive = tmp_path / "PoENavi.zip"
     make_release(archive)
 
     def fail_launch(_exe):
         raise OSError("launch failed")
 
-    with pytest.raises(UpdateApplyError, match="旧版を復元"):
+    with pytest.raises(UpdateApplyError, match="更新前のぽえなびを復元"):
         apply_update(archive, install, tmp_path / "work", fail_launch)
     assert (install / "PoENavi.exe").read_text(encoding="utf-8") == "old"
 
@@ -151,8 +175,7 @@ def test_apply_update_leaves_install_untouched_when_initial_rename_is_denied(
     tmp_path, monkeypatch
 ):
     install = tmp_path / "PoENavi"
-    install.mkdir()
-    (install / "PoENavi.exe").write_text("old", encoding="utf-8")
+    make_install(install)
     archive = tmp_path / "PoENavi.zip"
     make_release(archive)
     original_rename = Path.rename
@@ -178,12 +201,11 @@ def test_apply_update_leaves_install_untouched_when_initial_rename_is_denied(
 
 def test_apply_update_restores_old_install_when_new_app_exits_immediately(tmp_path):
     install = tmp_path / "PoENavi"
-    install.mkdir()
-    (install / "PoENavi.exe").write_text("old", encoding="utf-8")
+    make_install(install)
     archive = tmp_path / "PoENavi.zip"
     make_release(archive)
 
-    with pytest.raises(UpdateApplyError, match="旧版を復元"):
+    with pytest.raises(UpdateApplyError, match="更新前のぽえなびを復元"):
         apply_update(
             archive,
             install,
@@ -192,3 +214,138 @@ def test_apply_update_restores_old_install_when_new_app_exits_immediately(tmp_pa
             startup_check=lambda _process: False,
         )
     assert (install / "PoENavi.exe").read_text(encoding="utf-8") == "old"
+
+
+def test_apply_update_archives_valid_stale_backup_and_removes_it_after_success(tmp_path):
+    install = tmp_path / "PoENavi"
+    backup = tmp_path / "PoENavi.backup"
+    make_install(install, "current")
+    make_install(backup, "stale")
+    archive = tmp_path / "PoENavi.zip"
+    make_release(archive)
+
+    current_backup = apply_update(
+        archive,
+        install,
+        tmp_path / "work",
+        lambda _exe: object(),
+        timestamp=lambda: "20260804-122500",
+    )
+
+    assert (install / "PoENavi.exe").read_text(encoding="utf-8") == "new"
+    assert (current_backup / "PoENavi.exe").read_text(encoding="utf-8") == "current"
+    assert not (tmp_path / "PoENavi.backup-old-20260804-122500").exists()
+
+
+def test_apply_update_restores_stale_backup_name_when_update_fails(tmp_path):
+    install = tmp_path / "PoENavi"
+    backup = tmp_path / "PoENavi.backup"
+    make_install(install, "current")
+    make_install(backup, "stale")
+    archive = tmp_path / "PoENavi.zip"
+    make_release(archive)
+
+    with pytest.raises(UpdateApplyError, match="更新前のぽえなびを復元"):
+        apply_update(
+            archive,
+            install,
+            tmp_path / "work",
+            lambda _exe: object(),
+            startup_check=lambda _process: False,
+            timestamp=lambda: "20260804-122500",
+        )
+
+    assert (install / "PoENavi.exe").read_text(encoding="utf-8") == "current"
+    assert (backup / "PoENavi.exe").read_text(encoding="utf-8") == "stale"
+    assert not (tmp_path / "PoENavi.backup-old-20260804-122500").exists()
+
+
+def test_apply_update_rejects_unrecognizable_stale_backup(tmp_path):
+    install = tmp_path / "PoENavi"
+    backup = tmp_path / "PoENavi.backup"
+    make_install(install)
+    backup.mkdir()
+    (backup / "unknown.txt").write_text("keep me", encoding="utf-8")
+    archive = tmp_path / "PoENavi.zip"
+    make_release(archive)
+
+    with pytest.raises(UpdateApplyError) as error:
+        apply_update(archive, install, tmp_path / "work", lambda _exe: object())
+
+    assert (backup / "unknown.txt").read_text(encoding="utf-8") == "keep me"
+    assert (install / "PoENavi.exe").read_text(encoding="utf-8") == "old"
+    assert error.value.user_message() == (
+        "既存のバックアップの内容を安全に確認できないため、アップデートを中止しました。\n"
+        "（不足しているファイル: PoENavi.exe, PoENaviUpdater.exe）\n\n"
+        "対処方法:\n"
+        "1. この画面を閉じます。\n"
+        "2. 下記の対象フォルダを、PoENaviフォルダの外へ移動します。"
+        "削除する必要はありません。\n"
+        "3. ぽえなびを起動し、もう一度アップデートしてください。\n\n"
+        "安全を確認できなかったため、ファイルの削除や変更は行っていません。\n\n"
+        f"対象フォルダ:\n{backup}"
+    )
+
+
+def test_apply_update_reports_when_stale_backup_cannot_be_archived(
+    tmp_path, monkeypatch
+):
+    install = tmp_path / "PoENavi"
+    backup = tmp_path / "PoENavi.backup"
+    make_install(install)
+    make_install(backup, "stale")
+    archive = tmp_path / "PoENavi.zip"
+    make_release(archive)
+    original_rename = Path.rename
+
+    def deny_backup_rename(path, target):
+        if path == backup:
+            raise PermissionError("locked by sync")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", deny_backup_rename)
+    monkeypatch.setattr(
+        updater_engine,
+        "retry_transient_file_operation",
+        lambda operation: operation(),
+    )
+
+    with pytest.raises(UpdateApplyError) as error:
+        apply_update(archive, install, tmp_path / "work", lambda _exe: object())
+
+    assert (backup / "PoENavi.exe").read_text(encoding="utf-8") == "stale"
+    assert (install / "PoENavi.exe").read_text(encoding="utf-8") == "old"
+    message = error.value.user_message()
+    assert "OneDriveの同期やセキュリティソフトの確認処理が終わるまで待ちます" in message
+    assert "Windowsを再起動してから再度お試しください" in message
+    assert message.count(str(backup)) == 1
+
+
+def test_apply_update_stops_when_failed_update_directory_exists(tmp_path):
+    install = tmp_path / "PoENavi"
+    failed = tmp_path / "PoENavi.failed"
+    make_install(install)
+    make_install(failed, "failed")
+    archive = tmp_path / "PoENavi.zip"
+    make_release(archive)
+
+    with pytest.raises(UpdateApplyError) as error:
+        apply_update(archive, install, tmp_path / "work", lambda _exe: object())
+
+    assert (failed / "PoENavi.exe").read_text(encoding="utf-8") == "failed"
+    message = error.value.user_message()
+    assert "PoENaviフォルダの外へ移動します" in message
+    assert "もう一度アップデートしてください" in message
+    assert message.count(str(failed)) == 1
+
+
+def test_stale_backup_archive_name_avoids_collision(tmp_path):
+    backup = tmp_path / "PoENavi.backup"
+    first = tmp_path / "PoENavi.backup-old-20260804-122500"
+    second = tmp_path / "PoENavi.backup-old-20260804-122500-2"
+    first.mkdir()
+    second.mkdir()
+
+    assert updater_engine._next_stale_backup_path(
+        backup, "20260804-122500"
+    ) == tmp_path / "PoENavi.backup-old-20260804-122500-3"

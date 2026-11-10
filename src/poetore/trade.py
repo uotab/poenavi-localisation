@@ -1,27 +1,35 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from collections import OrderedDict
+from collections.abc import Callable
 import json
 import math
+from pathlib import Path
 import re
 from statistics import median
 import threading
 import time
-from urllib.error import HTTPError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlsplit
 
-from .models import ParsedItem
+import urllib3
+
+from .categories import is_armour_category, is_equipment_category, is_weapon_category
+from .models import ItemModifier, ParsedItem, apply_roll_increase
+from .performance import SearchPerformanceTrace, record_trade_api_event
 from .metadata import (
-    base_armour_bounds, default_metadata_index, gem_metadata, normalize_stat_text,
-    pseudo_definitions, pseudo_relations, unique_fixed_stats,
+    base_armour_bounds, default_metadata_index, gem_metadata, multi_value_rule,
+    normalize_stat_text,
+    pseudo_definitions, pseudo_relations, unique_fixed_stats, unique_icon_url,
 )
 
 
 API_ROOT = "https://www.pathofexile.com/api/trade"
 JP_API_ROOT = "https://jp.pathofexile.com/api/trade"
 LEAGUES_API_URL = "https://www.pathofexile.com/api/leagues?type=main&realm=pc"
+DIVINATION_CARD_IDENTITIES_PATH = (
+    Path(__file__).resolve().parents[2] / "data" / "poetore" / "divination_cards_ja.json"
+)
 USER_AGENT = "PoENavi/poetore-local-spike (github.com/buri34/poenavi)"
 DEFAULT_SEARCH_RANGE = 0.10
 TRADE_STATUS_OPTIONS = {
@@ -36,6 +44,8 @@ LISTED_WITHIN_OPTIONS = {
 }
 TRADE_CACHE_TTL = 300.0
 TRADE_CACHE_MAX_ENTRIES = 128
+TRADE_REQUEST_TIMEOUT_SECONDS = 20
+TRADE_READ_TIMEOUT_MAX_ATTEMPTS = 2
 TRADE_CURRENCY_OPTIONS = {
     "any": None,
     "chaos": "chaos",
@@ -70,19 +80,27 @@ _ITEM_CLASS_TRADE_CATEGORIES = {
     "Quivers": "accessory.quiver", "矢筒": "accessory.quiver",
     "Jewels": "jewel.base", "ジュエル": "jewel.base",
     "Abyss Jewels": "jewel.abyss", "アビスジュエル": "jewel.abyss",
+    "Crossbows": "weapon.crossbow", "クロスボウ": "weapon.crossbow",
+    "Spears": "weapon.spear", "槍": "weapon.spear",
+    "Flails": "weapon.flail", "フレイル": "weapon.flail",
+    "Quarterstaves": "weapon.warstaff", "クォータースタッフ": "weapon.warstaff",
+    "Foci": "armour.focus", "Focus": "armour.focus", "フォーカス": "armour.focus",
+    "Bucklers": "armour.buckler", "バックラー": "armour.buckler",
 }
 
 
 def item_class_trade_category(item_class: str) -> str | None:
     return _ITEM_CLASS_TRADE_CATEGORIES.get(item_class.strip())
 CONSUMABLE_CRAFTABLE_CATEGORIES = {
-    "map", "heist_blueprint", "heist_contract", "invitation",
+    "map", "chart", "heist_blueprint", "heist_contract", "invitation",
     "memory_line", "expedition_logbook",
 }
-NON_CRAFTABLE_CATEGORIES = {"gem", "flask", "currency", "divination_card"}
+NON_CRAFTABLE_CATEGORIES = {
+    "gem", "flask", "currency", "divination_card", "corpse", "incubator",
+}
 DEDICATED_EXACT_CATEGORIES = {
-    "gem", "captured_beast", "map", "memory_line", "invitation",
-    "heist_contract", "heist_blueprint", "charm", "cluster_jewel",
+    "gem", "captured_beast", "map", "chart", "memory_line", "invitation",
+    "heist_contract", "heist_blueprint", "charm", "corpse", "incubator",
 }
 PRESET_FINISHED = "finished"
 PRESET_BASE = "base"
@@ -91,6 +109,46 @@ _INSCRIBED_ULTIMATUM_NAMES = {
     "inscribed ultimatum", "アルティメイタムの刻印",
 }
 _JEWEL_AFFIX_CATEGORIES = {"jewel", "abyss_jewel", "cluster_jewel"}
+_CHART_AREA_TRADE_TYPES = {
+    "深海平原": "AbyssalPlain", "Abyssal Plain": "AbyssalPlain",
+    "錨海域": "Anchorfield", "Anchorfield": "Anchorfield",
+    "ブラインキングの領域": "BrineKingsDomain", "Brine King's Domain": "BrineKingsDomain",
+    "貝が群生する海棚": "ClamInfestedShelf", "Clam-infested Shelf": "ClamInfestedShelf",
+    "潜水の浅瀬": "DivingShoals", "Diving Shoals": "DivingShoals",
+    "エルドリッチの深み": "EldritchDepths", "Eldritch Depths": "EldritchDepths",
+    "危険な深み": "HazardousDepths", "Hazardous Depths": "HazardousDepths",
+    "寄生された潜水球": "InfestedBathyspheres", "Infested Bathyspheres": "InfestedBathyspheres",
+    "キシャラの安息所": "KisharasRest", "Kishara's Rest": "KisharasRest",
+    "失われた遺跡": "LostRuins", "Lost Ruins": "LostRuins",
+    "外洋のアビス": "PelagicAbyss", "Pelagic Abyss": "PelagicAbyss",
+    "海底の尾根": "SeafloorRidges", "Seafloor Ridges": "SeafloorRidges",
+    "海の柱": "SeaPillars", "Sea Pillars": "SeaPillars",
+    "沈んだトーテム": "SunkenTotems", "Sunken Totems": "SunkenTotems",
+    "海底の木立": "UnderseaGroves", "Undersea Groves": "UnderseaGroves",
+    "特徴のない海底": "UnremarkableSeabed", "Unremarkable Seabed": "UnremarkableSeabed",
+}
+_SPECIAL_CHART_AREA_TYPES = {
+    "Anchorfield", "BrineKingsDomain", "ClamInfestedShelf", "DivingShoals",
+    "EldritchDepths", "HazardousDepths", "InfestedBathyspheres",
+    "KisharasRest", "LostRuins", "PelagicAbyss", "SeaPillars",
+    "SunkenTotems", "UnremarkableSeabed",
+}
+
+
+def _chart_area_trade_type(value: str) -> str | None:
+    wanted = value.strip().casefold()
+    return next(
+        (trade_type for label, trade_type in _CHART_AREA_TRADE_TYPES.items()
+         if label.casefold() == wanted),
+        None,
+    )
+
+
+def is_special_chart_area(item: ParsedItem) -> bool:
+    if item.category != "chart":
+        return False
+    area = item.properties.get("マップエリア") or item.properties.get("Map Area") or ""
+    return _chart_area_trade_type(area) in _SPECIAL_CHART_AREA_TYPES
 # Experimental bases whose implicits change the normal rare-item 3/3 limits.
 # Values come from RePoE's local_maximum_prefixes_allowed_+ /
 # local_maximum_suffixes_allowed_+ stats.
@@ -109,6 +167,11 @@ _INFLUENCE_STATS = {
     "hunter": ("pseudo.pseudo_has_hunter_influence", "Hunter影響"),
     "redeemer": ("pseudo.pseudo_has_redeemer_influence", "Redeemer影響"),
     "warlord": ("pseudo.pseudo_has_warlord_influence", "Warlord影響"),
+}
+# Awakened stats.ndjson の resolve/select と同じ、アイテム種別で分岐する
+# 同名Trade stat。日本語Trade APIでは表示文だけでは区別できない。
+_CATEGORY_STAT_OVERRIDES = {
+    ("tincture", "explicit", "効果が#%増加する"): "explicit.stat_3529940209",
 }
 
 
@@ -143,6 +206,7 @@ _PROPERTY_FILTERS = {
     "property.map_rarity": ("map_filters", "map_iir"),
     "property.map_pack_size": ("map_filters", "map_packsize"),
     "property.area_level": ("map_filters", "area_level"),
+    "property.chart_sulphur": ("map_filters", "chart_sulphur"),
     "property.heist_wings": ("heist_filters", "heist_wings"),
     "property.heist_lockpicking": ("heist_filters", "heist_lockpicking"),
     "property.heist_brute_force": ("heist_filters", "heist_brute_force"),
@@ -166,7 +230,107 @@ _WEAPON_CRIT_STAT_KEYS = {"2375316951"}
 _ARMOUR_STAT_KEYS = {
     "4052037485", "124859000", "4015621042", "53045048", "1062208444",
     "3484657501", "3321629045", "2451402625", "1999113824", "3523867985",
-    "4253454700",
+    "4253454700", "774059442", "830161081",
+}
+
+# Allflameの日本語Trade APIで、固定文言中の数字をmin値として送る旧条件が0件、
+# 値なし条件が1件以上になることを新旧比較で確認したStatだけを対象にする。
+# 出品なしで判定不能、または新旧同数のStatは従来の数値抽出を維持する。
+_API_VERIFIED_VALUELESS_FIXED_STAT_IDS = {
+    "explicit.stat_1021552211",
+    "explicit.stat_1060931694",
+    "explicit.stat_1091613629",
+    "explicit.stat_1099200124",
+    "explicit.stat_1121911611",
+    "explicit.stat_1142276332",
+    "explicit.stat_1168138239",
+    "explicit.stat_130616495",
+    "explicit.stat_133804429",
+    "explicit.stat_1357409216",
+    "explicit.stat_1358422215",
+    "explicit.stat_1389615049",
+    "explicit.stat_1433144735",
+    "explicit.stat_1463929958",
+    "explicit.stat_1493090598",
+    "explicit.stat_1531241759",
+    "explicit.stat_1640259660",
+    "explicit.stat_179010262",
+    "explicit.stat_181229988",
+    "explicit.stat_185598681",
+    "explicit.stat_1904031052",
+    "explicit.stat_1917661185",
+    "explicit.stat_1919069577",
+    "explicit.stat_1963540179",
+    "explicit.stat_2044840211",
+    "explicit.stat_2064503808",
+    "explicit.stat_207863952",
+    "explicit.stat_224931623",
+    "explicit.stat_2295303426",
+    "explicit.stat_2384145996",
+    "explicit.stat_2439129490",
+    "explicit.stat_2501671832",
+    "explicit.stat_2517037025",
+    "explicit.stat_2554328719",
+    "explicit.stat_262773569",
+    "explicit.stat_2713909980",
+    "explicit.stat_2716882575",
+    "explicit.stat_2750004091",
+    "explicit.stat_2773026887",
+    "explicit.stat_282325999",
+    "explicit.stat_285624304",
+    "explicit.stat_2878779644|2",
+    "explicit.stat_2878779644|3",
+    "explicit.stat_2918150296",
+    "explicit.stat_2921954092",
+    "explicit.stat_2959020308",
+    "explicit.stat_3183988184",
+    "explicit.stat_3259812992",
+    "explicit.stat_3266609002",
+    "explicit.stat_3269060224",
+    "explicit.stat_328131617",
+    "explicit.stat_3339663313",
+    "explicit.stat_3345955207",
+    "explicit.stat_3362271649",
+    "explicit.stat_3423343084",
+    "explicit.stat_3525542360",
+    "explicit.stat_3598983877",
+    "explicit.stat_3616500790",
+    "explicit.stat_3714446071",
+    "explicit.stat_3768948090",
+    "explicit.stat_3772848194",
+    "explicit.stat_3778002979",
+    "explicit.stat_3797685329",
+    "explicit.stat_3844045281",
+    "explicit.stat_3910756536",
+    "explicit.stat_3938394827",
+    "explicit.stat_4077357269",
+    "explicit.stat_40907696",
+    "explicit.stat_4194606073",
+    "explicit.stat_456916387",
+    "explicit.stat_5955083",
+    "explicit.stat_609019022",
+    "explicit.stat_621302497",
+    "explicit.stat_637690626",
+    "explicit.stat_642457541",
+    "explicit.stat_684268017",
+    "explicit.stat_708913352",
+    "explicit.stat_824024007",
+    "explicit.stat_849085925",
+    "explicit.stat_877233648",
+    "explicit.stat_91505809",
+    "explicit.stat_933024928",
+    "explicit.stat_940684417",
+    "explicit.stat_971937289",
+    "explicit.stat_986616727",
+    "implicit.stat_1021552211",
+    "implicit.stat_1493090598",
+    "implicit.stat_1640259660",
+    "implicit.stat_1917661185",
+    "implicit.stat_2878779644|2",
+    "implicit.stat_2918150296",
+    "implicit.stat_3811649872",
+    "implicit.stat_4282426229",
+    "implicit.stat_5955083",
 }
 
 _RESISTANCE_REFS = {
@@ -206,6 +370,181 @@ class TradeApiError(RuntimeError):
     pass
 
 
+@dataclass
+class _RateLimitRule:
+    maximum: int
+    window_seconds: float
+    borrowed_at: list[float] = field(default_factory=list)
+
+    def prune(self, now: float) -> None:
+        threshold = now - self.window_seconds
+        self.borrowed_at[:] = [value for value in self.borrowed_at if value > threshold]
+
+    def wait_seconds(self, now: float) -> float:
+        self.prune(now)
+        if len(self.borrowed_at) < self.maximum:
+            return 0.0
+        return max(0.0, self.borrowed_at[0] + self.window_seconds - now)
+
+
+class _TradeRateLimiter:
+    """Awakened同様、公式Trade APIの複数制限窓をクライアント側で追跡する。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._rules: dict[str, list[_RateLimitRule]] = {
+            "search": [_RateLimitRule(1, 5.0)],
+            "fetch": [_RateLimitRule(1, 5.0)],
+        }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._rules = {
+                "search": [_RateLimitRule(1, 5.0)],
+                "fetch": [_RateLimitRule(1, 5.0)],
+            }
+
+    def estimate_wait(self, policy: str, count: int = 1) -> float:
+        with self._lock:
+            now = time.monotonic()
+            waits = []
+            for rule in self._rules[policy]:
+                rule.prune(now)
+                simulated = list(rule.borrowed_at)
+                elapsed = 0.0
+                for _ in range(count):
+                    simulated = [
+                        value for value in simulated
+                        if value + rule.window_seconds > now + elapsed
+                    ]
+                    if len(simulated) >= rule.maximum:
+                        elapsed = max(
+                            elapsed,
+                            simulated[0] + rule.window_seconds - now,
+                        )
+                        simulated = [
+                            value for value in simulated
+                            if value + rule.window_seconds > now + elapsed
+                        ]
+                    simulated.append(now + elapsed)
+                waits.append(elapsed)
+            return max(waits, default=0.0)
+
+    def wait_and_borrow(self, policy: str) -> float:
+        waited = 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                wait_for = max(
+                    (rule.wait_seconds(now) for rule in self._rules[policy]),
+                    default=0.0,
+                )
+                if wait_for <= 0:
+                    for rule in self._rules[policy]:
+                        rule.borrowed_at.append(now)
+                    return waited
+            time.sleep(wait_for)
+            waited += wait_for
+
+    def adjust(self, policy: str, headers: object) -> None:
+        try:
+            rule_names = str(headers.get("X-Rate-Limit-Rules", "")).strip()
+        except AttributeError:
+            return
+        if not rule_names:
+            return
+
+        parsed: list[tuple[int, float, int]] = []
+        for rule_name in rule_names.split(","):
+            rule_name = rule_name.strip()
+            limit_text = str(headers.get(f"X-Rate-Limit-{rule_name}", ""))
+            state_text = str(headers.get(f"X-Rate-Limit-{rule_name}-State", ""))
+            limits = [part.split(":") for part in limit_text.split(",")]
+            states = [part.split(":") for part in state_text.split(",")]
+            for index, parts in enumerate(limits):
+                if len(parts) < 2:
+                    continue
+                try:
+                    maximum = int(parts[0])
+                    # Awakenedの既定値と同じ2秒を通信状態ずれの余裕として加える。
+                    window_seconds = float(parts[1]) + 2.0
+                    active = int(states[index][0]) if index < len(states) else 0
+                except (TypeError, ValueError):
+                    continue
+                if maximum <= 0 or window_seconds <= 0:
+                    continue
+                parsed.append((maximum, window_seconds, max(0, active)))
+        if parsed:
+            with self._lock:
+                now = time.monotonic()
+                existing = self._rules[policy]
+                synchronized: list[_RateLimitRule] = []
+                for maximum, window_seconds, active in parsed:
+                    current = next((
+                        rule for rule in existing
+                        if rule.maximum == maximum
+                        and rule.window_seconds == window_seconds
+                    ), None)
+                    if current is None:
+                        current = _RateLimitRule(maximum, window_seconds)
+                    current.prune(now)
+                    missing = min(maximum, active) - len(current.borrowed_at)
+                    if missing > 0:
+                        current.borrowed_at.extend([now] * missing)
+                    synchronized.append(current)
+                self._rules[policy] = synchronized
+
+
+_trade_rate_limiter = _TradeRateLimiter()
+_trade2_rate_limiter = _TradeRateLimiter()
+
+
+def _trade_rate_policy(url: str) -> str | None:
+    path = urlsplit(url).path
+    if "/api/trade/search/" in path:
+        return "search"
+    if "/api/trade/fetch/" in path:
+        return "fetch"
+    return None
+
+
+def _trade2_rate_policy(url: str) -> str | None:
+    path = urlsplit(url).path
+    if "/api/trade2/search/" in path:
+        return "search"
+    if "/api/trade2/fetch/" in path:
+        return "fetch"
+    return None
+
+
+def _rate_limit_context(url: str) -> tuple[_TradeRateLimiter | None, str | None]:
+    policy = _trade_rate_policy(url)
+    if policy is not None:
+        return _trade_rate_limiter, policy
+    policy = _trade2_rate_policy(url)
+    if policy is not None:
+        return _trade2_rate_limiter, policy
+    return None, None
+
+
+def _prevent_trade_queue(url: str | None = None) -> None:
+    limiter = _trade_rate_limiter
+    if url is not None:
+        limiter, _ = _rate_limit_context(url)
+        if limiter is None:
+            return
+    wait_seconds = max(
+        limiter.estimate_wait("search"),
+        limiter.estimate_wait("fetch"),
+    )
+    # Awakenedと同じく、長い待ちになる新規検索は予約せず即座に返す。
+    if wait_seconds >= 1.5:
+        raise TradeApiError(
+            f"PoE Trade APIの通信間隔を調整中です。"
+            f"約{max(1, round(wait_seconds))}秒後に、もう一度検索してください。"
+        )
+
+
 def default_trade_currency(item: ParsedItem) -> str:
     """Awakened PoE Trade相当の、アイテム種別別の初期通貨条件。"""
     if _is_unique(item):
@@ -227,6 +566,8 @@ class PriceListing:
     gem_level: int | None = None
     quality: int | None = None
     stack_size: int | None = None
+    listed_times: int = 1
+    pricing_method: str = "face_to_face"
 
 
 @dataclass(frozen=True)
@@ -259,6 +600,20 @@ class TradeStatFilter:
     # Awakened同様、集約したproperty/pseudo行にも寄与元Modの高Tierを表示する。
     # Trade APIへは送らない表示専用情報。
     tier_tags: tuple[int, ...] = ()
+    hidden_reason: str = ""
+    source_texts: tuple[str, ...] = ()
+    # source_textsと同じ順序の、検索条件への寄与値と元Mod見出し。
+    # Trade APIへは送らないAwakened風の表示専用情報。
+    source_contributions: tuple[float | None, ...] = ()
+    source_headings: tuple[str, ...] = ()
+    alternative_stat_ids: tuple[str, ...] = ()
+    # 完成品の表示順を、集約後も元アイテムのaffix系統・記載順へ戻せるようにする。
+    # Trade APIやUI表示へは送らない内部情報。
+    source_affixes: tuple[str | None, ...] = ()
+    source_indexes: tuple[int, ...] = ()
+    # 検索用Statを通常Explicitへ正規化しても、元Modの生成由来をUIで示す。
+    # Trade APIへは送らない表示専用情報。
+    provenance_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -276,12 +631,154 @@ class PriceResult:
     rate_limit: str = ""
     web_url: str = ""
     cached: bool = False
+    # PoE2の手動追加取得でだけ使う。PoE1は従来どおり空のまま。
+    next_result_ids: tuple[str, ...] = ()
+    fetched_count: int = 0
 
     def median_by_currency(self) -> dict[str, float]:
         grouped: dict[str, list[float]] = {}
         for listing in self.listings:
+            if listing.pricing_method == "unpriced":
+                continue
             grouped.setdefault(listing.currency, []).append(listing.amount)
         return {currency: median(values) for currency, values in grouped.items()}
+
+
+def _group_price_listings(listings: list[PriceListing]) -> tuple[PriceListing, ...]:
+    """Awakened同様、同一出品者の同価格連投を相場サンプル1件へ集約する。"""
+    grouped: list[PriceListing] = []
+    positions: dict[tuple[str, str, float, str], int] = {}
+    for listing in listings:
+        key = (
+            listing.account, listing.currency, listing.amount,
+            listing.pricing_method,
+        )
+        if not listing.account or key not in positions:
+            positions[key] = len(grouped)
+            grouped.append(listing)
+            continue
+        index = positions[key]
+        previous = grouped[index]
+        stack_size = previous.stack_size
+        if stack_size is not None and listing.stack_size is not None:
+            stack_size += listing.stack_size
+        grouped[index] = replace(
+            previous,
+            stack_size=stack_size,
+            listed_times=previous.listed_times + 1,
+        )
+    return tuple(grouped)
+
+
+def apply_search_range(
+    filters: tuple[TradeStatFilter, ...], percent: float,
+    item: ParsedItem | None = None, *, poe2_rules: bool = False,
+    preset: str = PRESET_FINISHED,
+) -> tuple[TradeStatFilter, ...]:
+    """検索値をAwakenedの共通幅設定で再計算する（0～50%）。"""
+    if item is not None and item.rarity.casefold() in {"magic", "マジック"} and (
+        "mirrored" in item.flags
+        or "corrupted" in item.flags
+        or "unmodifiable" in item.flags
+        or (poe2_rules and "sanctified" in item.flags)
+    ):
+        percent = 0
+    percent = max(0.0, min(float(percent), 50.0)) / 100.0
+    unique_item = bool(
+        item is not None and item.rarity.casefold() in {"unique", "ユニーク"}
+    )
+    adjusted = []
+    discrete_socket_stats = {
+        "property.sockets",
+        "property.links",
+        "property.augment_sockets",
+        "property.gem_sockets",
+    }
+    for row in filters:
+        if poe2_rules and row.read_value is not None and row.better == 0:
+            adjusted.append(replace(
+                row, min_value=row.read_value, max_value=row.read_value,
+            ))
+            continue
+        if (
+            row.read_value is None
+            or row.stat_id in discrete_socket_stats
+            or (
+                item is not None
+                and item.category == "cluster_jewel"
+                and (
+                    row.ref == "Adds # Passive Skills"
+                    or row.stat_id == "enchant.stat_3086156145"
+                )
+            )
+            or row.option_value is not None
+            or row.exact
+            or (row.inverted and not poe2_rules)
+            or row.hidden_reason
+            or (
+                row.generation == "foulborn"
+                and row.roll_min is None and row.roll_max is None
+            )
+            or (row.min_value is None and row.max_value is None)
+        ):
+            adjusted.append(row)
+            continue
+        api_value = row.read_value
+        row_percent = percent
+        if poe2_rules:
+            perfect_roll = (
+                row.roll_min is not None
+                and row.roll_max is not None
+                and (
+                    (row.better == 1 and api_value >= row.roll_max)
+                    or (row.better == -1 and api_value <= row.roll_min)
+                )
+            )
+            selected_perfect_roll = perfect_roll and (
+                unique_item
+                or (
+                    item is not None
+                    and item.rarity.casefold() in {"magic", "マジック"}
+                    and item.category in {"jewel", "abyss_jewel", "tablet"}
+                )
+                or (
+                    row.tier == 1
+                    and (
+                        row.kind == "fractured"
+                        or "fractured" in row.provenance_tags
+                    )
+                )
+            )
+            if (
+                row.ref == "Has # Charm Slot"
+                or (
+                    item is not None
+                    and item.category == "tablet"
+                    and preset == PRESET_BASE
+                )
+                or selected_perfect_roll
+            ):
+                row_percent = 0
+        if unique_item and row.roll_min is not None and row.roll_max is not None:
+            delta = abs(row.roll_max - row.roll_min) * row_percent
+        else:
+            delta = abs(api_value) * row_percent
+        minimum = row.min_value
+        maximum = row.max_value
+        if minimum is not None:
+            minimum = (
+                api_value if row_percent == 0
+                else math.floor(api_value - delta) if not row.decimal
+                else api_value - delta
+            )
+        if maximum is not None:
+            maximum = (
+                api_value if row_percent == 0
+                else math.ceil(api_value + delta) if not row.decimal
+                else api_value + delta
+            )
+        adjusted.append(replace(row, min_value=minimum, max_value=maximum))
+    return tuple(adjusted)
 
 
 class _TtlLruCache:
@@ -316,14 +813,87 @@ class _TtlLruCache:
 
 
 _trade_response_cache = _TtlLruCache()
+_trade_http_pool = urllib3.PoolManager(num_pools=2, maxsize=1, block=True)
+_trade_http_request_lock = threading.Lock()
 
 
-def _cached_request_json(url: str, payload: dict | None = None) -> tuple[dict, object, bool]:
+def _trade_request_stage(url: str, payload: dict | None) -> str:
+    path = urlsplit(url).path
+    if "/search/" in path and payload is not None:
+        return "search_post"
+    if "/fetch/" in path:
+        return "result_fetch_get"
+    return "metadata"
+
+
+def _trade_request_mod_filter_count(payload: dict | None) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    query = payload.get("query")
+    if not isinstance(query, dict):
+        return 0
+    groups = query.get("stats")
+    if not isinstance(groups, list):
+        return 0
+    return sum(
+        len(group.get("filters", ()))
+        for group in groups
+        if isinstance(group, dict) and isinstance(group.get("filters"), list)
+    )
+
+
+def _is_read_timeout(exc: Exception) -> bool:
+    if isinstance(exc, urllib3.exceptions.ReadTimeoutError):
+        return True
+    return (
+        isinstance(exc, urllib3.exceptions.MaxRetryError)
+        and isinstance(exc.reason, urllib3.exceptions.ReadTimeoutError)
+    )
+
+
+def _trade_request_diagnostic(
+    *, stage: str, method: str, mod_filters: int, attempt: int,
+    elapsed: float, status: int | None, outcome: str,
+    error_type: str | None = None,
+) -> None:
+    fields = [
+        f"stage={stage}",
+        f"method={method}",
+        f"mod_filters={mod_filters}",
+        f"attempt={attempt}",
+        f"elapsed_seconds={elapsed:.3f}",
+        f"status={status if status is not None else 'none'}",
+        f"outcome={outcome}",
+    ]
+    if error_type:
+        fields.append(f"error_type={error_type}")
+    _trade_log("diagnostic: " + " ".join(fields))
+    record_trade_api_event(
+        "request_completed",
+        stage=stage,
+        method=method,
+        mod_filters=mod_filters,
+        attempt=attempt,
+        elapsed_ms=round(elapsed * 1000, 3),
+        status=status,
+        outcome=outcome,
+        error_type=error_type,
+    )
+
+
+def _cached_request_json(
+    url: str,
+    payload: dict | None = None,
+    *,
+    prevent_queue: bool = False,
+) -> tuple[dict, object, bool]:
     key = json.dumps([url, payload], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     cached = _trade_response_cache.get(key)
     if cached is not None:
         data, headers = cached
         return data, headers, True
+    if prevent_queue:
+        _prevent_trade_queue(url)
     data, headers = _request_json(url, payload)
     _trade_response_cache.set(key, (data, headers))
     return data, headers, False
@@ -334,39 +904,112 @@ def _request_json(url: str, payload: dict | None = None) -> tuple[dict, object]:
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if data is not None:
         headers["Content-Type"] = "application/json"
-    request = Request(url, data=data, headers=headers)
-    for attempt in range(2):
-        try:
-            with urlopen(request, timeout=15) as response:
-                return json.loads(response.read().decode("utf-8")), response.headers
-        except HTTPError as exc:
-            if exc.code == 429 and attempt == 0:
-                try:
-                    retry_after = float(exc.headers.get("Retry-After", "1"))
-                except (TypeError, ValueError):
-                    retry_after = 1.0
-                delay = min(30.0, max(0.2, retry_after))
-                _trade_log(f"rate limited; retrying once after {delay:g}s")
-                time.sleep(delay)
-                continue
+    method = "POST" if data is not None else "GET"
+    stage = _trade_request_stage(url, payload)
+    mod_filters = _trade_request_mod_filter_count(payload)
+    rate_limiter, rate_policy = _rate_limit_context(url)
+    response = None
+    response_elapsed = 0.0
+    response_attempt = 1
+    # urllib3's own retries stay disabled. Only a read timeout gets one explicit
+    # retry after clearing pooled connections, so HTTP errors and connect errors
+    # are never duplicated.
+    with _trade_http_request_lock:
+        for attempt in range(1, TRADE_READ_TIMEOUT_MAX_ATTEMPTS + 1):
+            if rate_limiter is not None and rate_policy is not None:
+                waited = rate_limiter.wait_and_borrow(rate_policy)
+                if waited > 0:
+                    _trade_log(
+                        f"rate limit wait: policy={rate_policy} seconds={waited:.3f}"
+                    )
+            started = time.monotonic()
             try:
-                error_body = exc.read().decode("utf-8", errors="replace")
-                error_payload = json.loads(error_body)
-                api_message = str((error_payload.get("error") or {}).get("message") or "").strip()
-            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-                api_message = ""
-            _trade_log(
-                f"request failed: {request.get_method()} {url} error={exc!r} "
-                f"api_message={api_message!r}"
-            )
-            detail = f"（{api_message}）" if api_message else ""
-            raise TradeApiError(
-                f"PoE Trade APIが検索条件を受理しませんでした: HTTP {exc.code}{detail}"
-            ) from exc
-        except Exception as exc:
-            _trade_log(f"request failed: {request.get_method()} {url} error={exc!r}")
-            raise TradeApiError(f"PoE Trade APIへの接続に失敗しました: {exc}") from exc
-    raise TradeApiError("PoE Trade APIへの再接続に失敗しました。")
+                response = _trade_http_pool.request(
+                    method, url, body=data, headers=headers,
+                    timeout=urllib3.Timeout(total=TRADE_REQUEST_TIMEOUT_SECONDS),
+                    retries=False,
+                )
+                response_elapsed = time.monotonic() - started
+                response_attempt = attempt
+                break
+            except Exception as exc:
+                elapsed = time.monotonic() - started
+                retrying = (
+                    attempt < TRADE_READ_TIMEOUT_MAX_ATTEMPTS
+                    and _is_read_timeout(exc)
+                )
+                _trade_request_diagnostic(
+                    stage=stage, method=method, mod_filters=mod_filters,
+                    attempt=attempt, elapsed=elapsed, status=None,
+                    outcome="retrying" if retrying else "failed",
+                    error_type=type(exc).__name__,
+                )
+                if retrying:
+                    _trade_http_pool.clear()
+                    continue
+                _trade_log(f"request failed: {method} {url} error={exc!r}")
+                raise TradeApiError(
+                    f"PoE Trade APIへの接続に失敗しました: {exc}"
+                ) from exc
+    assert response is not None
+    if rate_limiter is not None and rate_policy is not None:
+        rate_limiter.adjust(rate_policy, response.headers)
+    body = response.data.decode("utf-8", errors="replace")
+    if response.status == 429:
+        _trade_request_diagnostic(
+            stage=stage, method=method, mod_filters=mod_filters,
+            attempt=response_attempt, elapsed=response_elapsed,
+            status=response.status, outcome="http_error",
+        )
+        try:
+            retry_after = max(0, int(float(response.headers.get("Retry-After", ""))))
+        except (AttributeError, TypeError, ValueError):
+            retry_after = 0
+        if retry_after:
+            retry_minutes = max(1, (retry_after + 59) // 60)
+            retry_note = f" 約{retry_minutes}分後に、もう一度検索してください。"
+        else:
+            retry_note = " しばらく時間を置いてから、もう一度検索してください。"
+        raise TradeApiError(
+            "検索回数が多いため、PoE Trade APIの利用制限に達しました。"
+            f"{retry_note}"
+        )
+    if response.status >= 400:
+        try:
+            error_payload = json.loads(body)
+            api_message = str((error_payload.get("error") or {}).get("message") or "").strip()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            api_message = ""
+        _trade_log(
+            f"request failed: {method} {url} status={response.status} "
+            f"api_message={api_message!r}"
+        )
+        _trade_request_diagnostic(
+            stage=stage, method=method, mod_filters=mod_filters,
+            attempt=response_attempt, elapsed=response_elapsed,
+            status=response.status, outcome="http_error",
+        )
+        detail = f"（{api_message}）" if api_message else ""
+        raise TradeApiError(
+            f"PoE Trade APIが検索条件を受理しませんでした: "
+            f"HTTP {response.status}{detail}"
+        )
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        _trade_request_diagnostic(
+            stage=stage, method=method, mod_filters=mod_filters,
+            attempt=response_attempt, elapsed=response_elapsed,
+            status=response.status, outcome="invalid_json",
+        )
+        _trade_log(f"request failed: {method} {url} invalid JSON")
+        raise TradeApiError(f"PoE Trade APIから不正な応答を受信しました: {exc}") from exc
+    _trade_request_diagnostic(
+        stage=stage, method=method, mod_filters=mod_filters,
+        attempt=response_attempt, elapsed=response_elapsed,
+        status=response.status, outcome="success",
+    )
+    return parsed, response.headers
 
 
 def active_pc_league() -> str:
@@ -440,10 +1083,38 @@ def elemental_dps(item: ParsedItem) -> float | None:
     return average_damage * float(speed_values[0])
 
 
+_QUALITY_DISABLED_REFS = frozenset({
+    "Quality does not increase Defences",
+    "Quality does not increase Physical Damage",
+})
+_QUALITY_DISABLED_NORMALIZED = frozenset(
+    normalize_stat_text(ref) for ref in _QUALITY_DISABLED_REFS
+)
+
+
+def _quality_is_disabled(item: ParsedItem) -> bool:
+    return any(
+        modifier.ref in _QUALITY_DISABLED_REFS
+        or normalize_stat_text(modifier.text) in _QUALITY_DISABLED_NORMALIZED
+        for modifier in item.modifiers
+    )
+
+
+def _property_quality(item: ParsedItem) -> float:
+    if _quality_is_disabled(item):
+        return 0.0
+    return _raw_property_quality(item) or 0.0
+
+
+def _trade_property_quality(item: ParsedItem) -> float:
+    quality = _property_quality(item)
+    return 0.0 if _quality_is_disabled(item) else max(20.0, quality)
+
+
 def _quality_at_least_20(value: float, item: ParsedItem) -> float:
     """表示プロパティをAwakened同様、最低品質20%時の値へ換算する。"""
-    quality = _property_value(item, "品質", "Quality") or 0.0
-    target_quality = max(20.0, quality)
+    quality = _property_quality(item)
+    target_quality = _trade_property_quality(item)
     return value * (1 + target_quality / 100) / (1 + quality / 100)
 
 
@@ -482,6 +1153,29 @@ def _property_value(item: ParsedItem, *labels: str) -> float | None:
     return None
 
 
+def _raw_property_quality(item: ParsedItem) -> float | None:
+    """通常品質とCatalyst種別付き品質の表示値を取得する。"""
+    for label, value in item.properties.items():
+        if not re.fullmatch(
+            r"(?:品質|quality)(?:\s*\([^)]*\))?", label, re.IGNORECASE,
+        ):
+            continue
+        match = re.search(r"\d+(?:\.\d+)?", value.replace(",", ""))
+        if match:
+            return float(match.group())
+    return None
+
+
+def _is_catalyst_affected(item: ParsedItem, modifier: ItemModifier) -> bool:
+    """Catalyst品質が実際にロールへ反映されたアクセサリーModだけを返す。"""
+    if item.category != "accessory" or not _raw_property_quality(item):
+        return False
+    if modifier.quality_affected is not None:
+        return modifier.quality_affected
+    # 通常コピーにはMod見出しがないため、従来の安全側フォールバックを維持する。
+    return bool(modifier.values)
+
+
 def _memory_strands(item: ParsedItem) -> float | None:
     return _property_value(
         item, "メモリーの糸", "記憶の糸", "メモリーストランド", "Memory Strands",
@@ -504,6 +1198,13 @@ _DEFENCE_REFS = {
     "ward": ({"+# to Ward"}, {"#% increased Ward"}),
 }
 
+_DEFENCE_PROPERTY_LABELS = {
+    "ar": ("アーマー", "防具", "Armour"),
+    "ev": ("回避力", "Evasion Rating"),
+    "es": ("エナジーシールド", "Energy Shield"),
+    "ward": ("ワード", "Ward"),
+}
+
 
 def _local_defence_components(item: ParsedItem, defence: str) -> tuple[float, float]:
     """Return local flat and increased defence totals used by Awakened's q20 calculation."""
@@ -520,8 +1221,8 @@ def _local_defence_components(item: ParsedItem, defence: str) -> tuple[float, fl
 
 def _defence_at_20_quality(value: float, item: ParsedItem, defence: str) -> float:
     """Reconstruct a defence property at minimum 20% quality like Awakened."""
-    quality = _property_value(item, "品質", "Quality") or 0.0
-    target_quality = max(20.0, quality)
+    quality = _property_quality(item)
+    target_quality = _trade_property_quality(item)
     flat, increased = _local_defence_components(item, defence)
     quality_multiplier = 1.0 + quality / 100.0
     increased_multiplier = 1.0 + increased / 100.0
@@ -531,15 +1232,58 @@ def _defence_at_20_quality(value: float, item: ParsedItem, defence: str) -> floa
     return (base + flat) * increased_multiplier * (1.0 + target_quality / 100.0)
 
 
-def _base_defence_percentile(item: ParsedItem, trade_base_type: str | None) -> float | None:
+def _defence_bounds_at_trade_quality(
+    item: ParsedItem, trade_base_type: str | None, defence: str,
+) -> tuple[float, float] | None:
+    base_range = base_armour_bounds(trade_base_type or item.base_type).get(defence)
+    flat_refs, increased_refs = _DEFENCE_REFS[defence]
+    relevant_modifiers = tuple(
+        modifier for modifier in item.modifiers
+        if modifier.ref in flat_refs or modifier.ref in increased_refs
+    )
+    if not base_range:
+        if not relevant_modifiers:
+            return None
+        # SvalinnのWardのように、防具ベース自体は該当防御値を持たず、
+        # UniqueのローカルModだけで最終Propertyが作られる場合がある。
+        base_range = (0.0, 0.0)
+    flat_min = flat_max = increased_min = increased_max = 0.0
+    for modifier in relevant_modifiers:
+        value = modifier.values[0] if modifier.values else 0.0
+        low = modifier.roll_min if modifier.roll_min is not None else value
+        high = modifier.roll_max if modifier.roll_max is not None else value
+        if modifier.ref in flat_refs:
+            flat_min += min(low, high)
+            flat_max += max(low, high)
+        elif modifier.ref in increased_refs:
+            increased_min += min(low, high)
+            increased_max += max(low, high)
+    quality_multiplier = 1.0 + _trade_property_quality(item) / 100.0
+    minimum = (base_range[0] + flat_min) * (1.0 + increased_min / 100.0)
+    maximum = (base_range[1] + flat_max) * (1.0 + increased_max / 100.0)
+    return minimum * quality_multiplier, maximum * quality_multiplier
+
+
+def _has_variable_local_defence(item: ParsedItem, defence: str) -> bool:
+    refs = set().union(*_DEFENCE_REFS[defence])
+    return any(
+        modifier.ref in refs
+        and modifier.roll_min is not None
+        and modifier.roll_max is not None
+        and modifier.roll_min != modifier.roll_max
+        for modifier in item.modifiers
+    )
+
+
+def _base_defence_percentile_details(
+    item: ParsedItem, trade_base_type: str | None,
+) -> tuple[float, str] | None:
     bounds = base_armour_bounds(trade_base_type or item.base_type)
     properties = {
-        "ar": _property_value(item, "アーマー", "防具", "Armour"),
-        "ev": _property_value(item, "回避力", "Evasion Rating"),
-        "es": _property_value(item, "エナジーシールド", "Energy Shield"),
-        "ward": _property_value(item, "Ward"),
+        defence: _property_value(item, *labels)
+        for defence, labels in _DEFENCE_PROPERTY_LABELS.items()
     }
-    quality = _property_value(item, "品質", "Quality") or 0.0
+    quality = _property_quality(item)
     for defence in ("ar", "ev", "es", "ward"):
         total, base_range = properties[defence], bounds.get(defence)
         if not total or not base_range or base_range[0] == base_range[1]:
@@ -547,35 +1291,53 @@ def _base_defence_percentile(item: ParsedItem, trade_base_type: str | None) -> f
         flat, increased = _local_defence_components(item, defence)
         rolled_base = total / (1.0 + quality / 100.0) / (1.0 + increased / 100.0) - flat
         percentile = round((rolled_base - base_range[0]) * 100.0 / (base_range[1] - base_range[0]))
-        return float(min(100, max(0, percentile)))
+        return float(min(100, max(0, percentile))), defence
     return None
 
 
-def available_trade_presets(item: ParsedItem) -> tuple[str, ...]:
+def _base_defence_percentile(item: ParsedItem, trade_base_type: str | None) -> float | None:
+    details = _base_defence_percentile_details(item, trade_base_type)
+    return details[0] if details else None
+
+
+def available_trade_presets(
+    item: ParsedItem, *, allow_low_level_magic: bool = False,
+) -> tuple[str, ...]:
     """完成品を基本とし、未完成でクラフト価値がある装備だけベース検索を追加する。"""
     rarity = item.rarity.casefold()
-    if (item.category not in {"weapon", "armour", "accessory", "cluster_jewel", "jewel", "abyss_jewel"}
+    if (not (is_equipment_category(item.category)
+             or item.category in {"cluster_jewel", "jewel", "abyss_jewel"})
             or _is_unique(item) or rarity in {"normal", "ノーマル"}
             or "unidentified" in item.flags):
         return (PRESET_FINISHED,)
-    quality = _property_value(item, "品質", "Quality")
+    quality = _raw_property_quality(item)
     likely_finished = (
         any(modifier.kind == "crafted" for modifier in item.modifiers)
-        or (quality == 20 and item.category in {"weapon", "armour"}
+        or (quality == 20 and (
+            is_weapon_category(item.category) or is_armour_category(item.category)
+        )
             and _memory_strands(item) is None)
-        or "corrupted" in item.flags
-        or "mirrored" in item.flags
     )
-    has_crafting_value = (
+    is_unmodifiable = "corrupted" in item.flags or "mirrored" in item.flags
+    has_strong_crafting_value = (
         any(modifier.kind == "fractured" for modifier in item.modifiers)
         or "synthesised" in item.flags
         or any(flag.startswith("influence:") for flag in item.flags)
         or item.category == "cluster_jewel"
         or (item.category == "jewel" and rarity in {"magic", "マジック"})
-        or bool(item.category not in {"jewel", "abyss_jewel"}
-                and item.item_level is not None and item.item_level >= 82)
     )
-    if likely_finished or not has_crafting_value:
+    has_item_level_crafting_value = bool(
+        item.category not in {"jewel", "abyss_jewel"}
+        and item.item_level is not None
+        and item.item_level >= 82
+    )
+    if is_unmodifiable:
+        return (PRESET_FINISHED,)
+    if allow_low_level_magic and rarity in {"magic", "マジック"} and not likely_finished:
+        return (PRESET_FINISHED, PRESET_BASE)
+    if has_strong_crafting_value:
+        return (PRESET_FINISHED, PRESET_BASE)
+    if likely_finished or not has_item_level_crafting_value:
         return (PRESET_FINISHED,)
     return (PRESET_FINISHED, PRESET_BASE)
 
@@ -610,6 +1372,7 @@ def _apply_dedicated_exact_rules(
     """汎用完成品候補からAwakenedのcreateExactStatFilters相当だけを残す。"""
     keep_modifier_kinds = {
         "pseudo", "fractured", "enchant", "necropolis", "imbued", "craft",
+        "mercenary",
     }
     if (not any(flag.startswith("influence:") for flag in item.flags)
             and not any(mod.kind == "fractured" for mod in item.modifiers)
@@ -625,18 +1388,18 @@ def _apply_dedicated_exact_rules(
         keep_modifier_kinds.update({"prefix", "suffix", "explicit"})
     if item.category == "flask":
         keep_modifier_kinds.add("crafted")
-    if item.category in {"map", "invitation"}:
+    if item.category in {"map", "chart", "invitation"} and not _is_unique(item):
         keep_modifier_kinds.update({"prefix", "suffix", "explicit"})
 
     property_ids = {
         "property.armour", "property.evasion", "property.energy_shield",
         "property.ward", "property.block", "property.base_percentile",
         "property.memory_strands", "property.quality",
-        "property.sockets", "property.links", "property.white_sockets",
+        "property.sockets", "property.links",
     }
     special_kinds = {
         "map", "map pseudo", "map safety", "cluster", "heist", "expedition",
-        "special", "sanctum", "flask hybrid", "unique exception",
+        "special", "chart", "sanctum", "flask hybrid", "unique exception",
     }
     result = []
     logbook_faction_seen = False
@@ -655,7 +1418,7 @@ def _apply_dedicated_exact_rules(
         if row.kind in keep_modifier_kinds or row.kind in special_kinds:
             enabled = row.enabled
             if enable_all or (
-                item.category != "map"
+                item.category != "map" and row.kind != "mercenary"
                 and row.kind not in {"prefix", "suffix", "explicit"}
             ):
                 enabled = True
@@ -672,9 +1435,8 @@ def _apply_dedicated_exact_rules(
             is_valdo = item.category == "map" and item.base_type.casefold() == "valdo map"
             if is_valdo and row.kind in {"prefix", "suffix", "explicit"}:
                 enabled = True
-            if item.category == "map" and not is_valdo and row.kind in {
-                "prefix", "suffix", "explicit", "map pseudo",
-            }:
+            # Map/Chartも通常のExact規則へ統一し、Pseudoは候補表示だけにする。
+            if item.category == "map" and row.kind == "map pseudo":
                 enabled = False
             if item.category == "invitation" and row.kind in {
                 "prefix", "suffix", "explicit", "map", "map pseudo",
@@ -693,6 +1455,8 @@ def _apply_dedicated_exact_rules(
                 "logbook-area:"
             ):
                 enabled = row.selection_reason == f"logbook-area:{first_logbook_group}"
+            if row.hidden_reason:
+                enabled = False
             result.append(replace(row, enabled=enabled))
         elif row.stat_id in property_ids:
             if item.category == "armour" and row.stat_id in {
@@ -701,7 +1465,7 @@ def _apply_dedicated_exact_rules(
             }:
                 result.append(replace(row, enabled=False))
             elif row.stat_id == "property.base_percentile":
-                result.append(replace(row, enabled=True))
+                result.append(row)
             else:
                 result.append(row)
     return tuple(result)
@@ -711,17 +1475,18 @@ def _dedicated_exact_identity_filters(item: ParsedItem) -> tuple[TradeStatFilter
     """createFilters(exact=true)で表示されるilvl/Influenceの候補。"""
     filters: list[TradeStatFilter] = []
     excluded_ilvl = {
-        "map", "jewel", "heist_blueprint", "heist_contract", "memory_line",
+        "map", "chart", "jewel", "heist_blueprint", "heist_contract", "memory_line",
         "sanctum_relic", "charm", "idol", "expedition_logbook",
     }
     if (item.item_level is not None and not _is_unique(item)
             and item.category not in excluded_ilvl):
         if item.category == "cluster_jewel":
             minimum = max(value for value in (1, 50, 68, 75, 84) if value <= item.item_level)
-            maximum = next((value for value in (49, 67, 74, 100) if value >= item.item_level), 100)
+            maximum = next((value for value in (49, 67, 74) if value >= item.item_level), None)
             filters.append(TradeStatFilter(
                 "property.item_level", "アイテムレベル帯", float(minimum), "base", True,
-                max_value=float(maximum), selection_reason="Cluster JewelのMod出現帯へ正規化",
+                max_value=float(maximum) if maximum is not None else None,
+                selection_reason="Cluster JewelのMod出現帯へ正規化",
             ))
         else:
             filters.append(TradeStatFilter(
@@ -742,10 +1507,11 @@ def _base_item_filters(item: ParsedItem, trade_base_type: str | None = None) -> 
     if item.item_level is not None:
         if item.category == "cluster_jewel":
             minimum = max(value for value in (1, 50, 68, 75, 84) if value <= item.item_level)
-            maximum = next((value for value in (49, 67, 74, 100) if value >= item.item_level), 100)
+            maximum = next((value for value in (49, 67, 74) if value >= item.item_level), None)
             filters.append(TradeStatFilter(
                 "property.item_level", "アイテムレベル帯", float(minimum), "base", True,
-                max_value=float(maximum), selection_reason="Cluster JewelのMod出現帯へ正規化",
+                max_value=float(maximum) if maximum is not None else None,
+                selection_reason="Cluster JewelのMod出現帯へ正規化",
             ))
         elif item.category not in {
             "jewel", "abyss_jewel", "heist_blueprint", "heist_contract",
@@ -778,11 +1544,23 @@ def _base_item_filters(item: ParsedItem, trade_base_type: str | None = None) -> 
     for modifier in exact_modifiers:
         api_kind = "explicit" if modifier.kind in {"prefix", "suffix"} else modifier.kind
         source = _normalized_stat_text(modifier.text)
-        candidates = [
-            entry for entry in entries
-            if entry.get("type") == api_kind
-            and _normalized_stat_text(str(entry.get("text", ""))) == source
-        ]
+        # 3.29の詳細コピー本文には、Trade APIの表示用補足
+        # 「(ローカル)」が付かない。パーサーが確定したstat IDを優先し、
+        # IDがない古いコピー形式だけ正規化文字列で照合する。
+        candidates = (
+            [
+                entry for entry in entries
+                if entry.get("type") == api_kind
+                and str(entry.get("id")) == modifier.stat_id
+            ]
+            if modifier.stat_id else []
+        )
+        if not candidates:
+            candidates = [
+                entry for entry in entries
+                if entry.get("type") == api_kind
+                and _normalized_stat_text(str(entry.get("text", ""))) == source
+            ]
         if not candidates:
             continue
         if item.category == "weapon" and len(candidates) > 1:
@@ -797,14 +1575,28 @@ def _base_item_filters(item: ParsedItem, trade_base_type: str | None = None) -> 
         # COUNT(OR)にはしない。COUNTはUI指定または確定済み論理グループだけに使う。
         candidates = candidates[:1]
         entry = candidates[0]
-        value = _value_for_template(modifier.text, str(entry.get("text", "")))
-        if value is None:
+        entry_text = str(entry.get("text", ""))
+        value = _value_for_template(modifier.text, entry_text, modifier.stat_id)
+        # Trade Stat IDの`|option`部分が値そのものを表す選択肢型Statでは、
+        # 表示文中の固定数値をmin/maxとして送らない。Cluster Jewelの
+        # 「Added Small Passive Skills grant: 10% ...」などが該当する。
+        option_stat = "|" in str(entry.get("id", ""))
+        if option_stat:
+            value = None
+        if value is None and (
+            not option_stat and (
+                "#" in entry_text
+                or modifier.option_value is not None
+                or str(entry["id"]) not in _API_VERIFIED_VALUELESS_FIXED_STAT_IDS
+            )
+        ):
             value = modifier.values[0] if modifier.values else None
         enabled = modifier.kind not in {"prefix", "suffix"} or modifier.tier in {1, 2}
         filters.append(TradeStatFilter(
             str(entry["id"]), modifier.text, value,
             (modifier.kind if modifier.kind not in {"prefix", "suffix"}
              else f"T{modifier.tier}" if modifier.tier else "explicit"), enabled,
+            ref=modifier.ref,
         ))
     base_property_ids = {
         "property.total_dps", "property.physical_dps", "property.elemental_dps",
@@ -816,7 +1608,11 @@ def _base_item_filters(item: ParsedItem, trade_base_type: str | None = None) -> 
     special_properties = tuple(
         replace(
             row,
-            enabled=(row.stat_id in {"property.base_percentile", "property.memory_strands"}),
+            enabled=(
+                row.enabled if row.stat_id in {
+                    "property.base_percentile", "property.memory_strands",
+                } else False
+            ),
         )
         for row in _initial_property_filters(item, trade_base_type)
         if row.stat_id in base_property_ids
@@ -824,35 +1620,26 @@ def _base_item_filters(item: ParsedItem, trade_base_type: str | None = None) -> 
     return tuple(filters) + special_properties + _item_detail_filters(item)
 
 
-def _socket_summary(item: ParsedItem) -> tuple[int, int, int]:
+def _socket_summary(item: ParsedItem) -> tuple[int, int]:
     text = item.properties.get("ソケット") or item.properties.get("Sockets") or ""
     groups = re.findall(r"[RGBW](?:-[RGBW])*", text.upper())
     sizes = [len(group.split("-")) for group in groups]
     total = sum(sizes)
     linked = max(sizes, default=0)
-    white = len(re.findall(r"W", text.upper()))
-    return total, linked, white
+    return total, linked
 
 
 def _item_detail_filters(item: ParsedItem) -> tuple[TradeStatFilter, ...]:
     filters: list[TradeStatFilter] = []
-    quality = _property_value(item, "品質", "Quality")
+    quality = _raw_property_quality(item)
     if quality is not None and quality >= 20:
         filters.append(TradeStatFilter(
             "property.quality", "品質", quality, "property", quality > 20,
         ))
-    sockets, links, white = _socket_summary(item)
-    if sockets:
-        filters.append(TradeStatFilter(
-            "property.sockets", "ソケット数", float(sockets), "socket", sockets >= 6,
-        ))
+    _sockets, links = _socket_summary(item)
     if links > 1:
         filters.append(TradeStatFilter(
-            "property.links", "最大リンク数", float(links), "socket", True,
-        ))
-    if white:
-        filters.append(TradeStatFilter(
-            "property.white_sockets", "白ソケット数", float(white), "socket", True,
+            "property.links", "最大リンク数", float(links), "socket", False,
         ))
     return tuple(filters)
 
@@ -860,7 +1647,7 @@ def _item_detail_filters(item: ParsedItem) -> tuple[TradeStatFilter, ...]:
 def _gem_filters(item: ParsedItem, trade_base_type: str | None) -> tuple[TradeStatFilter, ...]:
     info = gem_metadata(trade_base_type or item.base_type)
     level = _property_value(item, "ジェムレベル", "レベル", "Level")
-    quality = _property_value(item, "品質", "Quality")
+    quality = _raw_property_quality(item)
     maximum = int(info.get("max_level", 20))
     filters = []
     if level is not None:
@@ -919,31 +1706,36 @@ def _special_content_filters(item: ParsedItem) -> tuple[TradeStatFilter, ...]:
     area_level = _property_value(item, "エリアレベル", "Area Level")
     if item.category == "cluster_jewel" and item.item_level is not None:
         minimum = max(value for value in (1, 50, 68, 75, 84) if value <= item.item_level)
-        maximum = next((value for value in (49, 67, 74, 100) if value >= item.item_level), 100)
+        maximum = next((value for value in (49, 67, 74) if value >= item.item_level), None)
         filters.append(TradeStatFilter(
             "property.item_level", "アイテムレベル帯", float(minimum), "cluster", True,
-            max_value=float(maximum), selection_reason="Cluster JewelのMod出現帯へ正規化",
+            max_value=float(maximum) if maximum is not None else None,
+            selection_reason="Cluster JewelのMod出現帯へ正規化",
         ))
     if item.category == "map":
-        for stat_id, label, value in (
-            ("property.map_tier", "マップティア", _property_value(item, "マップティア", "Map Tier")),
-            ("property.map_quantity", "アイテム数量", _property_value(item, "アイテム数量", "Item Quantity")),
-            ("property.map_rarity", "アイテムレアリティ", _property_value(item, "アイテムレアリティ", "Item Rarity")),
-            ("property.map_pack_size", "モンスターパックサイズ", _property_value(item, "モンスターパックサイズ", "Monster Pack Size")),
-        ):
-            if value is not None:
-                filters.append(TradeStatFilter(
-                    stat_id, label, value, "map", stat_id == "property.map_tier",
-                ))
+        tier = _property_value(item, "マップティア", "Map Tier")
+        if tier is not None:
+            filters.append(TradeStatFilter(
+                "property.map_tier", "マップティア", tier, "map", True,
+            ))
+        more_drop_rows = []
         for stat_id, label, labels in (
-            ("pseudo.pseudo_map_more_map_drops", "追加マップ", ("追加マップ", "More Maps")),
-            ("pseudo.pseudo_map_more_scarab_drops", "追加スカラベ", ("追加スカラベ", "More Scarabs")),
-            ("pseudo.pseudo_map_more_currency_drops", "追加カレンシー", ("追加カレンシー", "More Currency")),
-            ("pseudo.pseudo_map_more_card_drops", "追加占いカード", ("追加占いカード", "More Divination Cards")),
+            ("pseudo.pseudo_map_more_map_drops", "マップ量", ("追加マップ", "マップ量が上昇", "More Maps")),
+            ("pseudo.pseudo_map_more_scarab_drops", "スカラベ量", ("追加スカラベ", "スカラベ量が上昇", "More Scarabs")),
+            (
+                "pseudo.pseudo_map_more_currency_drops", "カレンシー量",
+                ("追加カレンシー", "カレンシー量が上昇", "More Currency"),
+            ),
+            (
+                "pseudo.pseudo_map_more_card_drops", "占いカード量",
+                ("追加占いカード", "占いカード増加", "More Divination Cards"),
+            ),
         ):
             value = _property_value(item, *labels)
             if value is not None:
-                filters.append(TradeStatFilter(stat_id, label, value, "map pseudo", False))
+                more_drop_rows.append(TradeStatFilter(
+                    stat_id, label, value, "map pseudo", True,
+                ))
         blight_state = _map_blight_state(item)
         if blight_state == "ravaged":
             filters.append(TradeStatFilter("property.map_uberblighted", "ブライトに破壊されたマップ", None, "map", True))
@@ -967,6 +1759,55 @@ def _special_content_filters(item: ParsedItem) -> tuple[TradeStatFilter, ...]:
                     "explicit.stat_1095765106", "死亡時にVoidへ送られるマップを除外", None,
                     "map safety", True, group_type="not", group_key="valdo-lethal",
                 ))
+        use_value_properties = (
+            not _is_unique(item)
+            and blight_state is None
+            and not completion
+        )
+        if use_value_properties:
+            for stat_id, label, value, enabled in (
+                (
+                    "property.map_quantity", "アイテム数量",
+                    _property_value(item, "アイテム数量", "Item Quantity"), True,
+                ),
+                (
+                    "property.map_rarity", "アイテムレアリティ",
+                    _property_value(item, "アイテムレアリティ", "Item Rarity"),
+                    not more_drop_rows,
+                ),
+                (
+                    "property.map_pack_size", "モンスターパックサイズ",
+                    _property_value(item, "モンスターパックサイズ", "Monster Pack Size"), True,
+                ),
+            ):
+                if value is not None:
+                    filters.append(TradeStatFilter(
+                        stat_id, label, value, "map", enabled,
+                    ))
+            filters.extend(more_drop_rows)
+            explicit_mods = [
+                modifier for modifier in item.modifiers
+                if modifier.kind in {"prefix", "suffix"}
+            ]
+            if len(explicit_mods) == 8 and not more_drop_rows:
+                filters.append(TradeStatFilter(
+                    "pseudo.pseudo_number_of_affix_mods", "Mod数", 8.0,
+                    "map pseudo", True, max_value=8.0,
+                    selection_reason="Awakenedの8 Mod Map条件",
+                ))
+    elif item.category == "chart" and area_level is not None:
+        filters.append(TradeStatFilter(
+            "property.area_level", "エリアレベル", area_level, "chart", True,
+        ))
+        for stat_id, label, labels in (
+            ("property.map_quantity", "アイテム数量", ("アイテム数量", "Item Quantity")),
+            ("property.map_rarity", "アイテムレアリティ", ("アイテムレアリティ", "Item Rarity")),
+            ("property.map_pack_size", "モンスターパックサイズ", ("モンスターパックサイズ", "Monster Pack Size")),
+            ("property.chart_sulphur", "死人の硫黄", ("死人の硫黄", "Dead Man's Sulphur")),
+        ):
+            value = _property_value(item, *labels)
+            if value is not None:
+                filters.append(TradeStatFilter(stat_id, label, value, "chart", True))
     elif item.category == "expedition_logbook" and area_level is not None:
         filters.append(TradeStatFilter(
             "property.area_level", "エリアレベル帯",
@@ -1064,6 +1905,42 @@ def _unique_exception_filters(item: ParsedItem) -> tuple[TradeStatFilter, ...]:
     return ()
 
 
+def preset_item_level_filter(
+    item: ParsedItem, preset: str = PRESET_FINISHED,
+    trade_base_type: str | None = None,
+) -> TradeStatFilter | None:
+    """Return Awakened's ilvl condition for the selected search preset.
+
+    Finished rare gear may expose an optional ilvl control in the UI, but it is
+    not part of the initial search. Dedicated Exact and craft-base searches use
+    their normalized ilvl condition, while unique items only use documented
+    exceptions such as unidentified Watcher's Eye and Agnerod.
+    """
+    if preset not in TRADE_PRESETS:
+        raise ValueError(f"未対応の検索プリセットです: {preset}")
+    if preset == PRESET_BASE:
+        rows = _base_item_filters(item, trade_base_type)
+    elif _is_unique(item):
+        rows = _unique_exception_filters(item)
+    elif item.category == "cluster_jewel":
+        # Awakenedの完成品（Pseudo）検索ではMod出現帯を表示するが
+        # 初期OFF。ベース検索では同じ帯を初期ONにする。
+        rows = tuple(
+            replace(row, enabled=False)
+            for row in _dedicated_exact_identity_filters(item)
+        )
+    elif uses_dedicated_exact_preset(item) and item.category not in {
+        "gem", "captured_beast",
+    }:
+        rows = _dedicated_exact_identity_filters(item)
+    else:
+        rows = ()
+    return next(
+        (row for row in rows if row.stat_id == "property.item_level"),
+        None,
+    )
+
+
 def _affix_limits(
     item: ParsedItem, trade_base_type: str | None = None,
 ) -> tuple[int, int] | None:
@@ -1094,20 +1971,36 @@ def _empty_affix_filters(
     limits = _affix_limits(item, trade_base_type)
     if limits is None:
         return ()
+    # Awakened's "1 Empty or Crafted Modifier" treats a crafted affix as a
+    # slot that can be freed at the crafting bench.  Count only natural affix
+    # groups as occupied; the remainder therefore includes both genuinely
+    # empty slots and removable crafted slots.
     groups: dict[str, set[object]] = {"prefix": set(), "suffix": set()}
+    known_affix = False
     for index, modifier in enumerate(item.modifiers):
         if modifier.affix not in groups:
             continue
+        known_affix = True
+        if modifier.kind == "crafted":
+            continue
         groups[modifier.affix].add(modifier.group if modifier.group is not None else ("line", index))
-    if not groups["prefix"] and not groups["suffix"]:
+    if not known_affix:
         # 通常コピーなどでPrefix/Suffix情報がない場合は推測しない。
         return ()
+    available = {
+        "prefix": max(0, limits[0] - len(groups["prefix"])),
+        "suffix": max(0, limits[1] - len(groups["suffix"])),
+    }
+    # Awakened intentionally offers this conservative preset only when the
+    # finished item has exactly one customizable affix slot in total.
+    if sum(available.values()) != 1:
+        return ()
     filters: list[TradeStatFilter] = []
-    for affix, maximum, stat_id, label in (
-        ("prefix", limits[0], "pseudo.pseudo_number_of_empty_prefix_mods", "空きPrefix枠"),
-        ("suffix", limits[1], "pseudo.pseudo_number_of_empty_suffix_mods", "空きSuffix枠"),
+    for affix, stat_id, label in (
+        ("prefix", "pseudo.pseudo_number_of_empty_prefix_mods", "空きPrefix枠"),
+        ("suffix", "pseudo.pseudo_number_of_empty_suffix_mods", "空きSuffix枠"),
     ):
-        empty = max(0, maximum - len(groups[affix]))
+        empty = available[affix]
         if empty:
             filters.append(TradeStatFilter(
                 stat_id, f"{label}（現在{empty}枠）", 1.0, "craft", False,
@@ -1115,7 +2008,12 @@ def _empty_affix_filters(
     return tuple(filters)
 
 
-def _initial_property_filters(item: ParsedItem, trade_base_type: str | None = None) -> list[TradeStatFilter]:
+def _initial_property_filters(
+    item: ParsedItem,
+    trade_base_type: str | None = None,
+    *,
+    hide_memory_strands: bool = False,
+) -> list[TradeStatFilter]:
     filters: list[TradeStatFilter] = []
     if item.category == "weapon":
         pdps = physical_dps_at_20_quality(item) or 0
@@ -1147,13 +2045,13 @@ def _initial_property_filters(item: ParsedItem, trade_base_type: str | None = No
         block = _property_value(item, "ブロック率", "Chance to Block")
         if block is not None:
             filters.append(TradeStatFilter(
-                "property.block", "ブロック率", _relaxed(block), "property", True,
+                "property.block", "ブロック率", _relaxed(block), "property", False,
             ))
         defenses = [
-            ("property.armour", "アーマー", _property_value(item, "アーマー", "防具", "Armour")),
-            ("property.evasion", "回避力", _property_value(item, "回避力", "Evasion Rating")),
-            ("property.energy_shield", "エナジーシールド", _property_value(item, "エナジーシールド", "Energy Shield")),
-            ("property.ward", "Ward", _property_value(item, "Ward")),
+            ("property.armour", "アーマー（品質20%換算）", _property_value(item, *_DEFENCE_PROPERTY_LABELS["ar"])),
+            ("property.evasion", "回避力（品質20%換算）", _property_value(item, *_DEFENCE_PROPERTY_LABELS["ev"])),
+            ("property.energy_shield", "エナジーシールド（品質20%換算）", _property_value(item, *_DEFENCE_PROPERTY_LABELS["es"])),
+            ("property.ward", "ワード（品質20%換算）", _property_value(item, *_DEFENCE_PROPERTY_LABELS["ward"])),
         ]
         defence_keys = {
             "property.armour": "ar",
@@ -1166,7 +2064,15 @@ def _initial_property_filters(item: ParsedItem, trade_base_type: str | None = No
             for stat_id, text, value in defenses if value
         ]
         for stat_id, text, value in present:
-            filters.append(TradeStatFilter(stat_id, text, _relaxed(value), "property", True))
+            bounds = _defence_bounds_at_trade_quality(
+                item, trade_base_type, defence_keys[stat_id],
+            )
+            filters.append(TradeStatFilter(
+                stat_id, text, _relaxed(value), "property", True,
+                read_value=value,
+                roll_min=bounds[0] if bounds else None,
+                roll_max=bounds[1] if bounds else None,
+            ))
         percentile = _base_defence_percentile(item, trade_base_type)
         if percentile is not None:
             filters.append(TradeStatFilter(
@@ -1178,9 +2084,142 @@ def _initial_property_filters(item: ParsedItem, trade_base_type: str | None = No
     if strands is not None:
         filters.append(TradeStatFilter(
             "property.memory_strands", "メモリーの糸", _relaxed(strands),
-            "property", strands >= 60, read_value=strands,
+            "property", strands >= 60 and not hide_memory_strands, read_value=strands,
+            hidden_reason=(
+                "Awakened完成品プリセットではメモリーの糸を非表示"
+                if hide_memory_strands else ""
+            ),
         ))
     return filters
+
+
+_ATZOATL_REMOVE_ROOMS = frozenset({
+    "Has Room: Banquet Hall",
+    "Has Room: Antechamber",
+    "Has Room: Passageways",
+    "Has Room: Cloister",
+    "Has Room: Tunnels",
+    "Has Room: Cellar",
+    "Has Room: Chasm",
+    "Has Room: Halls",
+    "Has Room: Tombs",
+    "Has Room: Pits",
+    "Has Room: Shrine of Empowerment (Tier 1)",
+    "Has Room: Sanctum of Unity (Tier 2)",
+    "Has Room: Temple Nexus (Tier 3)",
+    "Has Room: Explosives Room (Tier 1)",
+    "Has Room: Demolition Lab (Tier 2)",
+    "Has Room: Shrine of Unmaking (Tier 3)",
+    "Has Room: Corruption Chamber (Tier 1)",
+    "Has Room: Catalyst of Corruption (Tier 2)",
+    "Has Room: Gemcutter's Workshop (Tier 1)",
+    "Has Room: Department of Thaumaturgy (Tier 2)",
+    "Has Room: Sacrificial Chamber (Tier 1)",
+    "Has Room: Hall of Offerings (Tier 2)",
+    "Has Room: Storage Room (Tier 1)",
+    "Has Room: Guardhouse (Tier 1)",
+    "Has Room: Workshop (Tier 1)",
+    "Has Room: Royal Meeting Room (Tier 1)",
+    "Has Room: Torment Cells (Tier 1)",
+    "Has Room: Strongbox Chamber (Tier 1)",
+    "Has Room: Jeweller's Workshop (Tier 1)",
+    "Has Room: Splinter Research Lab (Tier 1)",
+    "Has Room: Tempest Generator (Tier 1)",
+    "Has Room: Hurricane Engine (Tier 2)",
+    "Has Room: Armourer's Workshop (Tier 1)",
+    "Has Room: Armoury (Tier 2)",
+    "Has Room: Sparring Room (Tier 1)",
+    "Has Room: Arena of Valour (Tier 2)",
+    "Has Room: Poison Garden (Tier 1)",
+    "Has Room: Cultivar Chamber (Tier 2)",
+    "Has Room: Hatchery (Tier 1)",
+    "Has Room: Automaton Lab (Tier 2)",
+    "Has Room: Trap Workshop (Tier 1)",
+    "Has Room: Temple Defense Workshop (Tier 2)",
+    "Has Room: Flame Workshop (Tier 1)",
+    "Has Room: Omnitect Forge (Tier 2)",
+    "Has Room: Lightning Workshop (Tier 1)",
+    "Has Room: Omnitect Reactor Plant (Tier 2)",
+    "Has Room: Pools of Restoration (Tier 1)",
+    "Has Room: Sanctum of Vitality (Tier 2)",
+})
+
+_ATZOATL_HIDDEN_ROOMS = frozenset({
+    "Has Room: Vault (Tier 1)",
+    "Has Room: Surveyor's Study (Tier 1)",
+    "Has Room: Hall of Mettle (Tier 1)",
+    "Has Room: Warehouses (Tier 2)",
+    "Has Room: Barracks (Tier 2)",
+    "Has Room: Engineering Department (Tier 2)",
+    "Has Room: Hall of Lords (Tier 2)",
+    "Has Room: Torture Cages (Tier 2)",
+    "Has Room: Hall of Locks (Tier 2)",
+    "Has Room: Jewellery Forge (Tier 2)",
+    "Has Room: Breach Containment Chamber (Tier 2)",
+    "Has Room: Storm of Corruption (Tier 3)",
+    "Has Room: Chamber of Iron (Tier 3)",
+    "Has Room: Hall of Champions (Tier 3)",
+    "Has Room: Toxic Grove (Tier 3)",
+    "Has Room: Hybridisation Chamber (Tier 3)",
+    "Has Room: Defense Research Lab (Tier 3)",
+    "Has Room: Crucible of Flame (Tier 3)",
+    "Has Room: Conduit of Lightning (Tier 3)",
+    "Has Room: Sanctum of Immortality (Tier 3)",
+})
+
+_ATZOATL_ENABLED_ROOMS = frozenset({
+    "Has Room: Apex of Atzoatl",
+    "Has Room: Locus of Corruption (Tier 3)",
+    "Has Room: Doryani's Institute (Tier 3)",
+    "Has Room: Apex of Ascension (Tier 3)",
+    "Has Room: Wealth of the Vaal (Tier 3)",
+})
+
+_ATZOATL_EXPLOSIVES_ROOMS = frozenset({
+    "Has Room: Explosives Room (Tier 1)",
+    "Has Room: Demolition Lab (Tier 2)",
+    "Has Room: Shrine of Unmaking (Tier 3)",
+})
+
+
+def _apply_atzoatl_room_rules(
+    filters: list[TradeStatFilter],
+) -> list[TradeStatFilter]:
+    """AwakenedのChronicle of Atzoatl全Room規則を適用する。"""
+    room_filters = [
+        row for row in filters
+        if row.ref and row.ref.startswith("Has Room:")
+    ]
+    has_open_explosives = any(
+        row.ref in _ATZOATL_EXPLOSIVES_ROOMS and row.option_value == 1
+        for row in room_filters
+    )
+    adjusted = []
+    for row in filters:
+        if not row.ref or not row.ref.startswith("Has Room:"):
+            adjusted.append(row)
+            continue
+        obstructed = row.option_value == 2
+        if row.ref in _ATZOATL_REMOVE_ROOMS or (
+            obstructed and not has_open_explosives
+        ):
+            continue
+        hidden_reason = (
+            "Awakened: 低優先度のAtzoatl部屋を非表示"
+            if row.ref in _ATZOATL_HIDDEN_ROOMS else ""
+        )
+        adjusted.append(replace(
+            row,
+            enabled=row.ref in _ATZOATL_ENABLED_ROOMS and not hidden_reason,
+            option_value=None if obstructed else row.option_value,
+            option_text=None if obstructed else row.option_text,
+            hidden_reason=hidden_reason,
+            selection_reason=(
+                "Atzoatlの主要部屋"
+                if row.ref in _ATZOATL_ENABLED_ROOMS else row.selection_reason
+            ),
+        ))
+    return adjusted
 
 
 def _gear_pseudo_filters(item: ParsedItem) -> list[TradeStatFilter]:
@@ -1188,7 +2227,14 @@ def _gear_pseudo_filters(item: ParsedItem) -> list[TradeStatFilter]:
         return []
     totals = {"life": 0.0, "mana": 0.0, "fire": 0.0, "cold": 0.0,
               "lightning": 0.0, "chaos": 0.0, "str": 0.0, "dex": 0.0, "int": 0.0}
+    has_maximum_life_mod = False
+    has_maximum_mana_mod = False
     simple: dict[str, float] = {}
+    simple_sources: dict[str, list[ItemModifier]] = {}
+    attribute_sources = {key: [] for key in ("str", "dex", "int")}
+    aggregate_sources = {key: [] for key in (
+        "life", "mana", "fire", "cold", "lightning", "chaos",
+    )}
     for modifier in item.modifiers:
         value = modifier.values[0] if modifier.values else 0
         ref = modifier.ref or ""
@@ -1199,43 +2245,72 @@ def _gear_pseudo_filters(item: ParsedItem) -> list[TradeStatFilter]:
             ) + tuple(row[0] for row in _SIMPLE_PSEUDOS) + tuple(_RELATIONAL_SOURCE_REFS)
             ref = next((candidate for candidate in known_refs
                         if normalize_stat_text(candidate) == normalized), "")
-        if ref == "+# to maximum Life": totals["life"] += value
-        if ref == "+# to maximum Mana": totals["mana"] += value
+        if ref == "+# to maximum Life":
+            has_maximum_life_mod = True
+            totals["life"] += value
+            aggregate_sources["life"].append(modifier)
+        if ref == "+# to maximum Mana":
+            has_maximum_mana_mod = True
+            totals["mana"] += value
+            aggregate_sources["mana"].append(modifier)
         for attr in _ATTRIBUTE_REFS.get(ref, ()):
             totals[attr] += value
+            attribute_sources[attr].append(modifier)
         if ref == "+# to all Attributes":
             simple[ref] = simple.get(ref, 0.0) + value
+            simple_sources.setdefault(ref, []).append(modifier)
         resistance = _RESISTANCE_REFS.get(ref)
         if resistance:
             elements, chaos = resistance
-            for element in elements: totals[element] += value
-            if chaos: totals["chaos"] += value
+            for element in elements:
+                totals[element] += value
+                aggregate_sources[element].append(modifier)
+            if chaos:
+                totals["chaos"] += value
+                aggregate_sources["chaos"].append(modifier)
         for source_ref, stat_id, label in _SIMPLE_PSEUDOS:
             if ref == source_ref and not (
                 source_ref == "#% increased Attack Speed" and
                 modifier.stat_id and modifier.stat_id.rsplit("_", 1)[-1] in _WEAPON_SPEED_STAT_KEYS
             ):
                 simple[source_ref] = simple.get(source_ref, 0.0) + value
+                simple_sources.setdefault(source_ref, []).append(modifier)
         if ref in _RELATIONAL_SOURCE_REFS:
             simple[ref] = simple.get(ref, 0.0) + value
+            simple_sources.setdefault(ref, []).append(modifier)
     filters = []
     totals["life"] += totals["str"] * 0.5
     totals["mana"] += totals["int"] * 0.5
     elemental = totals["fire"] + totals["cold"] + totals["lightning"]
-    if totals["life"]:
+    life_sources = aggregate_sources["life"] + attribute_sources["str"]
+    mana_sources = aggregate_sources["mana"] + attribute_sources["int"]
+    def useful_pseudo(value: float, sources: list[ItemModifier]) -> bool:
+        unique = list(dict.fromkeys(sources))
+        return len(unique) > 1 or bool(
+            unique and unique[0].values and unique[0].values[0] != value
+        )
+
+    if has_maximum_life_mod:
         filters.append(TradeStatFilter(
-            "pseudo.pseudo_total_life", "最大ライフ合計", _relaxed(totals["life"]), "pseudo", True,
+            "pseudo.pseudo_total_life", "最大ライフ合計",
+            _relaxed(totals["life"]), "pseudo", True,
         ))
-    if totals["mana"]:
+    if has_maximum_mana_mod and useful_pseudo(totals["mana"], mana_sources):
         filters.append(TradeStatFilter("pseudo.pseudo_total_mana", "最大マナ合計", _relaxed(totals["mana"]), "pseudo"))
+    elemental_sources = (
+        aggregate_sources["fire"] + aggregate_sources["cold"]
+        + aggregate_sources["lightning"]
+    )
     if elemental:
         filters.append(TradeStatFilter(
             "pseudo.pseudo_total_elemental_resistance", "元素耐性合計", _relaxed(elemental), "pseudo", True,
+            read_value=elemental,
         ))
     for element, stat_id, label in (("fire", "pseudo.pseudo_total_fire_resistance", "火耐性合計"),
                                     ("cold", "pseudo.pseudo_total_cold_resistance", "冷気耐性合計"),
                                     ("lightning", "pseudo.pseudo_total_lightning_resistance", "雷耐性合計")):
-        if totals[element]: filters.append(TradeStatFilter(stat_id, label, _relaxed(totals[element]), "pseudo"))
+        if totals[element] and useful_pseudo(totals[element], aggregate_sources[element]):
+            filters.append(TradeStatFilter(stat_id, label, _relaxed(totals[element]), "pseudo"))
     chaos_sources = [
         modifier for modifier in item.modifiers
         if modifier.ref in _RESISTANCE_REFS and _RESISTANCE_REFS[modifier.ref][1]
@@ -1244,13 +2319,22 @@ def _gear_pseudo_filters(item: ParsedItem) -> list[TradeStatFilter]:
     if totals["chaos"] and not crafted_chaos_only:
         filters.append(TradeStatFilter(
             "pseudo.pseudo_total_chaos_resistance", "混沌耐性合計", _relaxed(totals["chaos"]), "pseudo", True,
+            read_value=totals["chaos"],
         ))
     for attr, stat_id, label in (("str", "pseudo.pseudo_total_strength", "筋力合計"),
                                  ("dex", "pseudo.pseudo_total_dexterity", "器用さ合計"),
                                  ("int", "pseudo.pseudo_total_intelligence", "知性合計")):
-        if totals[attr]: filters.append(TradeStatFilter(stat_id, label, _relaxed(totals[attr]), "pseudo"))
+        direct_ref = {
+            "str": "+# to Strength",
+            "dex": "+# to Dexterity",
+            "int": "+# to Intelligence",
+        }[attr]
+        if totals[attr] and [row.ref for row in attribute_sources[attr]] != [direct_ref]:
+            filters.append(TradeStatFilter(stat_id, label, _relaxed(totals[attr]), "pseudo"))
     all_attributes = simple.get("+# to all Attributes", 0.0)
-    if all_attributes:
+    if all_attributes and useful_pseudo(
+        all_attributes, simple_sources.get("+# to all Attributes", []),
+    ):
         filters.append(TradeStatFilter(
             "pseudo.pseudo_total_all_attributes", "全能力値合計",
             _relaxed(all_attributes), "pseudo",
@@ -1267,13 +2351,20 @@ def _gear_pseudo_filters(item: ParsedItem) -> list[TradeStatFilter]:
         }
     }
     for ref, (stat_id, label) in simple_definitions.items():
-        if simple.get(ref):
+        if simple.get(ref) and useful_pseudo(simple[ref], simple_sources.get(ref, [])):
             filters.append(TradeStatFilter(stat_id, label, _relaxed(simple[ref]), "pseudo"))
 
     def add(stat_id: str, label: str, required_ref: str, *shared_refs: str) -> None:
         if not simple.get(required_ref):
             return
         value = sum(simple.get(ref, 0.0) for ref in (required_ref, *shared_refs))
+        sources = [
+            source
+            for ref in (required_ref, *shared_refs)
+            for source in simple_sources.get(ref, [])
+        ]
+        if not useful_pseudo(value, sources):
+            return
         filters.append(TradeStatFilter(stat_id, label, _relaxed(value), "pseudo"))
 
     add("pseudo.pseudo_global_critical_strike_chance", "グローバルクリティカル率",
@@ -1321,6 +2412,14 @@ def _apply_pseudo_relations(filters: list[TradeStatFilter]) -> list[TradeStatFil
         winners = [row for row in elemental if (row.min_value or 0) == maximum]
         winner_id = winners[0].stat_id if len(winners) == 1 else None
         kept = [row for row in kept if row.stat_id not in elemental_ids or row.stat_id == winner_id]
+        if winner_id:
+            kept = [
+                replace(
+                    row,
+                    hidden_reason="Awakened: 最大の個別元素耐性は隠し候補",
+                ) if row.stat_id == winner_id else row
+                for row in kept
+            ]
 
     # 能力値はAwakenedと同じく、all attributesと個別値のどちらかを残す。
     attr_ids = {
@@ -1343,27 +2442,12 @@ def _apply_pseudo_relations(filters: list[TradeStatFilter]) -> list[TradeStatFil
     return sorted(kept, key=lambda row: (row.kind != "property", row.stat_id, row.text))
 
 
-def _pseudo_consumed_stat_ids(item: ParsedItem) -> set[str]:
-    """pseudoへ集約した元Modを個別条件として二重表示しない。"""
-    known_refs = set(_RESISTANCE_REFS) | set(_ATTRIBUTE_REFS) | {
-        "+# to maximum Life", "+# to maximum Mana",
-    } | {row[0] for row in _SIMPLE_PSEUDOS} | _RELATIONAL_SOURCE_REFS
-    consumed = set()
-    for modifier in item.modifiers:
-        if not modifier.stat_id or modifier.ref not in known_refs:
-            continue
-        if (modifier.ref == "#% increased Attack Speed" and
-                modifier.stat_id.rsplit("_", 1)[-1] in _WEAPON_SPEED_STAT_KEYS):
-            continue
-        consumed.add(modifier.stat_id)
-    return consumed
-
-
 _stat_entries_cache: tuple[dict, ...] | None = None
+_stat_entry_indexes_cache = None
 _item_entries_cache: tuple[dict, ...] | None = None
 _jp_item_entries_cache: tuple[dict, ...] | None = None
-_item_groups_cache: tuple[tuple[dict, ...], ...] | None = None
-_jp_item_groups_cache: tuple[tuple[dict, ...], ...] | None = None
+_item_groups_cache: tuple[tuple[str, tuple[dict, ...]], ...] | None = None
+_jp_item_groups_cache: tuple[tuple[str, tuple[dict, ...]], ...] | None = None
 
 
 def _normalized_stat_text(text: str) -> str:
@@ -1372,14 +2456,50 @@ def _normalized_stat_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _value_for_template(source: str, template: str) -> float | None:
+def _indexed_stat_text(text: str, kind: str) -> str:
+    # Mercenary SupportはTierごとに別の公式stat IDを持つ。
+    if kind == "mercenary":
+        text = text.replace("（", "(").replace("）", ")")
+        text = re.sub(r"(ティア|Tier)\s*[:：]\s*", r"\1 ", text, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", text).strip()
+    return _normalized_stat_text(text)
+
+
+def _value_for_template(
+    source: str, template: str, stat_id: str | None = None,
+    *, roll_increase: float | None = None, decimal: bool = False,
+) -> float | None:
     source = re.sub(r"\([^)]*(?:\d|implicit|crafted|enchant)[^)]*\)", "", source, flags=re.IGNORECASE).strip()
     template = template.replace(" (ローカル)", "").strip()
     pattern = re.escape(template).replace(r"\#", r"(-?\d+(?:\.\d+)?)")
     match = re.fullmatch(pattern, source)
     if not match or not match.groups():
         return None
-    return float(match.group(1))
+    values = tuple(
+        apply_roll_increase(float(value), roll_increase, decimal=decimal)
+        for value in match.groups()
+    )
+    rule = multi_value_rule(stat_id or "")
+    if rule:
+        operation = rule.get("operation")
+        if operation == "blank":
+            return None
+        if operation == "first":
+            return values[0]
+        if operation == "mean":
+            return sum(values) / len(values)
+        if operation == "index":
+            return values[int(rule["value_index"])]
+        if operation == "half_second":
+            return values[1] / 2
+    if (
+        len(match.groups()) == 2
+        and "#から#" in template
+        and "ダメージ" in template
+        and "反射する" not in template
+    ):
+        return (values[0] + values[1]) / 2
+    return values[0]
 
 
 def _trade_stat_entries() -> tuple[dict, ...]:
@@ -1390,6 +2510,32 @@ def _trade_stat_entries() -> tuple[dict, ...]:
             entry for group in data.get("result", ()) for entry in group.get("entries", ())
         )
     return _stat_entries_cache
+
+
+def _trade_stat_entry_indexes(entries: tuple[dict, ...]):
+    """Index official stats once instead of scanning all 13k rows for every mod."""
+    global _stat_entry_indexes_cache
+    if (
+        _stat_entry_indexes_cache is not None
+        and _stat_entry_indexes_cache[0] is entries
+    ):
+        return _stat_entry_indexes_cache[1:]
+    by_id: dict[tuple[str, str], list[tuple[int, dict]]] = {}
+    by_text: dict[tuple[str, str], list[tuple[int, dict]]] = {}
+    for position, entry in enumerate(entries):
+        kind = str(entry.get("type", ""))
+        stat_id = str(entry.get("id", ""))
+        by_id.setdefault((kind, stat_id), []).append((position, entry))
+        comparable = str(entry.get("text", "")).replace(" (ローカル)", "")
+        normalized = _indexed_stat_text(comparable, kind)
+        by_text.setdefault((kind, normalized), []).append((position, entry))
+    _stat_entry_indexes_cache = (entries, by_id, by_text)
+    return by_id, by_text
+
+
+_CONQUEROR_CITADEL_STAT_IDS = {
+    f"implicit.stat_2563183002|{option}" for option in range(1, 5)
+}
 
 
 def _trade_item_entries() -> tuple[dict, ...]:
@@ -1412,22 +2558,26 @@ def _jp_trade_item_entries() -> tuple[dict, ...]:
     return _jp_item_entries_cache
 
 
-def _trade_item_groups() -> tuple[tuple[dict, ...], ...]:
+def _trade_item_groups() -> tuple[tuple[str, tuple[dict, ...]], ...]:
     global _item_groups_cache
     if _item_groups_cache is None:
         data, _ = _request_json(f"{API_ROOT}/data/items")
         _item_groups_cache = tuple(
-            tuple(group.get("entries", ())) for group in data.get("result", ())
+            (str(group.get("id", "")), tuple(group.get("entries", ())))
+            for group in data.get("result", ())
+            if str(group.get("id", ""))
         )
     return _item_groups_cache
 
 
-def _jp_trade_item_groups() -> tuple[tuple[dict, ...], ...]:
+def _jp_trade_item_groups() -> tuple[tuple[str, tuple[dict, ...]], ...]:
     global _jp_item_groups_cache
     if _jp_item_groups_cache is None:
         data, _ = _request_json(f"{JP_API_ROOT}/data/items")
         _jp_item_groups_cache = tuple(
-            tuple(group.get("entries", ())) for group in data.get("result", ())
+            (str(group.get("id", "")), tuple(group.get("entries", ())))
+            for group in data.get("result", ())
+            if str(group.get("id", ""))
         )
     return _jp_item_groups_cache
 
@@ -1449,9 +2599,11 @@ def _aligned_trade_item_pairs():
             tuple(sorted(flags)),
         )
 
-    for english_group, japanese_group in zip(
-        _trade_item_groups(), _jp_trade_item_groups(),
-    ):
+    japanese_groups = dict(_jp_trade_item_groups())
+    for group_id, english_group in _trade_item_groups():
+        japanese_group = japanese_groups.get(group_id)
+        if japanese_group is None:
+            continue
         if len(english_group) == len(japanese_group):
             yield from zip(english_group, japanese_group)
             continue
@@ -1490,11 +2642,59 @@ def _aligned_trade_item_pairs():
                 break
 
 
+_divination_card_identities_cache: tuple[tuple[str, str], ...] | None = None
+
+
+def _divination_card_identities() -> tuple[tuple[str, str], ...]:
+    """Return stable English Trade IDs paired with Japanese display names.
+
+    The official EN/JA ``data/items`` endpoints do not expose a shared entry ID,
+    and the Japanese card list omits duplicate localized names.  Consequently,
+    card entries must never be joined by array position.
+    """
+    global _divination_card_identities_cache
+    if _divination_card_identities_cache is None:
+        payload = json.loads(DIVINATION_CARD_IDENTITIES_PATH.read_text(encoding="utf-8"))
+        rows = tuple(
+            (
+                str(row.get("english", "")).strip(),
+                str(row.get("japanese", "")).strip(),
+            )
+            for row in payload.get("cards", ())
+        )
+        if not rows or any(not english or not japanese for english, japanese in rows):
+            raise ValueError("占いカード日英対応表が不正です。")
+        if len({english for english, _japanese in rows}) != len(rows):
+            raise ValueError("占いカードの英語identityが重複しています。")
+        _divination_card_identities_cache = rows
+    return _divination_card_identities_cache
+
+
+def _english_divination_card_type(japanese_type: str) -> str | None:
+    wanted = japanese_type.strip()
+    candidates = {
+        english for english, japanese in _divination_card_identities()
+        if japanese == wanted
+    }
+    # 「取り引き」「生贄」は日本語名がそれぞれ2種類のカードと重複する。
+    # コピー本文だけで識別できる処理を追加するまでは誤検索せず未解決にする。
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _japanese_divination_card_type(english_type: str) -> str | None:
+    wanted = english_type.strip()
+    return next((
+        japanese for english, japanese in _divination_card_identities()
+        if english == wanted
+    ), None)
+
+
 def _english_trade_item_name(japanese_name: str) -> str | None:
     """公式日英itemsの同一グループ・同一位置から英語固有名を得る。"""
     wanted = japanese_name.strip()
     if not wanted:
         return None
+    candidates: set[str] = set()
     for english, japanese in _aligned_trade_item_pairs():
         if str(japanese.get("name", "")).strip() != wanted:
             continue
@@ -1502,8 +2702,68 @@ def _english_trade_item_name(japanese_name: str) -> str | None:
             (japanese.get("flags") or {}).get("unique")
         ):
             continue
-        return str(english.get("name", "")).strip() or None
-    return None
+        translated = str(english.get("name", "")).strip()
+        if translated:
+            candidates.add(translated)
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+_CONFIRMED_ENGLISH_TRADE_TYPE_OVERRIDES = {
+    ("accessory", "重い矢筒"): "Heavy Arrow Quiver",
+    ("accessory", "原始の矢筒"): "Primal Arrow Quiver",
+    ("accessory", "羽根付きの矢筒"): "Feathered Arrow Quiver",
+    ("accessory", "灼熱の矢筒"): "Blazing Arrow Quiver",
+    ("divination_card", "狂犬病のロア"): "The Rabid Rhoa",
+}
+
+
+def _english_trade_item_type(
+    japanese_type: str,
+    category: str | None = None,
+) -> str | None:
+    """公式日英itemsから日本語の一行名に対応する英語typeを得る。"""
+    wanted = japanese_type.strip()
+    if not wanted:
+        return None
+    if category == "divination_card":
+        return _english_divination_card_type(wanted)
+    confirmed = _CONFIRMED_ENGLISH_TRADE_TYPE_OVERRIDES.get((category or "", wanted))
+    if confirmed:
+        return confirmed
+    if category == "gem":
+        gem_text_matches = {
+            str(english.get("text", "")).strip()
+            for english, japanese in _aligned_trade_item_pairs()
+            if str(japanese.get("text", "")).strip() == wanted
+            and str(english.get("text", "")).strip()
+        }
+        if len(gem_text_matches) == 1:
+            # 変容ジェムはtypeが通常版と共通で、textとdiscだけが異なる。
+            # 英語textを返せば固定メタデータから正しいtrade_type/alt_xを引ける。
+            return next(iter(gem_text_matches))
+    exact: set[str] = set()
+    contained: list[tuple[int, str]] = []
+    for english, japanese in _aligned_trade_item_pairs():
+        source = str(japanese.get("type", "")).strip()
+        translated = str(english.get("type", "")).strip()
+        if not source or not translated:
+            continue
+        if source == wanted:
+            exact.add(translated)
+            continue
+        # Magic/Veiled/Synthesised等はPrefix/Suffixを含む一行名になる。
+        # 内包される最長の公式base typeを採用する。
+        if source in wanted:
+            contained.append((len(source), translated))
+    if exact:
+        return next(iter(exact)) if len(exact) == 1 else None
+    if not contained:
+        return None
+    longest = max(length for length, _translated in contained)
+    candidates = {
+        translated for length, translated in contained if length == longest
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 def _japanese_trade_item_name(english_name: str) -> str | None:
@@ -1522,6 +2782,50 @@ def _japanese_trade_item_name(english_name: str) -> str | None:
     return None
 
 
+def _scrying_orb_trade_identity(item: ParsedItem) -> tuple[str, str] | None:
+    """透視のオーブをマップエリアに対応する公式Trade identityへ解決する。"""
+    if item.category != "currency" or item.base_type.strip() not in {
+        "透視のオーブ", "Scrying Orb",
+    }:
+        return None
+    area = str(
+        item.properties.get("マップエリア")
+        or item.properties.get("Map Area")
+        or ""
+    ).strip()
+    if not area:
+        return None
+    wanted = f"透視のオーブ ({area})"
+    for english, japanese in _aligned_trade_item_pairs():
+        if (
+            str(japanese.get("text", "")).strip() == wanted
+            and str(japanese.get("disc", "")).strip() == "scrying_orb"
+        ):
+            option = str(english.get("type", "")).strip()
+            discriminator = str(english.get("disc", "")).strip()
+            if option and discriminator:
+                return option, discriminator
+    return None
+
+
+def _mercenary_warrant_trade_identity(item: ParsedItem) -> tuple[str, str] | None:
+    if item.name.strip() not in {"傭兵の召喚状", "Mercenary's Warrant", "Mercenary Warrant"}:
+        return None
+    build = str(item.properties.get("ビルド") or item.properties.get("Build") or "").strip()
+    if not build:
+        return None
+    wanted = {f"傭兵の召喚状 ({build})", f"Mercenary's Warrant ({build})"}
+    for entry in (*_jp_trade_item_entries(), *_trade_item_entries()):
+        if str(entry.get("text", "")).strip() not in wanted:
+            continue
+        if str(entry.get("disc", "")).strip() != "mercenary_warrant":
+            continue
+        option = str(entry.get("type", "")).strip()
+        if option:
+            return option, "mercenary_warrant"
+    return None
+
+
 def _japanese_trade_item_type(english_type: str) -> str | None:
     """公式日英itemsの同一位置から日本語Trade用typeを得る。"""
     wanted = english_type.strip()
@@ -1534,6 +2838,36 @@ def _japanese_trade_item_type(english_type: str) -> str | None:
         if localized:
             return localized
     return None
+
+
+def japanese_trade_item_label(
+    namespace: str,
+    english_name: str,
+    variant: str | None = None,
+) -> str:
+    """関連アイテム用に公式Tradeの日英itemsから日本語表示名を得る。
+
+    価格照合に使う英語identityは変更せず、公式側に日本語entryがない場合だけ
+    英語名へフォールバックする。ドリヤニの妄想は同名で3種類あるため、
+    公式日本語ベース名も添えて区別できるようにする。
+    """
+    name = str(english_name or "").strip()
+    if not name:
+        return ""
+    normalized_namespace = str(namespace or "").strip().upper()
+    if normalized_namespace == "UNIQUE":
+        localized_name = _japanese_trade_item_name(name) or name
+        localized_variant = (
+            _japanese_trade_item_type(str(variant or ""))
+            if name.casefold() == "doryani's delusion" else None
+        )
+        return (
+            f"{localized_name}（{localized_variant}）"
+            if localized_variant else localized_name
+        )
+    if normalized_namespace == "DIVINATION_CARD":
+        return _japanese_divination_card_type(name) or name
+    return _japanese_trade_item_type(name) or name
 
 
 def _localized_web_trade_type(item: ParsedItem, web_query: dict) -> str:
@@ -1549,6 +2883,8 @@ def _localized_web_trade_type(item: ParsedItem, web_query: dict) -> str:
     localized = _normalize_trade_base_type(
         item.base_type if item.category == "gem" else (query_type_value or item.base_type)
     )
+    if item.category == "divination_card":
+        return _japanese_divination_card_type(localized) or localized
     if item.category != "gem":
         return _japanese_trade_item_type(localized) or localized
     if localized.casefold().startswith("vaal "):
@@ -1612,6 +2948,34 @@ def unique_candidates(base_type: str) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
+@dataclass(frozen=True)
+class UniqueCandidate:
+    name: str
+    icon_url: str | None
+    display_name: str | None = None
+
+
+def unique_candidate_details(base_type: str) -> tuple[UniqueCandidate, ...]:
+    """未鑑定Unique候補へ、日本語表示名と公式CDNアイコンURLを付ける。"""
+    return tuple(
+        UniqueCandidate(
+            name,
+            unique_icon_url(name) or _poewiki_unique_icon_url(name),
+            _japanese_trade_item_name(name) or name,
+        )
+        for name in unique_candidates(base_type)
+    )
+
+
+def _poewiki_unique_icon_url(name: str) -> str:
+    """現行Awakenedデータから消えた旧Uniqueの画像をPoE Wikiから補う。"""
+    filename = f"{name.strip()} inventory icon.png".replace(" ", "_")
+    return (
+        "https://www.poewiki.net/wiki/Special:Redirect/file/"
+        + quote(filename, safe="_")
+    )
+
+
 def unique_variants(name: str, base_type: str) -> tuple[tuple[str, str | None], ...]:
     """同名・同ベースの公式Trade discriminator候補を返す。"""
     entries = _trade_item_entries()
@@ -1634,6 +2998,14 @@ def _is_unique(item: ParsedItem) -> bool:
 def _aggregated_local_property_stat(item: ParsedItem, stat_id: str) -> bool:
     """完成品のプロパティ値へ既に集約済みのローカルstatか。"""
     key = stat_id.rsplit("_", 1)[-1]
+    if (
+        _is_unique(item)
+        and key == "4253454700"
+        and _property_value(item, "ブロック率", "Chance to Block") is not None
+    ):
+        # Unique盾では総ブロック率だけでなく、価格差になる可変Unique Modの
+        # ロールも独立して比較できるよう候補へ残す。
+        return False
     if item.category == "weapon":
         if key in _WEAPON_PHYSICAL_STAT_KEYS:
             return physical_dps(item) is not None
@@ -1644,10 +3016,10 @@ def _aggregated_local_property_stat(item: ParsedItem, stat_id: str) -> bool:
         if key in _WEAPON_CRIT_STAT_KEYS:
             return _property_value(item, "クリティカル率", "Critical Strike Chance") is not None
     if item.category == "armour" and key in _ARMOUR_STAT_KEYS:
-        return any(_property_value(item, label) is not None for label in (
-            "アーマー", "防具", "Armour", "回避力", "Evasion Rating",
-            "エナジーシールド", "Energy Shield", "Ward",
-        ))
+        return any(
+            _property_value(item, *labels) is not None
+            for labels in _DEFENCE_PROPERTY_LABELS.values()
+        )
     return False
 
 
@@ -1725,6 +3097,26 @@ def unresolved_modifier_warnings(
     # Captured BeastはBeast種別だけを検索し、個体のMonster Modは照合しない。
     if item.category == "captured_beast":
         return ()
+    # Awakenedは現在のアイテム化スペクター死体をCurrencyのExact検索として扱う。
+    # 固有能力は個体差のない説明であり、公式Tradeにも完全な検索Statがないため、
+    # Mod候補や「未解決」警告には含めない。
+    if item.category == "corpse":
+        return ()
+    # Embryonic Gifts all carry fixed Genesis Tree instructions. They identify
+    # no variable item stat and are searched by their exact base type.
+    if item.category == "incubator":
+        return ()
+    # Pinnacle boss invitations display this fixed implicit without the
+    # percentage found in the official Trade stat template. It has no
+    # per-item value and the invitation name already identifies the product.
+    invitation_fixed_implicits = {
+        _normalized_stat_text(
+            "アイテムの数量のモッドはボスからドロップする報酬の量に影響する"
+        ),
+        _normalized_stat_text(
+            "Modifiers to Item Quantity affect the amount of rewards dropped by the boss"
+        ),
+    }
     resolved_lines = {
         _normalized_stat_text(line)
         for row in resolved_filters
@@ -1735,7 +3127,13 @@ def unresolved_modifier_warnings(
     fixed_unique_refs = unique_fixed_stats(item.name) if _is_unique(item) else None
 
     def should_warn(modifier) -> bool:
-        if modifier.stat_id is not None or modifier.kind in {"desecrated"}:
+        if modifier.stat_id is not None or modifier.kind in {"desecrated", "mercenary"}:
+            return False
+        if (
+            item.category == "invitation"
+            and modifier.kind == "implicit"
+            and _normalized_stat_text(modifier.text) in invitation_fixed_implicits
+        ):
             return False
         if _normalized_stat_text(modifier.text) in resolved_lines:
             return False
@@ -1765,12 +3163,12 @@ def _decorate_filters(item: ParsedItem, filters: tuple[TradeStatFilter, ...],
         "property.physical_dps": "物理ダメージ主体の武器性能",
         "property.armour": "防具の主要アーマー値", "property.evasion": "防具の主要回避力",
         "property.energy_shield": "防具の主要エナジーシールド値", "property.ward": "防具の主要Ward値",
-        "property.links": "リンク数は価格への影響が大きい", "property.white_sockets": "白ソケットを保持",
+        "property.links": "リンク数は価格への影響が大きい",
         "property.quality": "品質20%超を保持", "property.item_level": "クラフト価値のあるアイテムレベル",
         "property.base_percentile": "防具ベース固有値のロールを保持",
         "property.memory_strands": "高いメモリーの糸を保持",
     }
-    sockets, links, white = _socket_summary(item)
+    sockets, links = _socket_summary(item)
     property_values = {
         "property.total_dps": (physical_dps_at_20_quality(item) or 0) + (elemental_dps(item) or 0),
         "property.elemental_dps": elemental_dps(item),
@@ -1782,10 +3180,9 @@ def _decorate_filters(item: ParsedItem, filters: tuple[TradeStatFilter, ...],
         "property.energy_shield": _property_value(item, "エナジーシールド", "Energy Shield"),
         "property.ward": _property_value(item, "Ward"),
         "property.item_level": float(item.item_level) if item.item_level is not None else None,
-        "property.quality": _property_value(item, "品質", "Quality"),
+        "property.quality": _raw_property_quality(item),
         "property.sockets": float(sockets) if sockets else None,
         "property.links": float(links) if links else None,
-        "property.white_sockets": float(white) if white else None,
     }
     simple_sources = {stat_id: source_ref for source_ref, stat_id, _ in _SIMPLE_PSEUDOS}
     pseudo_refs: dict[str, set[str]] = {
@@ -1827,11 +3224,82 @@ def _decorate_filters(item: ParsedItem, filters: tuple[TradeStatFilter, ...],
         },
     }
     pseudo_refs.update({stat_id: {ref} for stat_id, ref in simple_sources.items()})
+    known_source_refs = set().union(*pseudo_refs.values())
+
+    def effective_source_ref(modifier) -> str:
+        if modifier.ref:
+            return modifier.ref
+        normalized = normalize_stat_text(modifier.text)
+        return next((
+            ref for ref in known_source_refs
+            if normalize_stat_text(ref) == normalized
+        ), "")
+
+    def source_contribution(stat_id: str, modifier) -> float | None:
+        if not modifier.values:
+            return None
+        value = modifier.values[0]
+        ref = effective_source_ref(modifier)
+        if stat_id == "pseudo.pseudo_total_life":
+            if ref == "+# to maximum Life":
+                return value
+            if "str" in _ATTRIBUTE_REFS.get(ref, ()):
+                return value * 0.5
+        if stat_id == "pseudo.pseudo_total_mana":
+            if ref == "+# to maximum Mana":
+                return value
+            if "int" in _ATTRIBUTE_REFS.get(ref, ()):
+                return value * 0.5
+        resistance_targets = {
+            "pseudo.pseudo_total_fire_resistance": "fire",
+            "pseudo.pseudo_total_cold_resistance": "cold",
+            "pseudo.pseudo_total_lightning_resistance": "lightning",
+        }
+        resistance = _RESISTANCE_REFS.get(ref)
+        if resistance:
+            elements, chaos = resistance
+            if stat_id == "pseudo.pseudo_total_elemental_resistance":
+                return value * len(elements)
+            if stat_id == "pseudo.pseudo_total_chaos_resistance" and chaos:
+                return value
+            if resistance_targets.get(stat_id) in elements:
+                return value
+        attribute_targets = {
+            "pseudo.pseudo_total_strength": "str",
+            "pseudo.pseudo_total_dexterity": "dex",
+            "pseudo.pseudo_total_intelligence": "int",
+        }
+        if attribute_targets.get(stat_id) in _ATTRIBUTE_REFS.get(ref, ()):
+            return value
+        if (stat_id == "pseudo.pseudo_total_all_attributes"
+                and ref == "+# to all Attributes"):
+            return value
+        if ref in pseudo_refs.get(stat_id, set()):
+            return value
+        return value if modifier.stat_id == stat_id else None
+
+    def source_heading(modifier) -> str:
+        labels = {
+            "prefix": "プレフィックス",
+            "suffix": "サフィックス",
+            "implicit": "暗黙Mod",
+            "crafted": "クラフトMod",
+            "fractured": "フラクチャーMod",
+            "enchant": "エンチャント",
+            "veiled": "ヴェールドMod",
+            "explicit": "明示Mod",
+        }
+        heading = labels.get(modifier.affix or modifier.kind, "元Mod")
+        if modifier.tier is not None:
+            heading += f" (T{modifier.tier})"
+        return heading
+
     for row in filters:
         sources = by_stat.get(row.stat_id, ())
         source = sources[0] if sources else None
         pseudo_sources = [modifier for modifier in item.modifiers
-                          if modifier.ref in pseudo_refs.get(row.stat_id, set())]
+                          if effective_source_ref(modifier)
+                          in pseudo_refs.get(row.stat_id, set())]
         property_sources = _property_tier_sources(item, row.stat_id)
         if source is None and len(pseudo_sources) == 1:
             source = pseudo_sources[0]
@@ -1852,11 +3320,54 @@ def _decorate_filters(item: ParsedItem, filters: tuple[TradeStatFilter, ...],
         exact = row.exact or (
             row.min_value is not None and row.max_value is not None and row.min_value == row.max_value
         )
-        read_value = source.values[0] if source and source.values else row.read_value
+        fixed_foulborn = (
+            source is not None
+            and source.generation == "foulborn"
+            and _unique_roll_bounds(source.text) is None
+        )
+        read_value = (
+            row.min_value if fixed_foulborn else
+            source.values[0] if source and source.values else row.read_value
+        )
         if read_value is None:
             read_value = property_values.get(row.stat_id)
         if read_value is None and row.kind == "pseudo" and row.min_value is not None:
             read_value = round(row.min_value / (1 - DEFAULT_SEARCH_RANGE), 2)
+        contributing_sources = property_sources or pseudo_sources or sources
+        contributing_source_ids = {id(modifier) for modifier in contributing_sources}
+        contributing_indexes = tuple(
+            index for index, modifier in enumerate(item.modifiers)
+            if id(modifier) in contributing_source_ids
+        )
+        unique_sources = tuple(dict.fromkeys(
+            modifier
+            for modifier in contributing_sources
+            if modifier.text and modifier.text != row.text
+        ))
+        provenance_sources = contributing_sources or (() if source is None else (source,))
+        provenance_tags = []
+        for modifier in provenance_sources:
+            if modifier.generation in {"volatile", "reflecting"}:
+                provenance_tags.append(modifier.generation)
+            if (
+                _is_catalyst_affected(item, modifier)
+            ):
+                provenance_tags.append("catalyst")
+            if (
+                "corrupted" in item.flags
+                and modifier.values
+                and modifier.roll_min is not None
+                and modifier.roll_max is not None
+                and modifier.roll_min != modifier.roll_max
+            ):
+                provenance_tags.append("corrupted")
+            if (
+                "mirrored" in item.flags
+                and item.category == "accessory"
+                and not _is_unique(item)
+                and modifier.values
+            ):
+                provenance_tags.append("reflecting")
         decorated.append(replace(
             row,
             read_value=read_value,
@@ -1874,8 +3385,54 @@ def _decorate_filters(item: ParsedItem, filters: tuple[TradeStatFilter, ...],
                 _awakened_tier_tags(property_sources or pseudo_sources or sources)
                 or row.tier_tags
             ),
+            source_texts=tuple(modifier.text for modifier in unique_sources),
+            source_contributions=tuple(
+                source_contribution(row.stat_id, modifier)
+                for modifier in unique_sources
+            ),
+            source_headings=tuple(
+                source_heading(modifier) for modifier in unique_sources
+            ),
+            source_affixes=tuple(
+                item.modifiers[index].affix for index in contributing_indexes
+            ),
+            source_indexes=contributing_indexes,
+            provenance_tags=tuple(dict.fromkeys(provenance_tags)),
         ))
     return tuple(decorated)
+
+
+def _apply_cluster_passive_count_rules(
+    item: ParsedItem, filters: tuple[TradeStatFilter, ...] | list[TradeStatFilter],
+) -> tuple[TradeStatFilter, ...]:
+    if item.category != "cluster_jewel":
+        return tuple(filters)
+    adjusted = []
+    for row in filters:
+        if row.ref == "# Added Passive Skills are Jewel Sockets":
+            continue
+        is_passive_count = (
+            row.ref == "Adds # Passive Skills"
+            or row.stat_id == "enchant.stat_3086156145"
+        )
+        if is_passive_count and row.read_value is not None:
+            value = row.read_value
+            minimum, maximum = row.min_value, row.max_value
+            if value in {2, 8}:
+                minimum, maximum = None, value
+            elif value == 4:
+                minimum, maximum = None, 5.0
+            elif value == 5:
+                minimum, maximum = 5.0, 5.0
+            elif value in {3, 6, 9, 10, 11, 12}:
+                minimum, maximum = value, None
+            adjusted.append(replace(
+                row, min_value=minimum, max_value=maximum, enabled=True,
+                selection_reason="Cluster Jewelの最適Passive数へ正規化",
+            ))
+        else:
+            adjusted.append(row)
+    return tuple(adjusted)
 
 
 def resolve_trade_stat_filters(
@@ -1888,7 +3445,10 @@ def resolve_trade_stat_filters(
     if preset == PRESET_BASE:
         if PRESET_BASE not in available_trade_presets(item):
             raise ValueError("このアイテムはベースアイテム検索の対象外です。")
-        return _decorate_filters(item, _base_item_filters(item, trade_base_type))
+        return _apply_cluster_passive_count_rules(
+            item,
+            _decorate_filters(item, _base_item_filters(item, trade_base_type)),
+        )
     if is_inscribed_ultimatum(item):
         # Awakenedと同じく名前完全一致だけを使う。供物・報酬・試練Modは
         # Trade API上で高信頼に個体照合できないため、曖昧な条件へ変換しない。
@@ -1900,13 +3460,15 @@ def resolve_trade_stat_filters(
     if item.category == "gem":
         return _gem_filters(item, trade_base_type)
     entries = _trade_stat_entries()
+    entries_by_id, entries_by_text = _trade_stat_entry_indexes(entries)
     resolved: list[TradeStatFilter] = []
     unique_item = _is_unique(item)
     fixed_unique_refs = unique_fixed_stats(
         trade_name or item.name
     ) if unique_item else None
-    modifiers = _combine_valdo_multiline_modifiers(item, entries)
+    modifiers = _combine_map_multiline_modifiers(item, entries)
     for modifier in modifiers:
+        hidden_reason = ""
         if (
             item.category in {"heist_blueprint", "heist_contract"}
             and modifier.kind in {"prefix", "suffix", "crafted"}
@@ -1924,32 +3486,95 @@ def resolve_trade_stat_filters(
                 # Anointmentも候補へ表示する。その他の付け直しやすいものは隠す。
                 continue
         roll_bounds = _unique_roll_bounds(modifier.text) if unique_item else None
+        if (
+            roll_bounds is not None
+            and modifier.roll_increase
+            and modifier.roll_min is not None
+            and modifier.roll_max is not None
+        ):
+            roll_bounds = (modifier.roll_min, modifier.roll_max)
+        standalone_variant = (
+            unique_item
+            and modifier.kind == "explicit"
+            and modifier.option_value is None
+            and "|" in (modifier.stat_id or "")
+        )
+        special_variable = bool(
+            modifier.values and (
+                modifier.generation in {"volatile", "reflecting"}
+                or (
+                    "corrupted" in item.flags
+                    and modifier.roll_min is not None
+                    and modifier.roll_max is not None
+                    and modifier.roll_min != modifier.roll_max
+                )
+                or (
+                    _is_catalyst_affected(item, modifier)
+                )
+                or (
+                    "mirrored" in item.flags
+                    and item.category == "accessory"
+                    and not unique_item
+                )
+            )
+        )
+        unique_variant = (
+            standalone_variant
+            or special_variable
+            or modifier.generation == "vestigial"
+            or (
+                unique_item
+                and modifier.kind == "explicit"
+                and (modifier.stat_id or "").startswith(
+                    "explicit.indexable_support_"
+                )
+            )
+            or (
+                unique_item
+                and modifier.kind == "explicit"
+                and fixed_unique_refs is not None
+                and modifier.ref not in fixed_unique_refs
+            )
+        )
         if unique_item and roll_bounds is None:
             corrupted_implicit = (
                 modifier.kind == "implicit" and modifier.generation == "corrupted"
             )
-            if not corrupted_implicit and (
+            foulborn_variant = modifier.generation == "foulborn"
+            vestigial_variant = modifier.generation == "vestigial"
+            if (not standalone_variant and not corrupted_implicit
+                    and not foulborn_variant and not vestigial_variant) and (
                 fixed_unique_refs is None or modifier.ref in fixed_unique_refs
-            ):
+            ) and not special_variable:
                 # Awakened準拠: 常設Modでも可変ロールがあれば候補へ残す。
-                # 数値なしModはfixedStats外のVariantだけを候補として扱うが、
-                # 後付けされたコラプト暗黙はUnique固定Modではないため残す。
-                continue
+                # 固定Modも「隠された候補」から確認できるよう保持する。
+                hidden_reason = "ユニーク固定値のため初期非表示"
         api_kind = "explicit" if modifier.kind in {"prefix", "suffix"} else modifier.kind
-        source = _normalized_stat_text(modifier.text)
+        source = _indexed_stat_text(modifier.text, api_kind)
+        indexed_candidates = list(entries_by_text.get((api_kind, source), ()))
+        if modifier.stat_id:
+            indexed_candidates.extend(
+                entries_by_id.get((api_kind, modifier.stat_id), ())
+            )
         candidates = []
-        for entry in entries:
-            if entry.get("type") != api_kind:
+        seen_positions = set()
+        for position, entry in sorted(indexed_candidates, key=lambda row: row[0]):
+            if position in seen_positions:
                 continue
-            if modifier.stat_id and str(entry.get("id")) == modifier.stat_id:
-                candidates.append(entry)
-                continue
-            candidate = str(entry.get("text", ""))
-            comparable = candidate.replace(" (ローカル)", "")
-            if _normalized_stat_text(comparable) == source:
-                candidates.append(entry)
+            seen_positions.add(position)
+            candidates.append(entry)
         if not candidates:
             continue
+        preferred_stat_id = _CATEGORY_STAT_OVERRIDES.get((
+            item.category, api_kind, source,
+        ))
+        if preferred_stat_id:
+            preferred_candidates = [
+                entry for entry in candidates
+                if str(entry.get("id")) == preferred_stat_id
+            ]
+            if preferred_candidates:
+                candidates = preferred_candidates
         if modifier.stat_id:
             exact_candidates = [
                 entry for entry in candidates
@@ -1969,32 +3594,74 @@ def resolve_trade_stat_filters(
             if _aggregated_local_property_stat(item, str(entry["id"])):
                 # DPS・APS・クリ率・防御値へ反映済みなので二重条件化しない。
                 continue
-            value = _value_for_template(modifier.text, str(entry.get("text", "")))
-            if value is None:
+            entry_text = str(entry.get("text", ""))
+            value = _value_for_template(
+                modifier.text, entry_text, modifier.stat_id,
+                roll_increase=modifier.roll_increase, decimal=modifier.decimal,
+            )
+            if value is None and (
+                "#" in entry_text
+                or modifier.option_value is not None
+                or str(entry["id"]) not in _API_VERIFIED_VALUELESS_FIXED_STAT_IDS
+            ):
                 value = modifier.values[0] if modifier.values else None
             maximum = None
+            modifier_inverted = modifier.inverted
             if modifier.stat_id == str(entry["id"]):
                 metadata, _ = default_metadata_index().match(modifier.text, modifier.kind)
                 if metadata is None and modifier.ref:
                     metadata, _ = default_metadata_index().match_ref(
                         modifier.ref, modifier.kind,
                     )
-                if metadata:
-                    value, maximum = metadata.search_bounds(
+                if metadata and not preferred_stat_id:
+                    fixed_foulborn_value = (
+                        value
+                        if modifier.generation == "foulborn" and roll_bounds is None
+                        else None
+                    )
+                    effective_metadata = replace(
+                        metadata,
+                        better=(modifier.better if modifier.better is not None else metadata.better),
+                    )
+                    value, maximum = effective_metadata.search_bounds(
                         value,
-                        modifier.roll_min if unique_item else None,
-                        modifier.roll_max if unique_item else None,
+                        fixed_foulborn_value if fixed_foulborn_value is not None else (
+                            modifier.roll_min if unique_item else None
+                        ),
+                        fixed_foulborn_value if fixed_foulborn_value is not None else (
+                            modifier.roll_max if unique_item else None
+                        ),
                         DEFAULT_SEARCH_RANGE,
                     )
+            if hidden_reason and value is not None:
+                # 初期非表示の固定Unique Modは、ユーザーが明示的に選んだ時だけ
+                # 現在値を完全一致で検索する。共通の許容幅を適用すると、
+                # 4(3)%の変異値が3%以上になり通常品まで混ざってしまう。
+                current_value = _value_for_template(
+                    modifier.text, str(entry.get("text", "")),
+                    roll_increase=modifier.roll_increase,
+                    decimal=modifier.decimal,
+                )
+                if current_value is not None:
+                    value = maximum = current_value
             if unique_item and roll_bounds is not None and modifier.stat_id != str(entry["id"]):
                 value = _unique_minimum(value, roll_bounds)
             valdo_exact = item.category == "map" and item.base_type.casefold() == "valdo map"
+            conqueror_citadel = (
+                item.category == "map"
+                and str(entry["id"]) in _CONQUEROR_CITADEL_STAT_IDS
+            )
+            if conqueror_citadel:
+                # 2行目の「その数値の20%」は可変ロールではなく、
+                # 砦の種類を表す公式Statの固定文言。20をmin/maxへ送ると
+                # Trade側で一致しないため、選択状態だけを検索条件にする。
+                value = maximum = None
             resolved.append(TradeStatFilter(
                 str(entry["id"]), modifier.text, value, modifier.kind,
-                valdo_exact or (modifier.ref == "Allocates #" and (
+                unique_variant or valdo_exact or conqueror_citadel or (modifier.ref == "Allocates #" and (
                     "talisman" in item.item_class.casefold() or "タリスマン" in item.item_class
                 )),
-                maximum, modifier.ref, modifier.confidence, modifier.inverted,
+                maximum, modifier.ref, modifier.confidence, modifier_inverted,
                 option_value=modifier.option_value, option_text=modifier.option_text,
                 oils=modifier.oils,
                 selection_reason=(
@@ -2003,6 +3670,7 @@ def resolve_trade_stat_filters(
                 ),
                 group_type="count" if alternatives else "and",
                 group_key=group_key, group_min=1 if alternatives else None,
+                hidden_reason=hidden_reason,
             ))
     combined: dict[str, TradeStatFilter] = {}
     counts: dict[str, int] = {}
@@ -2030,46 +3698,102 @@ def resolve_trade_stat_filters(
             selection_reason=previous.selection_reason or stat_filter.selection_reason,
             group_type=stat_filter.group_type, group_key=stat_filter.group_key,
             group_min=stat_filter.group_min,
+            hidden_reason=previous.hidden_reason or stat_filter.hidden_reason,
         )
     enable_unique_rolls = unique_item and len(combined) <= 3
     # AwakenedはFoulborn品について、置換されたFoulborn Modだけでなく、
     # 置換されずに残った通常Unique Modも個体差として初期選択する。
     enable_foulborn_rolls = unique_item and "foulborn" in item.flags
-    # ユニーク品はpseudo集約を表示しないため、元の可変Modを消費扱いにしない。
-    # 非ユニーク品だけ、pseudoと個別Modの二重表示を避ける。
-    consumed_stat_ids = (
-        set() if unique_item or item.category in {"jewel", "abyss_jewel"}
-        else _pseudo_consumed_stat_ids(item)
-    )
-    consumed_refs = {
-        modifier.ref for modifier in item.modifiers
-        if modifier.stat_id in consumed_stat_ids and modifier.ref
-    }
+    # 非ユニーク品は直接Modを初期選択し、pseudoは任意の代替条件として残す。
     individual = tuple(
         TradeStatFilter(
             row.stat_id,
             f"{row.text} ({counts[combine_key]}行合計)" if counts[combine_key] > 1 else row.text,
             row.min_value, row.kind,
-            enable_unique_rolls or enable_foulborn_rolls or row.enabled,
+            False if row.hidden_reason else (
+                enable_unique_rolls or enable_foulborn_rolls or row.enabled
+            ),
             row.max_value, row.ref, row.confidence, row.inverted,
             option_value=row.option_value, option_text=row.option_text, oils=row.oils,
             selection_reason=row.selection_reason,
             group_type=row.group_type, group_key=row.group_key, group_min=row.group_min,
+            hidden_reason=row.hidden_reason,
         )
         for combine_key, row in combined.items()
-        if row.stat_id not in consumed_stat_ids and not (not unique_item and row.ref in consumed_refs)
     )
     if unique_item:
-        special_properties = tuple(
-            row for row in _initial_property_filters(item, trade_base_type)
-            if row.stat_id in {"property.block", "property.memory_strands"}
+        unique_property_ids = {
+            "property.total_dps", "property.physical_dps",
+            "property.elemental_dps", "property.aps", "property.crit",
+            "property.armour", "property.evasion", "property.energy_shield",
+            "property.ward", "property.block", "property.base_percentile",
+            "property.memory_strands",
+        }
+        special_properties = list(
+            row for row in _initial_property_filters(
+                item, trade_base_type, hide_memory_strands=True,
+            )
+            if row.stat_id in unique_property_ids
         )
-        return _decorate_filters(
-            item, special_properties + individual + _item_detail_filters(item)
-            + _unique_exception_filters(item) + _special_content_filters(item), True,
+        defence_ids = {
+            "property.armour": "ar",
+            "property.evasion": "ev",
+            "property.energy_shield": "es",
+            "property.ward": "ward",
+        }
+        visible_defence_ids = {
+            stat_id for stat_id, defence in defence_ids.items()
+            if _has_variable_local_defence(item, defence)
+            or _property_quality(item) >= 21
+        }
+        percentile_details = _base_defence_percentile_details(item, trade_base_type)
+        percentile_property_id = (
+            next(
+                stat_id for stat_id, defence in defence_ids.items()
+                if defence == percentile_details[1]
+            )
+            if percentile_details else None
         )
+        special_properties = [
+            row for row in special_properties
+            if (
+                row.stat_id not in defence_ids
+                or row.stat_id in visible_defence_ids
+            ) and not (
+                row.stat_id == "property.base_percentile"
+                and percentile_property_id in visible_defence_ids
+            )
+        ]
+        pseudo_candidates = list(_gear_pseudo_filters(item))
+        # AwakenedのUnique Map Exactは固有名・Map種別・Tierだけで照合し、
+        # 個体ごとのUnique Modロールを検索条件へ追加しない。
+        exact_individual = () if item.category == "map" else individual
+        decorated = _decorate_filters(
+            item, tuple(special_properties) + tuple(pseudo_candidates) + exact_individual
+            + _item_detail_filters(item) + _unique_exception_filters(item)
+            + _special_content_filters(item), True,
+        )
+        unique_pseudos = []
+        for row in decorated:
+            if row.kind != "pseudo":
+                unique_pseudos.append(row)
+                continue
+            sources = [item.modifiers[index] for index in row.source_indexes]
+            enough_sources = (
+                len(sources) >= 2
+                if "corrupted" in item.flags else
+                sum(source.kind in {"explicit", "prefix", "suffix"} for source in sources) >= 2
+            )
+            if enough_sources:
+                unique_pseudos.append(replace(
+                    row, enabled=False,
+                    selection_reason="Uniqueの複数Mod集約候補（初期未選択）",
+                ))
+        return tuple(unique_pseudos)
     initial_properties = [
-        row for row in _initial_property_filters(item, trade_base_type)
+        row for row in _initial_property_filters(
+            item, trade_base_type, hide_memory_strands=True,
+        )
         if (row.stat_id != "property.base_percentile"
             or uses_dedicated_exact_preset(item))
     ]
@@ -2174,6 +3898,61 @@ def resolve_trade_stat_filters(
         decorated = [row for _, row in sorted(
             enumerate(decorated), key=accessory_sort_key,
         )]
+    if item.category in {"weapon", "armour", "accessory"}:
+        # 完成品は最終性能を先頭に置き、その後を元Modのaffix系統で
+        # Prefix→Suffix→その他へ整理する。各系統内は元アイテムの記載順を保つ。
+        major_property_order = {
+            "weapon": (
+                "property.total_dps", "property.physical_dps",
+                "property.elemental_dps",
+            ),
+            "armour": (
+                "property.armour", "property.evasion",
+                "property.energy_shield", "property.ward",
+            ),
+            "accessory": (),
+        }[item.category]
+        property_priority = {
+            stat_id: index for index, stat_id in enumerate(major_property_order)
+        }
+        prefix_mixed_pseudos = {
+            "pseudo.pseudo_total_life",
+            "pseudo.pseudo_total_mana",
+        }
+
+        def source_order(row: TradeStatFilter, fallback: int) -> int:
+            if row.source_indexes:
+                return min(row.source_indexes)
+            for source_index, modifier in enumerate(item.modifiers):
+                if row.stat_id and modifier.stat_id == row.stat_id:
+                    return source_index
+                if row.ref and modifier.ref == row.ref:
+                    return source_index
+            return len(item.modifiers) + fallback
+
+        def affix_group(row: TradeStatFilter) -> int:
+            if row.stat_id in prefix_mixed_pseudos:
+                return 1
+            affixes = {
+                affix for affix in (*row.source_affixes, row.affix)
+                if affix in {"prefix", "suffix"}
+            }
+            # 通常affixと暗黙等が混在するpseudoも、通常affixを優先する。
+            if "prefix" in affixes:
+                return 1
+            if "suffix" in affixes:
+                return 2
+            return 3
+
+        def finished_gear_sort_key(pair):
+            index, row = pair
+            if row.stat_id in property_priority:
+                return (0, property_priority[row.stat_id], index)
+            return (affix_group(row), source_order(row, index), index)
+
+        decorated = [row for _, row in sorted(
+            enumerate(decorated), key=finished_gear_sort_key,
+        )]
     if item.category in {"jewel", "abyss_jewel"}:
         rarity = item.rarity.casefold()
         magic = rarity in {"magic", "マジック"}
@@ -2208,30 +3987,33 @@ def resolve_trade_stat_filters(
                 enabled = True
             adjusted.append(replace(row, enabled=enabled))
         decorated = [row for _, row in sorted(enumerate(adjusted), key=jewel_priority)]
-    if item.category in {"flask", "tincture"}:
+    if item.category == "flask":
         used_enkindling = any(
-            modifier.ref == "Gains no Charges during Flask Effect" for modifier in item.modifiers
+            modifier.ref == "Gains no Charges during Flask Effect"
+            for modifier in item.modifiers
         )
-        if item.category == "flask" and not used_enkindling:
-            decorated = [row for row in decorated if row.kind != "enchant"]
+        if not used_enkindling:
+            decorated = [
+                replace(
+                    row,
+                    enabled=False,
+                    hidden_reason="Awakened: Enkindling以外のフラスコEnchantを非表示",
+                )
+                if row.kind == "enchant" else row
+                for row in decorated
+            ]
+    if item.category in {"flask", "tincture"}:
         has_recovery = any(modifier.ref == "#% increased Charge Recovery" for modifier in item.modifiers)
         has_effect = any(modifier.ref == "#% increased effect" for modifier in item.modifiers)
         if item.rarity.casefold() in {"magic", "マジック"} and has_recovery and not has_effect:
             decorated.append(TradeStatFilter(
-                "explicit.stat_2448920197", "効果増加hybrid Modを除外", None,
+                "explicit.stat_2448920197", "効果減少を含む複合Modを除外", None,
                 "flask hybrid", True, group_type="not", group_key="flask-effect",
                 selection_reason="Charge Recovery単独品を検索",
             ))
     special_name = f"{item.name} {item.base_type}".casefold()
     if "chronicle of atzoatl" in special_name or "アトゾアトルの年代記" in special_name:
-        valuable_rooms = {
-            "Has Room: Apex of Atzoatl", "Has Room: Locus of Corruption (Tier 3)",
-            "Has Room: Doryani's Institute (Tier 3)", "Has Room: Apex of Ascension (Tier 3)",
-        }
-        decorated = [row for row in decorated if not (row.ref and "(Tier 1)" in row.ref)]
-        decorated = [replace(
-            row, enabled=True, selection_reason="Atzoatlの主要Tier 3部屋"
-        ) if row.ref in valuable_rooms else row for row in decorated]
+        decorated = _apply_atzoatl_room_rules(decorated)
     if "mirrored tablet" in special_name or "ミラーされたタブレット" in special_name:
         premium = ("Reflection of Kalandra", "Reflection of the Sun", "Reflection of Paradise", "Reflection of Angling")
         decorated = [row for row in decorated if not (
@@ -2242,27 +4024,7 @@ def resolve_trade_stat_filters(
         decorated = [replace(
             row, enabled=True, selection_reason="高価値Reflection"
         ) if row.ref and any(name in row.ref for name in premium) else row for row in decorated]
-    if item.category == "cluster_jewel":
-        adjusted = []
-        for row in decorated:
-            if row.ref == "# Added Passive Skills are Jewel Sockets":
-                continue
-            if row.ref == "Adds # Passive Skills" and row.read_value is not None:
-                value = row.read_value
-                minimum, maximum = row.min_value, row.max_value
-                if value == 4:
-                    minimum, maximum = None, 5.0
-                elif value == 5:
-                    minimum, maximum = 5.0, 5.0
-                elif value in {3, 6, 10, 11, 12}:
-                    minimum, maximum = value, None
-                adjusted.append(replace(
-                    row, min_value=minimum, max_value=maximum, enabled=True,
-                    selection_reason="Cluster Jewelの最適Passive数へ正規化",
-                ))
-            else:
-                adjusted.append(row)
-        decorated = adjusted
+    decorated = list(_apply_cluster_passive_count_rules(item, decorated))
     if uses_dedicated_exact_preset(item):
         decorated = list(_apply_dedicated_exact_rules(item, tuple(decorated)))
         existing_ids = {row.stat_id for row in decorated}
@@ -2270,26 +4032,32 @@ def resolve_trade_stat_filters(
             row for row in _dedicated_exact_identity_filters(item)
             if row.stat_id not in existing_ids
         )
+    if "veiled" in item.flags:
+        # AwakenedはVeiled種別だけを専用item filterとして検索し、
+        # 通常Mod・property・pseudo条件はすべて初期OFFにする。
+        decorated = [replace(row, enabled=False) for row in decorated]
     return tuple(decorated)
 
 
-def _combine_valdo_multiline_modifiers(item: ParsedItem, entries: tuple[dict, ...]) -> tuple:
-    """Valdo固有の複数行statを、公式Tradeの改行テンプレート単位へ戻す。"""
-    if item.category != "map" or item.base_type.casefold() != "valdo map":
+def _combine_map_multiline_modifiers(item: ParsedItem, entries: tuple[dict, ...]) -> tuple:
+    """Mapの複数行statを、公式Tradeの改行テンプレート単位へ戻す。"""
+    if item.category != "map":
         return item.modifiers
     official = {
         _normalized_stat_text(str(entry.get("text", ""))): entry
         for entry in entries
-        if entry.get("type") == "explicit" and "\n" in str(entry.get("text", ""))
+        if "\n" in str(entry.get("text", ""))
     }
     result, index = [], 0
     while index < len(item.modifiers):
         matched = None
         for size in range(min(3, len(item.modifiers) - index), 1, -1):
             group = item.modifiers[index:index + size]
+            if len({row.group for row in group}) != 1:
+                continue
             text = "\n".join(row.text for row in group)
             entry = official.get(_normalized_stat_text(text))
-            if entry:
+            if entry and all(row.kind == entry.get("type") for row in group):
                 matched = replace(
                     group[0], text=text, values=tuple(
                         value for row in group for value in row.values
@@ -2326,6 +4094,9 @@ def build_search_query(
     include_unidentified: bool | None = None,
     include_veiled: bool | None = None,
     include_foil: bool | None = None,
+    include_searing: bool | None = None,
+    include_tangled: bool | None = None,
+    chart_area_exact: bool = True,
 ) -> dict:
     if trade_status not in TRADE_STATUS_OPTIONS:
         raise ValueError(f"未対応の取引方式です: {trade_status}")
@@ -2335,7 +4106,7 @@ def build_search_query(
         raise ValueError(f"未対応の価格通貨です: {trade_currency}")
     if listed_within not in LISTED_WITHIN_OPTIONS:
         raise ValueError(f"未対応の出品期間です: {listed_within}")
-    if item.category == "map":
+    if item.category in {"map", "chart"}:
         # Awakened準拠: MapはTier・種類・固有条件で検索し、ilvlは使わない。
         # UIの古い状態や直接呼び出しから渡されてもクエリへ混入させない。
         item_level_min = None
@@ -2360,6 +4131,10 @@ def build_search_query(
     corruption_mode_explicit = include_corrupted is not None
     if include_corrupted is None:
         include_corrupted = "corrupted" in item.flags
+    if include_searing is None:
+        include_searing = "searing_item" in item.flags
+    if include_tangled is None:
+        include_tangled = "tangled_item" in item.flags
     if include_corrupted not in {False, True, "only"}:
         raise ValueError(f"未対応のコラプト条件です: {include_corrupted}")
     craftable = (
@@ -2382,14 +4157,44 @@ def build_search_query(
     base_type = _normalize_trade_base_type(trade_base_type or item.base_type)
     gem_info = gem_metadata(base_type) if item.category == "gem" else {}
     query_type: str | dict = str(gem_info.get("trade_type") or base_type)
-    if gem_info.get("discriminator"):
+    scrying_identity = _scrying_orb_trade_identity(item)
+    mercenary_identity = _mercenary_warrant_trade_identity(item)
+    if item.name.strip() in {"傭兵の召喚状", "Mercenary's Warrant", "Mercenary Warrant"} and not mercenary_identity:
+        raise ValueError("傭兵の召喚状のビルドを公式Tradeデータで解決できませんでした。")
+    if mercenary_identity:
+        query_type = {
+            "option": mercenary_identity[0],
+            "discriminator": mercenary_identity[1],
+        }
+    elif scrying_identity:
+        query_type = {
+            "option": scrying_identity[0],
+            "discriminator": scrying_identity[1],
+        }
+    elif gem_info.get("discriminator"):
         query_type = {"option": query_type, "discriminator": gem_info["discriminator"]}
+    elif item.category == "map" and base_type == "Map":
+        query_type = {"option": query_type, "discriminator": "map"}
+    elif item.category == "chart" and not exact_base_type and chart_area_exact:
+        area = item.properties.get("マップエリア") or item.properties.get("Map Area")
+        area_type = _chart_area_trade_type(area or "")
+        if not area_type:
+            raise ValueError("海図の海域を公式Tradeデータで解決できませんでした。")
+        query_type = {"option": area_type, "discriminator": "chart"}
     query: dict = {
         "status": {"option": TRADE_STATUS_OPTIONS[trade_status]},
         "stats": [{"type": "and", "filters": []}],
-        "filters": {},
+        # Official Trade API側で同一Sellerの大量出品を検索候補の段階から畳む。
+        # 取得後のローカル集約も、古い応答や例外的な重複への保険として残す。
+        "filters": {
+            "trade_filters": {
+                "filters": {"collapse": {"option": "true"}},
+            },
+        },
     }
-    if exact_base_type and not _is_generic_map_copy_type(item, base_type):
+    if (
+        exact_base_type or (item.category == "chart" and chart_area_exact)
+    ) and not _is_generic_map_copy_type(item, base_type):
         query["type"] = query_type
     currency_option = TRADE_CURRENCY_OPTIONS[trade_currency]
     if currency_option is not None:
@@ -2401,9 +4206,23 @@ def build_search_query(
         query["filters"].setdefault("trade_filters", {"filters": {}})["filters"]["indexed"] = {
             "option": listed_option
         }
+    if item.category == "chart":
+        area_level = _property_value(item, "エリアレベル", "Area Level")
+        if area_level is not None:
+            query["filters"].setdefault("map_filters", {"filters": {}})["filters"]["area_level"] = {
+                "min": area_level,
+            }
+        stat_filters = tuple(
+            row for row in stat_filters if row.stat_id != "property.area_level"
+        )
     if _is_unique(item) and trade_name and trade_name.strip():
-        query["name"] = ({"option": trade_name.strip(), "discriminator": trade_discriminator}
-                         if trade_discriminator else trade_name.strip())
+        name_discriminator = trade_discriminator
+        if name_discriminator is None and item.category == "map" and base_type == "Map":
+            name_discriminator = "map"
+        query["name"] = (
+            {"option": trade_name.strip(), "discriminator": name_discriminator}
+            if name_discriminator else trade_name.strip()
+        )
     if include_unidentified is None:
         include_unidentified = _is_unique(item) and "unidentified" in item.flags
     if include_unidentified:
@@ -2426,8 +4245,15 @@ def build_search_query(
             normalized = 82 if item.item_level >= 82 else 80 if item.item_level >= 80 else 78 if item.item_level >= 78 else 75
             misc["ilvl"] = {"min": normalized}
     rarity = item.rarity.lower()
+    magic = rarity in {"マジック", "magic"}
+    exact_magic_search = (
+        magic
+        and (preset == PRESET_BASE or uses_dedicated_exact_preset(item))
+    )
     if preset == PRESET_BASE:
-        rarity_option = "magic" if magic_exact else "nonunique"
+        rarity_option = "magic" if magic_exact else (
+            None if exact_magic_search else "nonunique"
+        )
     elif _is_unique(item):
         rarity_option = "unique"
     elif rarity in {"ノーマル", "normal", "マジック", "magic", "レア", "rare"}:
@@ -2445,8 +4271,11 @@ def build_search_query(
         rarity_option = "uniquefoil"
     if rarity_option and item.category != "captured_beast":
         query["filters"]["type_filters"] = {"filters": {"rarity": {"option": rarity_option}}}
-    if not exact_base_type:
-        category = item_class_trade_category(item.item_class)
+    if not exact_base_type and (item.category != "chart" or not chart_area_exact):
+        category = (
+            "chart" if item.category == "chart"
+            else item_class_trade_category(item.item_class)
+        )
         if category is None:
             raise ValueError("このアイテムクラスではベースを限定しない検索を利用できません。")
         type_filters = query["filters"].setdefault("type_filters", {"filters": {}})["filters"]
@@ -2483,26 +4312,54 @@ def build_search_query(
         if (item.category in {"weapon", "armour", "accessory", "cluster_jewel", "jewel", "abyss_jewel"}
                 and "foulborn" not in item.flags):
             misc["foulborn_item"] = {"option": "false"}
-        if "searing_item" in item.flags:
-            misc["searing_item"] = {"option": "true"}
-        if "tangled_item" in item.flags:
-            misc["tangled_item"] = {"option": "true"}
+        if (rarity in {"unique", "ユニーク"}
+                and item.category in {"weapon", "armour", "accessory", "cluster_jewel", "jewel", "abyss_jewel"}
+                and "vestigial" not in item.flags):
+            misc["vestigial"] = {"option": "false"}
         if (not corruption_mode_explicit
                 and item.category in {"jewel", "abyss_jewel"}
                 and rarity in {"magic", "マジック"}):
             misc["corrupted"] = {
                 "option": "true" if "corrupted" in item.flags else "false"
             }
+    # Awakenedの共通規則: クラフト可能な通常状態の品を検索する時は、
+    # プリセットやレアリティにかかわらずフラクチャー失敗品を除外する。
+    # 元からフラクチャー／コラプト／ミラー状態の品には適用しない。
+    if (craftable
+            and "corrupted" not in item.flags
+            and "mirrored" not in item.flags
+            and not any(modifier.kind == "fractured" for modifier in item.modifiers)):
+        misc = query["filters"].setdefault("misc_filters", {"filters": {}})["filters"]
+        misc["fractured_item"] = {"option": "false"}
     if corruption_mode_explicit and include_corrupted != True:
         misc = query["filters"].setdefault("misc_filters", {"filters": {}})["filters"]
         misc["corrupted"] = {
             "option": "true" if include_corrupted == "only" else "false"
         }
     misc = query["filters"].setdefault("misc_filters", {"filters": {}})["filters"]
+    if include_searing:
+        misc["searing_item"] = {"option": "true"}
+    else:
+        misc.pop("searing_item", None)
+    if include_tangled:
+        misc["tangled_item"] = {"option": "true"}
+    else:
+        misc.pop("tangled_item", None)
     if include_mirrored:
         misc.pop("mirrored", None)
     else:
         misc["mirrored"] = {"option": "false"}
+    if (
+        item.category == "map"
+        and not _is_unique(item)
+        and _map_blight_state(item) is None
+    ):
+        # 通常Map検索へBlighted系が混ざらないよう、両分類を明示的に除外する。
+        map_filters = query["filters"].setdefault(
+            "map_filters", {"filters": {}}
+        )["filters"]
+        map_filters["map_blighted"] = {"option": "false"}
+        map_filters["map_uberblighted"] = {"option": "false"}
     # Awakened準拠: Veiled全般のmisc条件ではなく、詳細コピーで読み取った
     # Veiled Mod名に対応するstat IDをAND条件として検索する。
     stat_filters = tuple(row for row in stat_filters if row.kind != "veiled")
@@ -2525,13 +4382,6 @@ def build_search_query(
     stat_groups: dict[tuple[str, str], dict] = {("and", ""): query["stats"][0]}
     for stat_filter in stat_filters:
         if not stat_filter.enabled:
-            continue
-        if stat_filter.stat_id == "property.white_sockets":
-            sockets = query["filters"].setdefault(
-                "socket_filters", {"filters": {}}
-            )["filters"].setdefault("sockets", {})
-            if stat_filter.min_value is not None:
-                sockets["w"] = int(stat_filter.min_value)
             continue
         if stat_filter.stat_id == "property.gem_imbued":
             query["filters"].setdefault("misc_filters", {"filters": {}})["filters"]["gem_imbued"] = {
@@ -2570,7 +4420,13 @@ def build_search_query(
         value = {}
         if stat_filter.option_value is not None:
             value["option"] = stat_filter.option_value
-        minimum, maximum = stat_filter.min_value, stat_filter.max_value
+        # Trade APIのoption型statは選択肢自体が値を表す。
+        # コピー文中の数値をmin/maxとして併記すると、正しいoptionでも0件になる。
+        minimum, maximum = (
+            (None, None)
+            if stat_filter.option_value is not None
+            else (stat_filter.min_value, stat_filter.max_value)
+        )
         if stat_filter.inverted:
             minimum, maximum = (
                 -maximum if maximum is not None else None,
@@ -2589,7 +4445,12 @@ def build_search_query(
                 group["value"] = {"min": stat_filter.group_min or 1}
             query["stats"].append(group)
             stat_groups[group_key] = group
-        group["filters"].append({"id": stat_filter.stat_id, "value": value})
+        api_stat_id = (
+            stat_filter.stat_id.split("|", 1)[0]
+            if stat_filter.option_value is not None
+            else stat_filter.stat_id
+        )
+        group["filters"].append({"id": api_stat_id, "value": value})
     if item_level_min is not None:
         level_filter = {"min": item_level_min}
         if item_level_max is not None:
@@ -2627,14 +4488,49 @@ def _is_generic_map_copy_type(item: ParsedItem, base_type: str) -> bool:
     """詳細コピーの汎用Map表記を、公式Tradeのベース名として送らない。"""
     if item.category != "map":
         return False
-    return bool(re.fullmatch(
-        r"(?:(?:Blighted|Blight-ravaged)\s+)?Map\s*[（(]\s*Tier\s*\d+\s*[）)]",
-        base_type.strip(), flags=re.IGNORECASE,
-    ))
+    return bool(
+        re.fullmatch(
+            r"(?:(?:Blighted|Blight-ravaged)\s+)?Map\s*[（(]\s*Tier\s*\d+\s*[）)]",
+            base_type.strip(), flags=re.IGNORECASE,
+        )
+        or re.fullmatch(
+            r"(?:(?:ブライトに覆われた|ブライトに蹂躙された)\s*)?"
+            r"マップ\s*[（(]\s*ティア\s*\d+\s*[）)]",
+            base_type.strip(),
+        )
+    )
 
 
 def _contains_japanese_text(value: object) -> bool:
     return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", str(value)))
+
+
+def english_trade_identity(
+    item: ParsedItem,
+    base_type: str | None = None,
+    name: str | None = None,
+) -> tuple[str | None, str | None]:
+    """3.29以降のローカライズ済み詳細コピーを英語Trade検索用IDへ変換する。"""
+    scrying_identity = _scrying_orb_trade_identity(item)
+    resolved_type = (
+        scrying_identity[0] if scrying_identity
+        else str(base_type or item.base_type or "").strip() or None
+    )
+    if resolved_type and _contains_japanese_text(resolved_type):
+        resolved_type = (
+            _english_trade_item_type(resolved_type, item.category) or resolved_type
+        )
+
+    resolved_name = str(name or "").strip() or None
+    if resolved_name and resolved_name == str(item.base_type or "").strip():
+        resolved_name = None
+    if (
+        resolved_name
+        and _is_unique(item)
+        and _contains_japanese_text(resolved_name)
+    ):
+        resolved_name = _english_trade_item_name(resolved_name) or resolved_name
+    return resolved_type, resolved_name
 
 
 def _require_english_search_identity(payload: dict) -> None:
@@ -2677,8 +4573,20 @@ def search_prices(
     include_unidentified: bool | None = None,
     include_veiled: bool | None = None,
     include_foil: bool | None = None,
+    include_searing: bool | None = None,
+    include_tangled: bool | None = None,
+    performance_trace: SearchPerformanceTrace | None = None,
+    partial_result_callback: Callable[[PriceResult], None] | None = None,
+    chart_area_exact: bool = True,
 ) -> PriceResult:
+    if performance_trace is not None:
+        performance_trace.mark("trade_worker_started")
     league = league or active_pc_league()
+    trade_base_type, trade_name = english_trade_identity(
+        item, trade_base_type, trade_name,
+    )
+    if performance_trace is not None:
+        performance_trace.mark("trade_identity_resolved", league=league)
     if (item.rarity.casefold() in {"magic", "マジック"}
             and trade_base_type and item.name == item.base_type):
         # 日本語詳細コピーのMagic品はAffix込み英語名がname/base_typeの両方へ
@@ -2692,7 +4600,13 @@ def search_prices(
         quality_min,
         links_min,
         include_unidentified, include_veiled, include_foil,
+        include_searing, include_tangled,
+        chart_area_exact,
     )
+    if performance_trace is not None:
+        performance_trace.mark(
+            "trade_query_built", stat_filters=len(stat_filters), preset=preset,
+        )
     _require_english_search_identity(payload)
     search_url = f"{API_ROOT}/search/{quote(league, safe='')}"
     _trade_log(
@@ -2703,28 +4617,62 @@ def search_prices(
         f"api_currency={TRADE_CURRENCY_OPTIONS[trade_currency]!r} url={search_url}"
     )
     _trade_log_payload(payload)
+    if performance_trace is not None:
+        performance_trace.mark("trade_search_request_started")
     search, headers, search_cached = _cached_request_json(
-        search_url, payload,
+        search_url, payload, prevent_queue=True,
     )
     query_id = str(search.get("id", ""))
     ids = list(search.get("result", ()))
+    if performance_trace is not None:
+        performance_trace.mark(
+            "trade_search_response",
+            cached=search_cached,
+            candidates=len(ids),
+        )
     _trade_log(f"search response: query_id={query_id!r} candidates={len(ids)}")
     if not query_id:
         _trade_log("search failed: response did not contain a query ID")
         raise TradeApiError("検索IDを取得できませんでした。")
-    listings: list[PriceListing] = []
+    raw_listings: list[PriceListing] = []
     fetch_cached = False
-    if ids:
-        fetch_ids = ",".join(ids[:10])
+    fetched_count = 0
+    while fetched_count < min(len(ids), 20):
+        block_number = fetched_count // 10 + 1
+        fetch_ids = ",".join(ids[fetched_count:fetched_count + 10])
         fetch_url = f"{API_ROOT}/fetch/{fetch_ids}?query={quote(query_id)}"
-        _trade_log(f"request: GET {fetch_url} (first {min(len(ids), 10)} candidates)")
-        fetched, _, fetch_cached = _cached_request_json(fetch_url)
+        _trade_log(
+            f"request: GET {fetch_url} "
+            f"(candidates {fetched_count + 1}-{min(fetched_count + 10, len(ids))})"
+        )
+        if performance_trace is not None:
+            performance_trace.mark(
+                "trade_fetch_started",
+                block=block_number,
+                first_candidate=fetched_count + 1,
+            )
+        fetched, _, block_cached = _cached_request_json(fetch_url)
+        if performance_trace is not None:
+            performance_trace.mark(
+                "trade_fetch_response",
+                block=block_number,
+                cached=block_cached,
+                rows=len(fetched.get("result", ())),
+            )
+        fetch_cached = fetch_cached or block_cached
         for row in fetched.get("result", ()):
             listing = row.get("listing", {})
             fetched_item = row.get("item", {})
             price = listing.get("price") or {}
-            if price.get("amount") is None or not price.get("currency"):
-                continue
+            has_price = (
+                price.get("amount") is not None
+                and bool(price.get("currency"))
+            )
+            pricing_method = (
+                "instant" if listing.get("fee") is not None
+                else "face_to_face" if has_price or fetched_item.get("note") is not None
+                else "unpriced"
+            )
             account = (listing.get("account") or {}).get("name", "")
             fetched_properties = fetched_item.get("properties") or ()
 
@@ -2741,20 +4689,48 @@ def search_prices(
                         return int(match.group())
                 return None
 
-            listings.append(PriceListing(
-                float(price["amount"]), str(price["currency"]), str(account),
+            raw_listings.append(PriceListing(
+                float(price["amount"]) if has_price else 0.0,
+                str(price["currency"]) if has_price else "",
+                str(account),
                 str(fetched_item.get("name", "")), str(fetched_item.get("baseType", "")),
                 str(listing.get("indexed", "")),
                 int(fetched_item["ilvl"]) if fetched_item.get("ilvl") is not None else None,
                 property_number("Level", "レベル", "Gem Level", "ジェムレベル"),
                 property_number("Quality", "品質"),
                 int(fetched_item["stackSize"]) if fetched_item.get("stackSize") is not None else None,
+                pricing_method=pricing_method,
             ))
+        fetched_count += 10
+        grouped = _group_price_listings(raw_listings)
+        if (
+            partial_result_callback is not None
+            and fetched_count == 10
+            and len(ids) > fetched_count
+        ):
+            rate_limit = headers.get("X-Rate-Limit-Ip-State", "") if headers else ""
+            partial_result_callback(PriceResult(
+                league, query_id, len(ids), tuple(grouped), rate_limit,
+                "", search_cached or fetch_cached,
+            ))
+            if performance_trace is not None:
+                performance_trace.mark(
+                    "trade_partial_result_emitted", listings=len(grouped),
+                )
+    listings = _group_price_listings(raw_listings)
     rate_limit = headers.get("X-Rate-Limit-Ip-State", "") if headers else ""
     _trade_log(
         f"completed: query_id={query_id!r} candidates={len(ids)} "
-        f"priced_listings={len(listings)} rate_limit={rate_limit!r}"
+        f"priced_listings={len(listings)} rate_limit={rate_limit!r} "
+        f"raw_listings={len(raw_listings)}"
     )
+    if performance_trace is not None:
+        performance_trace.mark(
+            "trade_listings_built",
+            fetch_blocks=(fetched_count + 9) // 10,
+            listings=len(listings),
+            candidates=len(ids),
+        )
     # 検索IDはAPIホストごとに管理されるため、www側のIDをjp側へ渡せない。
     # 日本語アイテム文から得た名称を使った検索JSONをURLへ埋め込み、
     # 日本語Trade画面自身に検索状態を読み込ませる。
@@ -2769,11 +4745,11 @@ def search_prices(
             web_query["type"]["option"] = localized_type
         else:
             web_query["type"] = localized_type
-    localized_name = item.name.strip()
+    localized_name = str(trade_name or item.name or "").strip()
     if _is_unique(item):
-        # 日本語クライアントでも詳細コピーのUnique名は英語になる場合がある。
-        # 日本語Tradeへ英語名を渡すと検索状態の読込が失敗するため、
-        # 公式itemsの日英対応から正式な日本語Unique名へ変換する。
+        # 未鑑定Uniqueではitem.nameがベースタイプになるため、候補選択で確定した
+        # trade_nameを正本にする。日本語Tradeへは公式itemsの日英対応から得た
+        # 正式な日本語Unique名を渡す。
         localized_name = _japanese_trade_item_name(localized_name) or localized_name
     if "name" in web_query and localized_name:
         if isinstance(web_query["name"], dict):
@@ -2796,6 +4772,8 @@ def search_prices(
         f"https://jp.pathofexile.com/trade/search/{quote(league, safe='')}"
         f"?q={encoded_query}"
     )
+    if performance_trace is not None:
+        performance_trace.mark("trade_worker_completed")
     return PriceResult(
         league, query_id, len(ids), tuple(listings), rate_limit,
         web_url, search_cached or fetch_cached,

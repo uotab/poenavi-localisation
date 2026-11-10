@@ -1,27 +1,34 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 from src.poetore.metadata_builder import (
-    build_minimal_index,
+    apply_japanese_trade_overrides,
+    audit_awakened_stat_rules,
+    build_official_index,
+    build_related_item_groups,
     diff_minimal_indexes,
+    diff_official_trade_entries,
     excessive_removal,
+    official_trade_entry_snapshot,
     unresolved_trade_entries,
     validate_minimal_index,
 )
 
-
 DEFAULT_LOCK = Path("scripts/poetore-sources.lock.json")
 DEFAULT_OUTPUT = Path("data/poetore/mod_metadata.json")
 DEFAULT_REPORT = Path("build/poetore-metadata-report.json")
+DEFAULT_STAT_RULES = Path("scripts/poetore-stat-rules.json")
+DEFAULT_OFFICIAL_BASELINE = Path("scripts/poetore-official-stats-baseline.json")
+DEFAULT_JAPANESE_OVERRIDES = Path("scripts/poetore-japanese-overrides.json")
 
 
 def _get(url: str) -> bytes:
@@ -41,11 +48,30 @@ def _serialized(payload: dict) -> bytes:
 def _run_regression_tests(candidate: Path) -> None:
     env = os.environ.copy()
     env["POETORE_METADATA_PATH"] = str(candidate.resolve())
-    env["POETORE_CANDIDATE_BUILD"] = "1"
+    in_place_candidate = DEFAULT_OUTPUT.with_name(
+        f".{DEFAULT_OUTPUT.name}.candidate"
+    ).resolve()
+    if candidate.resolve() == in_place_candidate:
+        env["POETORE_CANDIDATE_BUILD"] = "1"
+    else:
+        env.pop("POETORE_CANDIDATE_BUILD", None)
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
-    command = [sys.executable, "-m", "pytest", "-q"]
-    print(f"running candidate regression tests: {' '.join(command)}")
-    subprocess.run(command, check=True, env=env)
+    commands = tuple(
+        [sys.executable, "-m", "pytest", "-q", str(path)]
+        for path in sorted(Path("tests").glob("test_*.py"))
+    )
+    # macOS/PySideは複数のGUIテストファイルを同一プロセスで走らせると、
+    # 終了時のQt teardownでSIGSEGVすることがある。対象範囲は減らさず、
+    # ファイル単位でプロセスを分離する。
+    for command in commands:
+        print(f"running candidate regression tests: {' '.join(command)}")
+        command_env = env.copy()
+        test_name = str(command[-1]).replace("\\", "/").rsplit("/", 1)[-1]
+        if test_name == "test_single_instance.py":
+            # pytest-qt 4.5 + Qt 6.11/macOSのQLocalServer teardownで落ちるため、
+            # Qt fixtureを使わないこの統合テストだけplugin自動読込を止める。
+            command_env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        subprocess.run(command, check=True, env=command_env)
 
 
 def main() -> int:
@@ -53,6 +79,15 @@ def main() -> int:
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)
+    parser.add_argument("--stat-rules", type=Path, default=DEFAULT_STAT_RULES)
+    parser.add_argument(
+        "--official-baseline", type=Path, default=DEFAULT_OFFICIAL_BASELINE,
+        help="前回確認済みの公式Trade Stat一覧",
+    )
+    parser.add_argument(
+        "--japanese-overrides", type=Path, default=DEFAULT_JAPANESE_OVERRIDES,
+        help="公式日本語APIの既知の翻訳欠落を補う監査済み台帳",
+    )
     parser.add_argument("--apply", action="store_true", help="検査成功後に正本を原子的に置換する")
     parser.add_argument(
         "--refresh-lock", action="store_true",
@@ -62,17 +97,61 @@ def main() -> int:
         "--allow-large-removal", action="store_true",
         help="10%%超または100件超の削除をレビュー済みとして許可する",
     )
+    parser.add_argument(
+        "--related-items-only", action="store_true",
+        help="固定済みAwakened items/item-dropだけから関連品定義を更新する",
+    )
+    parser.add_argument(
+        "--official-mods-only", action="store_true",
+        help="Awakenedを取得せず、公式Trade＋RePoE＋独自台帳だけでMod基盤を更新する",
+    )
     args = parser.parse_args()
     lock = _load_json(args.lock)
     source_rows = lock.get("sources", {})
-    required = {"awakened_poe_trade", "awakened_items", "jp_trade_api", "repoe_stats", "repoe_mods"}
+    required = {
+        "awakened_poe_trade", "awakened_items", "awakened_item_drops",
+        "jp_trade_api", "repoe_stats", "repoe_mods",
+    }
     if set(source_rows) != required:
         raise SystemExit(f"source lock keys mismatch: expected={sorted(required)} actual={sorted(source_rows)}")
+
+    if args.related_items_only:
+        if not args.apply:
+            raise SystemExit("--related-items-only requires --apply")
+        item_blob = _get(str(source_rows["awakened_items"]["url"]))
+        drop_blob = _get(str(source_rows["awakened_item_drops"]["url"]))
+        for name, blob in (
+            ("awakened_items", item_blob),
+            ("awakened_item_drops", drop_blob),
+        ):
+            digest = hashlib.sha256(blob).hexdigest()
+            if digest != source_rows[name].get("sha256"):
+                raise SystemExit(f"locked source hash changed: {name}")
+        payload = _load_json(args.output)
+        payload["related_item_groups"] = build_related_item_groups(
+            item_blob.decode("utf-8").splitlines(), json.loads(drop_blob),
+        )
+        payload.setdefault("sources", {})["awakened_item_drops"] = {
+            key: value for key, value in source_rows["awakened_item_drops"].items()
+            if key in {"url", "revision", "version", "sha256"}
+        }
+        args.output.write_bytes(_serialized(payload))
+        print(
+            f"applied {len(payload['related_item_groups'])} related item groups: "
+            f"{args.output}"
+        )
+        return 0
 
     blobs: dict[str, bytes] = {}
     hashes: dict[str, str] = {}
     changed_sources: list[str] = []
+    skipped_awakened = {
+        "awakened_poe_trade", "awakened_items", "awakened_item_drops",
+    } if args.official_mods_only else set()
     for name, row in source_rows.items():
+        if name in skipped_awakened:
+            print(f"source {name}: skipped (--official-mods-only)")
+            continue
         blob = _get(str(row["url"]))
         digest = hashlib.sha256(blob).hexdigest()
         blobs[name], hashes[name] = blob, digest
@@ -96,6 +175,7 @@ def main() -> int:
             if "version" in effective_lock["sources"][name]:
                 effective_lock["sources"][name]["version"] = f"snapshot-{refreshed_at.date().isoformat()}"
 
+    previous = _load_json(args.output) if args.output.exists() else {"mods": []}
     sources = {
         name: {
             key: value for key, value in row.items()
@@ -103,21 +183,43 @@ def main() -> int:
         }
         for name, row in effective_lock["sources"].items()
     }
-    awakened = blobs["awakened_poe_trade"].decode("utf-8").splitlines()
-    jp_trade = json.loads(blobs["jp_trade_api"])
-    candidate = build_minimal_index(
-        awakened,
+    if args.official_mods_only:
+        for name in skipped_awakened:
+            if name in previous.get("sources", {}):
+                sources[name] = previous["sources"][name]
+    awakened = blobs.get("awakened_poe_trade", b"").decode("utf-8").splitlines()
+    raw_jp_trade = json.loads(blobs["jp_trade_api"])
+    official_snapshot = official_trade_entry_snapshot(raw_jp_trade)
+    official_changes = diff_official_trade_entries(
+        _load_json(args.official_baseline), official_snapshot,
+    )
+    jp_trade, japanese_overrides = apply_japanese_trade_overrides(
+        raw_jp_trade, _load_json(args.japanese_overrides),
+    )
+    stat_rules = _load_json(args.stat_rules)
+    candidate = build_official_index(
         jp_trade,
+        stat_rules,
         json.loads(blobs["repoe_stats"]),
         json.loads(blobs["repoe_mods"]),
-        awakened_items=blobs["awakened_items"].decode("utf-8").splitlines(),
+        awakened_items=blobs.get("awakened_items", b"").decode("utf-8").splitlines(),
+        awakened_item_drops=json.loads(blobs.get("awakened_item_drops", b"[]")),
         sources=sources,
         generated_at=str(effective_lock["generated_at"]),
     )
-    previous = _load_json(args.output) if args.output.exists() else {"mods": []}
+    if args.official_mods_only:
+        for field in (
+            "base_armour", "gems", "unique_fixed_stats", "unique_icons",
+            "unique_disenchant_values", "related_item_groups",
+        ):
+            candidate[field] = previous.get(field, candidate.get(field))
     integrity = validate_minimal_index(candidate)
     differences = diff_minimal_indexes(previous, candidate)
     unresolved = unresolved_trade_entries(candidate, jp_trade)
+    awakened_audit = (
+        {"skipped": True} if args.official_mods_only
+        else audit_awakened_stat_rules(awakened, stat_rules)
+    )
     candidate_bytes = _serialized(candidate)
     too_many_removed, removal_limit = excessive_removal(differences)
     failures = list(integrity["errors"])
@@ -133,6 +235,9 @@ def main() -> int:
         "integrity": integrity,
         "diff": differences,
         "unresolved_japanese_stats": unresolved,
+        "official_trade_changes": official_changes,
+        "japanese_overrides": japanese_overrides,
+        "awakened_comparison": awakened_audit,
         "failures": failures,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -141,6 +246,7 @@ def main() -> int:
         f"candidate records={integrity['record_count']} size={len(candidate_bytes)} "
         f"added={len(differences['added'])} removed={len(differences['removed'])} "
         f"changed={len(differences['changed'])} ambiguous={len(integrity['ambiguous_matchers'])} "
+        f"official_added={len(official_changes['added'])} "
         f"unresolved={len(unresolved)} report={args.report}"
     )
     if failures:
@@ -156,6 +262,10 @@ def main() -> int:
             if args.refresh_lock:
                 args.lock.write_text(
                     json.dumps(effective_lock, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                args.official_baseline.write_text(
+                    json.dumps(official_snapshot, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
                 )
             print(f"applied {integrity['record_count']} records atomically: {args.output}")
         else:

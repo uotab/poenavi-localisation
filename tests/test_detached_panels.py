@@ -3,6 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "minimal")
 
 from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QPushButton, QSizePolicy, QSplitter, QVBoxLayout, QWidget
 
 from src.ui.detached_panel import DetachedPanelWindow
@@ -20,6 +21,7 @@ def _window():
     layout = QVBoxLayout(host)
     content = QWidget()
     layout.addWidget(content)
+    minimize_button = QPushButton("─ 最小化")
 
     window = MainWindow.__new__(MainWindow)
     QMainWindow.__init__(window)
@@ -32,6 +34,7 @@ def _window():
             "index": 0,
             "title": "タイマー",
             "detach_button": None,
+            "minimize_button": minimize_button,
         }
     }
     window.detached_panel_windows = {}
@@ -46,11 +49,53 @@ def test_detach_panel_removes_content_from_main_layout_and_restore_returns_it(mo
 
     assert layout.indexOf(content) == -1
     assert window.detached_panel_windows["timer"].content is content
+    assert window.panel_registry["timer"]["minimize_button"].isHidden()
 
     window.restore_panel("timer")
 
     assert layout.indexOf(content) == 0
     assert window.detached_panel_windows == {}
+    assert not window.panel_registry["timer"]["minimize_button"].isHidden()
+
+
+def test_detach_panel_inherits_current_click_through_state(monkeypatch):
+    window, _content, _layout = _window()
+    window.click_through = True
+    applied = []
+    monkeypatch.setattr(ConfigManager, "save_config", lambda _config: None)
+    monkeypatch.setattr(
+        window, "_set_window_click_through",
+        lambda target, enabled: applied.append((target, enabled)),
+    )
+
+    window.detach_panel("timer")
+
+    assert applied == [(window.detached_panel_windows["timer"], True)]
+
+
+def test_click_through_toggle_updates_main_and_all_detached_windows(monkeypatch):
+    window, _content, _layout = _window()
+    detached_timer = QWidget()
+    detached_map = QWidget()
+    window.detached_panel_windows = {
+        "timer": detached_timer,
+        "map": detached_map,
+    }
+    applied = []
+    monkeypatch.setattr(window, "_update_click_through_label", lambda: None)
+    monkeypatch.setattr(
+        window, "_set_window_click_through",
+        lambda target, enabled: applied.append((target, enabled)),
+    )
+
+    window.toggle_click_through()
+
+    assert window.click_through is True
+    assert applied == [
+        (window, True),
+        (detached_timer, True),
+        (detached_map, True),
+    ]
 
 
 def test_detached_panel_persists_geometry_when_moved_or_resized(monkeypatch):
@@ -71,9 +116,25 @@ def test_detached_panel_persists_geometry_when_moved_or_resized(monkeypatch):
     }
 
 
+def test_debounced_detached_panel_save_keeps_the_scheduled_callback(monkeypatch):
+    window, _content, _layout = _window()
+    saved = []
+    monkeypatch.setattr(ConfigManager, "save_config", lambda config: saved.append(config))
+
+    window._save_detached_panel_state("timer", persist=False)
+    monkeypatch.setattr(
+        ConfigManager, "save_config",
+        lambda _config: (_ for _ in ()).throw(AssertionError("late lookup")),
+    )
+    QTest.qWait(300)
+
+    assert saved == [window.config]
+
+
 def test_restore_detached_panels_uses_saved_geometry(monkeypatch):
     window, _content, _layout = _window()
     monkeypatch.setattr(ConfigManager, "save_config", lambda _config: None)
+    monkeypatch.setattr(window, "_keep_detached_panel_header_on_screen", lambda _panel: None)
     window.config["detached_panels"]["timer"] = {
         "detached": True,
         "x": 41,
@@ -85,6 +146,58 @@ def test_restore_detached_panels_uses_saved_geometry(monkeypatch):
     window._restore_detached_panels()
 
     assert window.detached_panel_windows["timer"].geometry().getRect() == (41, 52, 420, 280)
+
+
+def test_restore_expanded_detached_timer_grows_past_stale_saved_height(monkeypatch):
+    window, content, _layout = _window()
+    content.setFixedHeight(400)
+    window.timer_expanded = True
+    window.lap_expanded = True
+    monkeypatch.setattr(ConfigManager, "save_config", lambda _config: None)
+    monkeypatch.setattr(window, "_keep_detached_panel_header_on_screen", lambda _panel: None)
+    window.config["detached_panels"]["timer"] = {
+        "detached": True,
+        "x": 41,
+        "y": 52,
+        "width": 420,
+        "height": 280,
+    }
+
+    window._restore_detached_panels()
+
+    panel_window = window.detached_panel_windows["timer"]
+    assert panel_window.height() >= panel_window.header.height() + content.height()
+    assert panel_window.minimumHeight() == panel_window.height()
+
+
+def test_visible_header_geometry_clamps_top_and_right_edges():
+    corrected = MainWindow._geometry_with_visible_header(
+        QRect(1700, -80, 500, 600),
+        42,
+        [QRect(0, 0, 1920, 1040)],
+    )
+
+    assert corrected.getRect() == (1420, 0, 500, 600)
+
+
+def test_visible_header_geometry_supports_negative_monitor_coordinates():
+    corrected = MainWindow._geometry_with_visible_header(
+        QRect(-2200, -120, 640, 700),
+        40,
+        [QRect(-1920, 0, 1920, 1040), QRect(0, 0, 2560, 1400)],
+    )
+
+    assert corrected.getRect() == (-1920, 0, 640, 700)
+
+
+def test_visible_header_geometry_uses_nearest_screen_when_fully_offscreen():
+    corrected = MainWindow._geometry_with_visible_header(
+        QRect(5000, 400, 480, 500),
+        40,
+        [QRect(-1920, 0, 1920, 1040), QRect(0, 0, 2560, 1400)],
+    )
+
+    assert corrected.getRect() == (2080, 400, 480, 500)
 
 
 def test_detached_panel_moves_from_its_header_drag_area():
@@ -234,6 +347,7 @@ def test_expanding_lap_content_grows_the_detached_timer_without_shrinking_it():
     MainWindow._adjust_detached_panel_height(window, "timer")
 
     assert panel_window.height() >= initial_height + 100
+    assert panel_window.minimumHeight() == panel_window.height()
     panel_window.close()
 
 
@@ -255,6 +369,7 @@ def test_collapsing_lap_content_shrinks_the_detached_timer_to_its_contents():
     MainWindow._fit_detached_panel_height(window, "timer")
 
     assert panel_window.height() < 720
+    assert panel_window.minimumHeight() == panel_window.height()
     panel_window.close()
 
 
@@ -308,14 +423,118 @@ def test_register_detachable_panel_places_button_on_title_row():
     window.panel_registry = {}
     window._register_detachable_panel(
         "timer", "タイマー", [title, body], layout, header_widgets=(panel_controls,),
+        header_right_margin=10,
     )
 
     record = window.panel_registry["timer"]
     header_layout = record["header_widget"].layout()
     assert header_layout.indexOf(title) == 0
-    assert header_layout.indexOf(panel_controls) < header_layout.indexOf(record["detach_button"])
+    assert header_layout.indexOf(panel_controls) < header_layout.indexOf(record["minimize_button"])
     assert header_layout.indexOf(record["detach_button"]) >= 0
+    assert header_layout.indexOf(record["minimize_button"]) < header_layout.indexOf(record["detach_button"])
+    assert record["minimize_button"].text() == "─ 最小化"
+    assert header_layout.contentsMargins().right() == 10
     assert record["content"].layout().count() == 2
+
+
+def test_minimize_attached_timer_keeps_global_controls_and_restore_all_returns_it(monkeypatch):
+    _app()
+    host = QWidget()
+    main_layout = QVBoxLayout(host)
+    title = QPushButton("▼ タイマー")
+    timer_body = QWidget()
+    timer_button_layout = QHBoxLayout(timer_body)
+    global_controls = QWidget()
+    restore_all_button = QPushButton("パネルを全て表示")
+    timer_button_layout.addWidget(global_controls)
+    main_layout.addWidget(title)
+    main_layout.addWidget(timer_body)
+
+    window = MainWindow.__new__(MainWindow)
+    QMainWindow.__init__(window)
+    window.config = {"detached_panels": {"timer": {"detached": False}}}
+    window.panel_registry = {}
+    window.detached_panel_windows = {}
+    window.timer_button_layout = timer_button_layout
+    window.global_controls_widget = global_controls
+    window.restore_all_panels_btn = restore_all_button
+    window.poe_version = "poe1"
+    window._adjust_main_window_after_panel_change = lambda: None
+    window._register_detachable_panel("timer", "タイマー", [title, timer_body], main_layout)
+    monkeypatch.setattr(ConfigManager, "save_config", lambda _config: None)
+
+    window.minimize_panel("timer")
+
+    assert window.panel_registry["timer"]["content"].isHidden()
+    assert main_layout.indexOf(global_controls) >= 0
+    assert window.config["detached_panels"]["timer"]["minimized"] is True
+    assert restore_all_button.isVisible()
+
+    window.restore_all_minimized_panels()
+
+    assert not window.panel_registry["timer"]["content"].isHidden()
+    assert timer_button_layout.indexOf(global_controls) >= 0
+    assert window.config["detached_panels"]["timer"]["minimized"] is False
+    assert restore_all_button.isHidden()
+
+
+def test_minimize_detached_panel_hides_window_and_restore_all_shows_it(monkeypatch):
+    window, _content, _layout = _window()
+    window.restore_all_panels_btn = QPushButton("パネルを全て表示")
+    window.poe_version = "poe1"
+    window._adjust_main_window_after_panel_change = lambda: None
+    monkeypatch.setattr(ConfigManager, "save_config", lambda _config: None)
+    window.detach_panel("timer")
+    panel_window = window.detached_panel_windows["timer"]
+
+    window.minimize_panel("timer")
+
+    assert panel_window.isHidden()
+    assert window.config["detached_panels"]["timer"]["detached"] is True
+    assert window.config["detached_panels"]["timer"]["minimized"] is True
+
+    window.restore_all_minimized_panels()
+
+    assert panel_window.isVisible()
+    assert window.detached_panel_windows["timer"] is panel_window
+    assert window.config["detached_panels"]["timer"]["minimized"] is False
+    panel_window.close()
+
+
+def test_collapsing_guide_does_not_hide_the_attached_map_panel():
+    _app()
+    window = MainWindow.__new__(MainWindow)
+    window.guide_expanded = False
+    window.zone_header_expanded = True
+    window.guide_text_expanded = True
+    window.guide_info_frame = QWidget()
+    window.guide_text_frame = QWidget()
+    window.zone_header_toggle_btn = QPushButton()
+    window.guide_text_toggle_btn = QPushButton()
+    window.guide_container = QWidget()
+    window.guide_container.setObjectName("guideContainer")
+    window.guide_toggle_btn = QPushButton()
+    window.map_toggle_btn = QPushButton("▼ マップ")
+    window.map_thumbnail = QWidget()
+    window.map_toggle_btn.show()
+    window.map_thumbnail.show()
+
+    window._apply_guide_visibility()
+
+    assert not window.map_toggle_btn.isHidden()
+    assert not window.map_thumbnail.isHidden()
+
+
+def test_restore_minimized_panels_reapplies_saved_attached_state(monkeypatch):
+    window, content, _layout = _window()
+    window.config["detached_panels"]["timer"]["minimized"] = True
+    window.restore_all_panels_btn = QPushButton("パネルを全て表示")
+    window._adjust_main_window_after_panel_change = lambda: None
+
+    window._restore_minimized_panels()
+
+    assert content.isHidden()
+    assert window.restore_all_panels_btn.isVisible()
 
 
 def test_detaching_timer_keeps_global_controls_in_main_and_timer_controls_detached(monkeypatch):

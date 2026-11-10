@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import copy
 import json
 from typing import Iterable
 
@@ -9,9 +10,19 @@ from .metadata import normalize_stat_text
 
 SUPPORTED_KINDS = {"explicit", "implicit", "crafted", "fractured", "enchant", "veiled"}
 INDEX_FIELDS = (
-    "ref", "stat_id", "kind", "japanese", "better", "inverted", "exact",
+    "ref", "stat_id", "kind", "japanese", "better", "inverted", "negated", "exact",
     "local", "decimal", "tiers", "options",
 )
+
+# Awakenedの配布statsから消えていても、公式Trade APIでは現在も有効なoption型stat。
+# 公式側は ``stat_id|option`` の個別entryだけを返すため、ぽえとれ用には従来どおり
+# ``stat_id`` + ``value.option`` へ復元する。
+OFFICIAL_OPTION_COMPATIBILITY = {
+    ("enchant", "enchant.stat_3948993189"): {
+        "ref": "Added Small Passive Skills grant: #",
+        "japanese": "追加される通常パッシブスキルは付与: #",
+    },
+}
 
 
 def _awakened_stats(lines: Iterable[str]) -> list[dict]:
@@ -20,7 +31,18 @@ def _awakened_stats(lines: Iterable[str]) -> list[dict]:
         if not line.strip():
             continue
         row = json.loads(line)
-        rows.extend(row.get("stats", ())) if "stats" in row else rows.append(row)
+        nested = row.get("stats")
+        if nested is None:
+            rows.append(row)
+            continue
+        resolve = row.get("resolve") or {}
+        tests = resolve.get("test", ()) if resolve.get("strat") == "select" else ()
+        for index, stat in enumerate(nested):
+            stat = dict(stat)
+            if index < len(tests):
+                # nullはAwakenedのfallback候補、文字列はそのカテゴリ専用候補。
+                stat["category_select"] = tests[index]
+            rows.append(stat)
     return rows
 
 
@@ -29,6 +51,81 @@ def _trade_entries(payload: dict) -> dict[tuple[str, str], dict]:
         (str(entry.get("type", "")), str(entry.get("id", ""))): entry
         for group in payload.get("result", ()) for entry in group.get("entries", ())
     }
+
+
+def _ref_matcher_negated(stat: dict) -> bool:
+    """refと同じ表示文のAwakened matcher.negateを返す。"""
+    ref = normalize_stat_text(str(stat.get("ref", "")))
+    return bool(next((
+        matcher.get("negate", False)
+        for matcher in stat.get("matchers", ())
+        if normalize_stat_text(str(matcher.get("string", ""))) == ref
+    ), False))
+
+
+def apply_japanese_trade_overrides(jp_trade: dict, overrides: dict) -> tuple[dict, list[dict]]:
+    """公式日本語APIの既知の翻訳欠落だけを監査済み文面へ差し替える。"""
+    effective = copy.deepcopy(jp_trade)
+    entries = _trade_entries(effective)
+    applied = []
+    for row in overrides.get("overrides", ()):
+        kind = str(row.get("kind", ""))
+        stat_id = str(row.get("stat_id", ""))
+        japanese = str(row.get("japanese", ""))
+        entry = entries.get((kind, stat_id))
+        if entry is None or not japanese:
+            raise ValueError(f"invalid Japanese Trade override: {kind}:{stat_id}")
+        upstream = str(entry.get("text", ""))
+        entry["text"] = japanese
+        applied.append({
+            "kind": kind, "stat_id": stat_id,
+            "upstream": upstream, "effective": japanese,
+        })
+    return effective, applied
+
+
+def _official_option_compatibility_records(
+    trade_entries: dict[tuple[str, str], dict],
+) -> list[dict]:
+    """公式APIの合成IDを、検索送信用のbase stat＋optionへ戻す。"""
+    records = []
+    for (kind, stat_id), definition in OFFICIAL_OPTION_COMPATIBILITY.items():
+        prefix = f"{stat_id}|"
+        options = []
+        for (entry_kind, entry_id), entry in trade_entries.items():
+            if entry_kind != kind or not entry_id.startswith(prefix):
+                continue
+            option_id = entry_id[len(prefix):]
+            if not option_id:
+                continue
+            try:
+                value: int | str = int(option_id)
+            except ValueError:
+                value = option_id
+            options.append({
+                "value": value,
+                "japanese": str(entry.get("text", "")),
+                "english": "",
+                "oils": [],
+            })
+        if not options:
+            continue
+        options.sort(key=lambda row: (isinstance(row["value"], str), row["value"]))
+        records.append({
+            "ref": definition["ref"],
+            "stat_id": stat_id,
+            "kind": kind,
+            "japanese": [definition["japanese"]],
+            "better": 0,
+            "inverted": False,
+            "negated": False,
+            "exact": True,
+            "local": False,
+            "decimal": False,
+            "tiers": [],
+            "options": options,
+        })
+    return records
 
 
 def _repoe_by_ref(stats: dict, mods: dict) -> dict[str, dict]:
@@ -108,10 +205,234 @@ def _unique_fixed_stats(items_lines: Iterable[str]) -> dict[str, list[str]]:
     return dict(sorted(result.items()))
 
 
+def _unique_icons(items_lines: Iterable[str]) -> dict[str, str]:
+    """AwakenedのUnique名とPoE公式CDNアイコンURLだけを抽出する。"""
+    result = {}
+    for line in items_lines:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        name = str(row.get("refName", "")).strip()
+        icon = str(row.get("icon", "")).strip()
+        if row.get("namespace") == "UNIQUE" and name and icon:
+            result[name.casefold()] = icon
+    return dict(sorted(result.items()))
+
+
+def _unique_disenchant_values(items_lines: Iterable[str]) -> dict[str, dict[str, float]]:
+    """AwakenedのUnique基礎解呪値を名前・基底種の組で固定する。"""
+    result: dict[str, dict[str, float]] = {}
+    for line in items_lines:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        unique = row.get("unique") or {}
+        name = str(row.get("refName", "")).strip().casefold()
+        base = str(unique.get("base", "")).strip().casefold()
+        value = unique.get("disenchantValue")
+        if row.get("namespace") != "UNIQUE" or not name or not base or value is None:
+            continue
+        numeric = float(value)
+        previous = result.setdefault(name, {}).get(base)
+        if previous is not None and previous != numeric:
+            raise ValueError(f"conflicting unique disenchant value: {name}:{base}")
+        result[name][base] = numeric
+    return {
+        name: dict(sorted(variants.items()))
+        for name, variants in sorted(result.items())
+    }
+
+
+UBER_BOSS_DROP_SUPPLEMENTS = {
+    # Awakenedのitem-drop.jsonはUber固有枠を中心に収録しており、
+    # 通常版とUber版に共通する取引可能ドロップが各入場券から欠けている。
+    "ITEM::Awakening Fragment": (
+        "UNIQUE::Thread of Hope // Crimson Jewel",
+        "UNIQUE::Zana's Ingenuity // Prismatic Ring",
+        "GEM::Annihilation Support",
+        "ITEM::Orb of Dominance",
+        "ITEM::Awakener's Orb",
+        "DIVINATION_CARD::A Fate Worse Than Death",
+    ),
+    "ITEM::Reality Fragment": (
+        "GEM::Awakened Empower Support",
+        "GEM::Awakened Enhance Support",
+        "GEM::Awakened Enlighten Support",
+        "GEM::Eclipse Support",
+        "GEM::Invert the Rules Support",
+        "ITEM::Orb of Conflict",
+        "DIVINATION_CARD::Auspicious Ambitions",
+    ),
+    "ITEM::Devouring Fragment": (
+        "UNIQUE::Forbidden Flesh // Cobalt Jewel",
+        "GEM::Gluttony Support",
+        "ITEM::Exceptional Eldritch Ichor",
+        "ITEM::Eldritch Orb of Annulment",
+        "ITEM::Eldritch Chaos Orb",
+        "ITEM::Eldritch Exalted Orb",
+        "DIVINATION_CARD::Auspicious Ambitions",
+    ),
+    "ITEM::Blazing Fragment": (
+        "UNIQUE::Forbidden Flame // Crimson Jewel",
+        "GEM::Overheat Support",
+        "ITEM::Exceptional Eldritch Ember",
+        "ITEM::Eldritch Orb of Annulment",
+        "ITEM::Eldritch Chaos Orb",
+        "ITEM::Eldritch Exalted Orb",
+        "DIVINATION_CARD::Auspicious Ambitions",
+    ),
+    "ITEM::Cosmic Fragment": (
+        "UNIQUE::The Unblinking Eye // Harlequin Mask",
+        "ITEM::Fragment of Knowledge",
+        "ITEM::Fragment of Shape",
+        "GEM::Voidstorm Support",
+        "ITEM::Shaper's Exalted Orb",
+        "ITEM::Orb of Dominance",
+    ),
+    "ITEM::Decaying Fragment": (
+        "UNIQUE::Impresence // Onyx Amulet",
+        "GEM::Void Shockwave Support",
+        "GEM::Cooldown Recovery Support",
+        "UNIQUE::Watcher's Eye // Prismatic Jewel",
+        "ITEM::Shaper's Exalted Orb",
+        "ITEM::Elder's Exalted Orb",
+        "ITEM::Orb of Dominance",
+        "DIVINATION_CARD::Void of the Elements",
+        "DIVINATION_CARD::Auspicious Ambitions",
+    ),
+    "ITEM::Synthesising Fragment": (
+        "GEM::Greater Kinetic Instability Support",
+        "DIVINATION_CARD::The Hook",
+        "DIVINATION_CARD::Imperfect Memories",
+    ),
+}
+
+# Awakenedのitem-drop.jsonには、素材・報酬・派生関係ではなく、単に用途が
+# 近い装備を横並びにする比較用グループも含まれる。ぽえとれでは価格一覧の
+# 意味を明確にするため、比較用途のグループと、個体ごとの価値判断に
+# 関連ドロップ価格が役立たないナイトメアマップを表示対象外にする。
+EXCLUDED_RELATED_ITEM_QUERY_GROUPS = {
+    frozenset({"ITEM::Nightmare Map // T0, Atlas"}),
+    frozenset({
+        "UNIQUE::Ventor's Gamble // Gold Ring",
+        "UNIQUE::Sadima's Touch // Wool Gloves",
+        "UNIQUE::Bisco's Leash // Heavy Belt",
+        "UNIQUE::Goldwyrm // Nubuck Boots",
+        "UNIQUE::Divination Distillate",
+        "UNIQUE::The Ascetic // Gold Amulet",
+        "UNIQUE::Greed's Embrace // Golden Plate",
+        "UNIQUE::Sentari's Answer // Brass Spirit Shield",
+    }),
+    frozenset({
+        "GEM::Cast on Death Support",
+        "UNIQUE::Goldrim // Leather Cap",
+        "UNIQUE::Tabula Rasa // Simple Robe, 6L",
+        "UNIQUE::Lochtonial Caress // Iron Gauntlets",
+        "UNIQUE::Wanderlust // Wool Shoes",
+        "UNIQUE::Lifesprig // Driftwood Wand",
+        "UNIQUE::Karui Ward // Jade Amulet",
+    }),
+    frozenset({
+        "UNIQUE::Farrul's Bite // Harlequin Mask",
+        "UNIQUE::Farrul's Pounce // Hydrascale Gauntlets",
+        "UNIQUE::Farrul's Fur // Triumphant Lamellar",
+        "UNIQUE::Farrul's Chase // Slink Boots",
+    }),
+    frozenset({
+        "UNIQUE::Craiceann's Chitin // Magistrate Crown",
+        "UNIQUE::Craiceann's Carapace // Golden Plate",
+        "UNIQUE::Craiceann's Pincers // Titan Gauntlets",
+        "UNIQUE::Craiceann's Tracks // Goliath Greaves",
+    }),
+    frozenset({
+        "UNIQUE::Fenumus' Toxins // Necromancer Circlet",
+        "UNIQUE::Fenumus' Shroud // Widowsilk Robe",
+        "UNIQUE::Fenumus' Weave // Carnal Mitts",
+        "UNIQUE::Fenumus' Spinnerets // Assassin's Boots",
+    }),
+    frozenset({
+        "UNIQUE::Saqawal's Flock // Silken Hood",
+        "UNIQUE::Saqawal's Nest // Blood Raiment",
+        "UNIQUE::Saqawal's Winds // Soldier Gloves",
+        "UNIQUE::Saqawal's Talons // Hydrascale Boots",
+    }),
+}
+
+# 現行PoEでは廃止済みだが、Awakenedの関連品定義に残っている項目。
+# グループ自体は有用なので、該当項目だけを生成時に除外する。
+EXCLUDED_RELATED_ITEM_IDS = {
+    "ITEM::Bestiary Scarab of the Shadowed Crow",
+}
+
+RELATED_ITEM_QUERY_LABELS = {
+    frozenset({
+        "UNIQUE::Watcher's Eye // Prismatic Jewel",
+        "CAPTURED_BEAST::Wild Hellion Alpha",
+    }): "ビーストクラフト素材：Modをリロール",
+}
+
+def build_related_item_groups(items_lines: Iterable[str], drop_rows: Iterable[dict]) -> list[dict]:
+    """Awakenedの関連品定義を、表示に必要な名前・variant・iconへ展開する。"""
+    items = {}
+    for line in items_lines:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        namespace = str(row.get("namespace", "")).strip()
+        name = str(row.get("refName", "")).strip()
+        if not namespace or not name:
+            continue
+        variant = ""
+        if namespace == "UNIQUE":
+            variant = str((row.get("unique") or {}).get("base", "")).strip()
+        items.setdefault((namespace, name, variant), row)
+
+    def resolve(query_id: str) -> dict:
+        namespace, encoded = query_id.split("::", 1)
+        name, separator, variant = encoded.partition(" // ")
+        row = items.get((namespace, name, variant if separator else ""))
+        if row is None and namespace == "UNIQUE":
+            candidates = [
+                value for (ns, item_name, _variant), value in items.items()
+                if ns == namespace and item_name == name
+            ]
+            row = candidates[0] if len(candidates) == 1 else None
+        return {
+            "id": query_id,
+            "namespace": namespace,
+            "name": name,
+            "variant": variant if separator else None,
+            "icon": str((row or {}).get("icon", "")),
+        }
+
+    groups = []
+    for row in drop_rows:
+        query_ids = [str(value) for value in row.get("query", ())]
+        if frozenset(query_ids) in EXCLUDED_RELATED_ITEM_QUERY_GROUPS:
+            continue
+        query_ids = [
+            value for value in query_ids
+            if value not in EXCLUDED_RELATED_ITEM_IDS
+        ]
+        related_ids = [str(value) for value in row.get("items", ())]
+        for query_id in query_ids:
+            related_ids.extend(UBER_BOSS_DROP_SUPPLEMENTS.get(query_id, ()))
+        related_ids = list(dict.fromkeys(related_ids))
+        queries = [resolve(value) for value in query_ids]
+        related = [resolve(value) for value in related_ids]
+        if queries:
+            group = {"query": queries, "items": related}
+            if label := RELATED_ITEM_QUERY_LABELS.get(frozenset(query_ids)):
+                group["query_label"] = label
+            groups.append(group)
+    return groups
+
+
 def build_minimal_index(awakened_lines: Iterable[str], jp_trade: dict,
                         repoe_stats: dict | None = None,
                         repoe_mods: dict | None = None,
                         awakened_items: Iterable[str] = (),
+                        awakened_item_drops: Iterable[dict] = (),
                         sources: dict | None = None,
                         generated_at: str | None = None) -> dict:
     """必要な照合・検索項目だけに縮小した派生インデックスを生成する。"""
@@ -151,30 +472,154 @@ def build_minimal_index(awakened_lines: Iterable[str], jp_trade: dict,
                             "english": str(matcher.get("string", "")),
                             "oils": oils,
                         })
-                records.append({
+                record = {
                     "ref": str(stat.get("ref", "")),
                     "stat_id": stat_id,
                     "kind": kind,
                     "japanese": [str(entry.get("text", ""))],
                     "better": int(stat.get("better", 1)),
                     "inverted": bool(trade.get("inverted", False)),
+                    # Awakenedは表示文ごとのmatcher.negateで内部値の符号を
+                    # 正規化した後、trade.invertedでAPI値へ変換する。公式Tradeの
+                    # 日本語文はrefに対応するため、refと同じmatcherの属性を保持する。
+                    "negated": _ref_matcher_negated(stat),
                     "exact": int(stat.get("better", 1)) == 0 or bool(trade.get("option", False)),
                     "local": bool(repoe_row.get("local", False)),
                     # Awakenedのdpフラグがあるstatだけ小数精度を維持する。
                     "decimal": bool(stat.get("dp", False)),
                     "tiers": repoe_row.get("tiers", ()),
                     "options": options,
-                })
+                }
+                if "category_select" in stat:
+                    record["category_select"] = stat["category_select"]
+                records.append(record)
+    for record in _official_option_compatibility_records(jp):
+        key = (record["kind"], record["stat_id"])
+        if key not in seen:
+            records.append(record)
+            seen.add(key)
     records.sort(key=lambda row: (row["kind"], row["stat_id"]))
+    awakened_items = tuple(awakened_items)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
         "sources": sources or {},
         "scope": "PoE1 trade stat matching for equipment and gems",
         "base_armour": _base_armour(awakened_items),
         "gems": _gems(awakened_items),
         "unique_fixed_stats": _unique_fixed_stats(awakened_items),
+        "unique_icons": _unique_icons(awakened_items),
+        "unique_disenchant_values": _unique_disenchant_values(awakened_items),
+        "related_item_groups": build_related_item_groups(
+            awakened_items, awakened_item_drops,
+        ),
         "mods": records,
+    }
+
+
+def build_official_index(jp_trade: dict, stat_rules: dict,
+                         repoe_stats: dict | None = None,
+                         repoe_mods: dict | None = None,
+                         awakened_items: Iterable[str] = (),
+                         awakened_item_drops: Iterable[dict] = (),
+                         sources: dict | None = None,
+                         generated_at: str | None = None) -> dict:
+    """公式Tradeを骨格、RePoEと独自台帳を補足情報として派生indexを作る。
+
+    ``stat_rules`` は一度監査した意味判断だけを保持するPoENavi正本であり、
+    Awakenedの稼働や取得可否に依存しない。公式APIに存在しない古いruleは出力せず、
+    未登録の公式statは ``unresolved_trade_entries`` で明示する。
+    """
+    jp = _trade_entries(jp_trade)
+    repoe = _repoe_by_ref(repoe_stats or {}, repoe_mods or {})
+    records = []
+    seen = set()
+    for rule in stat_rules.get("rules", ()):
+        kind = str(rule.get("kind", ""))
+        stat_id = str(rule.get("stat_id", ""))
+        entry = jp.get((kind, stat_id))
+        if kind not in SUPPORTED_KINDS or not entry or (kind, stat_id) in seen:
+            continue
+        seen.add((kind, stat_id))
+        ref = str(rule.get("ref", ""))
+        repoe_row = repoe.get(normalize_stat_text(ref), {})
+        record = {
+            "ref": ref,
+            "stat_id": stat_id,
+            "kind": kind,
+            "japanese": [str(entry.get("text", ""))],
+            "better": int(rule.get("better", 1)),
+            "inverted": bool(rule.get("inverted", False)),
+            "negated": bool(rule.get("negated", False)),
+            "exact": bool(rule.get("exact", False)),
+            "local": bool(repoe_row.get("local", False)),
+            "decimal": bool(rule.get("decimal", False)),
+            "tiers": repoe_row.get("tiers", ()),
+            "options": list(rule.get("options", ())),
+        }
+        if "category_select" in rule:
+            record["category_select"] = rule["category_select"]
+        records.append(record)
+    for record in _official_option_compatibility_records(jp):
+        key = (record["kind"], record["stat_id"])
+        if key not in seen:
+            records.append(record)
+            seen.add(key)
+    records.sort(key=lambda row: (row["kind"], row["stat_id"]))
+    awakened_items = tuple(awakened_items)
+    return {
+        "schema_version": 3,
+        "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
+        "sources": sources or {},
+        "scope": "PoE1 trade stat matching for equipment and gems",
+        "base_armour": _base_armour(awakened_items),
+        "gems": _gems(awakened_items),
+        "unique_fixed_stats": _unique_fixed_stats(awakened_items),
+        "unique_icons": _unique_icons(awakened_items),
+        "unique_disenchant_values": _unique_disenchant_values(awakened_items),
+        "related_item_groups": build_related_item_groups(
+            awakened_items, awakened_item_drops,
+        ),
+        "mods": records,
+    }
+
+
+def audit_awakened_stat_rules(awakened_lines: Iterable[str], stat_rules: dict) -> dict:
+    """Awakenedを入力正本にせず、独自台帳との差分だけを報告する。"""
+    upstream = {}
+    for stat in _awakened_stats(awakened_lines):
+        trade = stat.get("trade") or {}
+        for kind, ids in (trade.get("ids") or {}).items():
+            for stat_id in ids:
+                upstream[(kind, stat_id)] = {
+                    "ref": str(stat.get("ref", "")),
+                    "better": int(stat.get("better", 1)),
+                    "inverted": bool(trade.get("inverted", False)),
+                    "negated": _ref_matcher_negated(stat),
+                    "exact": int(stat.get("better", 1)) == 0 or bool(trade.get("option", False)),
+                    "decimal": bool(stat.get("dp", False)),
+                }
+    local = {
+        (str(row.get("kind", "")), str(row.get("stat_id", ""))): row
+        for row in stat_rules.get("rules", ())
+    }
+    common = set(upstream) & set(local)
+    fields = ("ref", "better", "inverted", "negated", "exact", "decimal")
+    changed = [
+        {"kind": key[0], "stat_id": key[1], "fields": [
+            field for field in fields if upstream[key].get(field) != local[key].get(field)
+        ]}
+        for key in sorted(common)
+        if any(upstream[key].get(field) != local[key].get(field) for field in fields)
+    ]
+    return {
+        "only_in_awakened": [
+            {"kind": kind, "stat_id": stat_id} for kind, stat_id in sorted(set(upstream) - set(local))
+        ],
+        "only_in_poetore": [
+            {"kind": kind, "stat_id": stat_id} for kind, stat_id in sorted(set(local) - set(upstream))
+        ],
+        "changed": changed,
     }
 
 
@@ -202,6 +647,22 @@ def validate_minimal_index(payload: dict) -> dict:
                 or any(not isinstance(ref, str) or not ref.strip() for ref in fixed_stats)
                 or len(fixed_stats) != len(set(fixed_stats))):
             errors.append(f"invalid unique fixed stats: {unique_name}")
+    for unique_name, icon_url in payload.get("unique_icons", {}).items():
+        if (not unique_name or not isinstance(icon_url, str)
+                or not icon_url.startswith("https://web.poecdn.com/")):
+            errors.append(f"invalid unique icon: {unique_name}")
+    for unique_name, variants in payload.get("unique_disenchant_values", {}).items():
+        if not unique_name or not isinstance(variants, dict) or not variants:
+            errors.append(f"invalid unique disenchant variants: {unique_name}")
+            continue
+        for base_type, value in variants.items():
+            if (
+                not base_type or not isinstance(value, (int, float))
+                or isinstance(value, bool) or value <= 0
+            ):
+                errors.append(
+                    f"invalid unique disenchant value: {unique_name}:{base_type}={value}"
+                )
     keys: set[tuple[str, str]] = set()
     matchers: dict[tuple[str, str], list[str]] = {}
     for index, row in enumerate(mods):
@@ -210,6 +671,8 @@ def validate_minimal_index(payload: dict) -> dict:
             errors.append(f"mods[{index}] missing fields: {', '.join(missing)}")
             continue
         key = (str(row["kind"]), str(row["stat_id"]))
+        if not isinstance(row.get("negated"), bool):
+            errors.append(f"invalid negated flag: {key[0]}:{key[1]}")
         if key in keys:
             errors.append(f"duplicate stat ID: {key[0]}:{key[1]}")
         keys.add(key)
@@ -280,6 +743,49 @@ def unresolved_trade_entries(payload: dict, jp_trade: dict) -> list[dict]:
             continue
         rows.append({"kind": kind, "stat_id": stat_id, "japanese": str(entry.get("text", ""))})
     return rows
+
+
+def official_trade_entry_snapshot(jp_trade: dict) -> dict:
+    """新リーグ差分の基準にする、対応対象の公式Stat一覧を返す。"""
+    entries = [
+        {"kind": kind, "stat_id": stat_id, "japanese": str(entry.get("text", ""))}
+        for (kind, stat_id), entry in sorted(_trade_entries(jp_trade).items())
+        if kind in SUPPORTED_KINDS
+    ]
+    return {"schema_version": 1, "entries": entries}
+
+
+def diff_official_trade_entries(previous: dict, current: dict) -> dict:
+    """公式Trade Statの追加・削除・日本語文面変更をレビュー用に列挙する。"""
+    def keyed(payload: dict) -> dict[tuple[str, str], str]:
+        return {
+            (str(row.get("kind", "")), str(row.get("stat_id", ""))):
+                str(row.get("japanese", ""))
+            for row in payload.get("entries", ())
+        }
+
+    old, new = keyed(previous), keyed(current)
+    return {
+        "previous_count": len(old),
+        "current_count": len(new),
+        "added": [
+            {"kind": kind, "stat_id": stat_id, "japanese": new[(kind, stat_id)]}
+            for kind, stat_id in sorted(set(new) - set(old))
+        ],
+        "removed": [
+            {"kind": kind, "stat_id": stat_id, "japanese": old[(kind, stat_id)]}
+            for kind, stat_id in sorted(set(old) - set(new))
+        ],
+        "changed": [
+            {
+                "kind": kind, "stat_id": stat_id,
+                "previous_japanese": old[(kind, stat_id)],
+                "current_japanese": new[(kind, stat_id)],
+            }
+            for kind, stat_id in sorted(set(old) & set(new))
+            if old[(kind, stat_id)] != new[(kind, stat_id)]
+        ],
+    }
 
 
 def excessive_removal(diff: dict) -> tuple[bool, int]:

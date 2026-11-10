@@ -3105,6 +3105,26 @@
       }
     }
   },
+  "act10_area12": {
+    "visits": {
+      "1": {
+        "objective": "Clearing this area is not required in Act 10.\nTurn back and take another route.\nThere is a side quest from Lilly here that rewards a rare belt.",
+        "layout": "",
+        "tips": "",
+        "direction": "none",
+        "mini_navi": {
+          "text": "Clearing this area is not required in Act 10.\nTurn back and take another route.\nThere is a side quest from Lilly here that rewards a rare belt.",
+          "direction": "none"
+        }
+      },
+      "2": {
+        "objective": "",
+        "layout": "",
+        "tips": "",
+        "direction": "none"
+      }
+    }
+  },
   "act10_area6": {
     "visits": {
       "1": {

@@ -26,41 +26,61 @@ class PoetoreLazyLaunchTest(unittest.TestCase):
 
     def test_capture_poetore_item_starts_capture(self):
         window = MainWindow.__new__(MainWindow)
-        window.config = {"poe_version": POE1}
-        window.poe_version = POE1
+        window.config = {"hotkeys": {"poetore_capture": "ctrl+shift+p"}}
         poetore_window = Mock()
-        with patch("src.poetore.ui.show_poetore_window", return_value=poetore_window) as show_window:
+        trace = Mock()
+        with patch(
+            "src.poetore.performance.start_search_trace", return_value=trace,
+        ), patch(
+            "src.poetore.ui.show_poetore_window", return_value=poetore_window,
+        ) as show_window:
             MainWindow.capture_poetore_item(window)
         show_window.assert_called_once_with(window, activate=False)
-        poetore_window.capture_from_poe.assert_called_once_with()
+        poetore_window.capture_from_poe.assert_called_once_with(
+            trace, capture_hotkey="ctrl+shift+p",
+        )
+        self.assertEqual(
+            [call.args[0] for call in trace.mark.call_args_list],
+            ["hotkey_dispatched", "poetore_window_ready"],
+        )
 
-    def test_poetore_capture_hotkey_is_ignored_in_poe2_mode(self):
+    def test_capture_release_is_forwarded_to_prepared_poetore_window(self):
         window = MainWindow.__new__(MainWindow)
-        window.config = {"poe_version": POE2}
-        window.poe_version = POE2
-        window.capture_poetore_item = Mock()
-
-        MainWindow.handle_hotkey(window, "poetore_capture")
-
-        window.capture_poetore_item.assert_not_called()
-
-    def test_poetore_availability_refresh_hides_and_closes_it_after_poe2_switch(self):
-        window = MainWindow.__new__(MainWindow)
-        window.config = {"poe_version": POE1}
-        window.poe_version = POE1
-        window.poetore_btn = Mock()
         window._poetore_window = Mock()
 
-        MainWindow._refresh_poetore_availability(window)
-        window.poetore_btn.setVisible.assert_called_once_with(True)
-        window._poetore_window.close.assert_not_called()
+        MainWindow.handle_hotkey(window, "poetore_capture_released")
 
-        window.config["poe_version"] = POE2
+        window._poetore_window.capture_hotkey_released.assert_called_once_with()
+
+    def test_auto_hide_capture_uses_passive_mode(self):
+        window = MainWindow.__new__(MainWindow)
+        poetore_window = Mock()
+        trace = Mock()
+        with patch(
+            "src.poetore.performance.start_search_trace", return_value=trace,
+        ), patch(
+            "src.poetore.ui.show_poetore_window", return_value=poetore_window,
+        ):
+            MainWindow.capture_poetore_item(window, auto_hide=True)
+
+        poetore_window.capture_from_poe.assert_called_once_with(
+            trace, auto_hide=True, capture_hotkey="ctrl+d",
+        )
+
+    def test_poe2_opens_prepares_and_captures_poetore(self):
+        window = MainWindow.__new__(MainWindow)
         window.poe_version = POE2
-        MainWindow._refresh_poetore_availability(window)
+        window.config = {"poe_version": POE2}
 
-        window.poetore_btn.setVisible.assert_called_with(False)
-        window._poetore_window.close.assert_called_once_with()
+        with patch("src.poetore.ui.show_poetore_window") as show_window, patch(
+            "src.poetore.ui.prepare_poetore_window"
+        ) as prepare_window:
+            MainWindow.open_poetore(window)
+            MainWindow._prepare_poetore_window(window)
+            MainWindow.capture_poetore_item(window)
+
+        self.assertEqual(show_window.call_count, 2)
+        prepare_window.assert_called_once_with(window)
 
 
 if __name__ == "__main__":

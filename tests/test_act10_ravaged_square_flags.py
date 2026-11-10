@@ -1,6 +1,7 @@
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from src.utils.guide_data import get_zone_guide
 from src.utils.poe_version_data import POE1
@@ -28,13 +29,34 @@ class Act10RavagedSquareFlagsTest(unittest.TestCase):
         act10_control = [z for z in zone_data["Act 10"] if z["zone"] == "奴隷管理区画"]
         act5_ossuary = [z for z in zone_data["Act 5"] if z["zone"] == "納骨堂"]
         act10_ossuary = [z for z in zone_data["Act 10"] if z["zone"] == "納骨堂"]
+        act5_reliquary = [z for z in zone_data["Act 5"] if z["zone"] == "聖廟"]
+        act10_reliquary = [z for z in zone_data["Act 10"] if z["zone"] == "聖廟"]
         desecrated = [z for z in zone_data["Act 10"] if z["zone"] == "冒涜された広間"]
 
         self.assertEqual(act5_control[0]["id"], "act5_area2")
         self.assertEqual(act10_control[0]["id"], "act10_area4")
         self.assertEqual(act5_ossuary[0]["id"], "act5_area8")
         self.assertEqual(act10_ossuary[0]["id"], "act10_area5")
+        self.assertEqual(act5_reliquary[0]["id"], "act5_area9")
+        self.assertEqual(act10_reliquary[0]["id"], "act10_area12")
         self.assertEqual(desecrated[0]["id"], "act10_area7")
+
+    def test_part2_mode_resolves_reliquary_to_act10_authored_guide(self):
+        from src.ui.main_window import MainWindow
+
+        window = SimpleNamespace(
+            zone_data=load_zone_data_by_version()[POE1],
+            part2_mode=True,
+            _in_act10=True,
+        )
+        guide_data = json.loads(Path("guide_data.json").read_text(encoding="utf-8"))
+
+        zone_id = MainWindow._get_zone_id(window, "聖廟")
+        guide = get_zone_guide(guide_data, zone_id, visit=1)
+
+        self.assertEqual(zone_id, "act10_area12")
+        self.assertIn("このエリアの攻略は不要です", guide["objective"])
+        self.assertEqual(guide["mini_navi"]["text"], guide["objective"])
 
     def test_controlblocks_two_flags_and_three_flags_select_different_guides(self):
         guide_data = {

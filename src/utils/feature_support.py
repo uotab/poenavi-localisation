@@ -1,0 +1,51 @@
+"""Central registry for features that support only specific PoE versions."""
+
+from src.utils.poe_version_data import POE1, POE2
+
+MINI_NAVI = "mini_navi"
+POETORE = "poetore"
+MAP_CHECK = "map_check"
+GEM_SHOP_SEARCH = "gem_shop_search"
+EXPEDITION_REWARD_OVERLAY = "expedition_reward_overlay"
+DESECRATION_TIER_OVERLAY = "desecration_tier_overlay"
+HEIST_CURIO_OCR = "heist_curio_ocr"
+MAP_LAYOUT_DETECT = "map_layout_detect"
+
+FEATURE_SUPPORTED_VERSIONS = {
+    MINI_NAVI: frozenset({POE1, POE2}),
+    POETORE: frozenset({POE1, POE2}),
+    MAP_CHECK: frozenset({POE1}),
+    GEM_SHOP_SEARCH: frozenset({POE1}),
+    EXPEDITION_REWARD_OVERLAY: frozenset({POE2}),
+    DESECRATION_TIER_OVERLAY: frozenset({POE2}),
+    HEIST_CURIO_OCR: frozenset({POE1}),
+    MAP_LAYOUT_DETECT: frozenset({POE1}),
+}
+
+FEATURE_HOTKEY_ACTIONS = {
+    POETORE: frozenset({"poetore_capture", "poetore_auto_hide"}),
+    MAP_CHECK: frozenset({"map_check"}),
+    GEM_SHOP_SEARCH: frozenset({"gem_shop_search"}),
+    EXPEDITION_REWARD_OVERLAY: frozenset({"expedition_reward_ocr"}),
+    DESECRATION_TIER_OVERLAY: frozenset({"desecration_tier_ocr"}),
+    HEIST_CURIO_OCR: frozenset({"heist_curio_ocr"}),
+    MAP_LAYOUT_DETECT: frozenset({"map_layout_detect"}),
+}
+
+
+def is_feature_supported(feature: str, poe_version: str) -> bool:
+    """Return whether *feature* explicitly supports *poe_version*."""
+    return poe_version in FEATURE_SUPPORTED_VERSIONS.get(feature, frozenset())
+
+
+def is_feature_hotkey_supported(action: str, poe_version: str) -> bool:
+    """Apply feature support to a hotkey action; common actions remain allowed."""
+    for feature, actions in FEATURE_HOTKEY_ACTIONS.items():
+        if action in actions:
+            return is_feature_supported(feature, poe_version)
+    return True
+
+
+def supported_versions(feature: str) -> frozenset[str]:
+    """Expose the immutable supported-version set for UI and diagnostics."""
+    return FEATURE_SUPPORTED_VERSIONS.get(feature, frozenset())
