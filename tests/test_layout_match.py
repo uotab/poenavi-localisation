@@ -6,7 +6,15 @@ import numpy as np
 from PySide6.QtGui import QImage
 
 from src.utils.feature_support import is_feature_hotkey_supported
-from src.utils.layout_match import pick_layout, qimage_to_bgr, rank_layouts, read_image
+from src.utils.layout_match import (
+    LEARNED_PER_LAYOUT,
+    learn_layout,
+    learned_references,
+    pick_layout,
+    qimage_to_bgr,
+    rank_layouts,
+    read_image,
+)
 from src.utils.poe_version_data import POE1, POE2
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,6 +70,24 @@ def test_pick_accepts_a_smaller_lead_when_the_leader_repeats():
     assert pick_layout([("5.png", 0.752), ("3.png", 0.724)], previous_leader="5.png") == "5.png"
     assert pick_layout([("5.png", 0.709), ("2.png", 0.701)], previous_leader="5.png") is None
     assert pick_layout([("2.png", 0.62), ("3.png", 0.61)], previous_leader="1.png") is None
+
+
+def test_learned_references_are_used_and_pruned(tmp_path):
+    """A confidently detected capture becomes an extra reference for that layout; only the newest are kept."""
+    root = str(tmp_path / "layout_refs")
+    capture = _partial_capture(ZONE_PATHS[0])
+    before = dict(rank_layouts(capture, ZONE_PATHS, root))
+    # Deliberately learn it as another layout: that layout must now match it best.
+    for _ in range(LEARNED_PER_LAYOUT + 2):
+        assert learn_layout(capture, ZONE_PATHS[1], root)
+    assert len(learned_references(ZONE_PATHS[1], root)) == LEARNED_PER_LAYOUT
+    assert learned_references(ZONE_PATHS[0], root) == []
+    # One learned layout is neutral: its capture-vs-capture style gain is granted to all layouts.
+    one = rank_layouts(capture, ZONE_PATHS, root)
+    assert [path for path, _ in one] == sorted(before, key=before.get, reverse=True)
+    # Once two layouts have learned references, the learned match decides.
+    learn_layout(_partial_capture(ZONE_PATHS[2]), ZONE_PATHS[2], root)
+    assert rank_layouts(capture, ZONE_PATHS, root)[0][0] == ZONE_PATHS[1]
 
 
 def test_capture_without_map_lines_returns_no_ranking():

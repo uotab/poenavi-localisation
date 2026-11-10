@@ -10,6 +10,9 @@ the game's fixed orientation, and allowing rotations produced false matches.
 
 from __future__ import annotations
 
+import glob
+import os
+import time
 from functools import lru_cache
 
 import cv2
@@ -26,6 +29,11 @@ DECISION_MARGIN = 0.06
 # A smaller gap is enough when the same layout already led the previous press: live presses on
 # a correct layout led by 0.008 then 0.028, while early wrong leaders flip between presses.
 REPEAT_MARGIN = 0.02
+# Confident picks are kept as extra references: the user's own overlay captures match later
+# captures better than the redrawn bundled images. No wrong pick has come near this gap.
+LEARN_MARGIN = 0.10
+LEARNED_PER_LAYOUT = 3
+LEARNED_SUFFIX = ".mask.png"
 NOISE_SHARE = 0.25  # capture groups smaller than this share of the largest are discarded (life globe ~11%)
 
 
@@ -92,9 +100,37 @@ def _scaled(crop: np.ndarray, long_side: float) -> np.ndarray:
     return cv2.GaussianBlur((scaled > 0).astype(np.float32), (0, 0), 2)
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=256)
 def _reference_crop(path: str) -> np.ndarray | None:
+    if path.endswith(LEARNED_SUFFIX):  # already a cleaned wall mask saved by learn_layout
+        return _content_crop(cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE))
     return _content_crop(wall_mask(read_image(path)))
+
+
+def _learned_dir(layout_path: str, learned_root: str) -> str:
+    """maps/PoE1/<zone>/<n>.png -> <learned_root>/PoE1/<zone>/<n>"""
+    version, zone, name = os.path.normpath(layout_path).split(os.sep)[-3:]
+    return os.path.join(learned_root, version, zone, os.path.splitext(name)[0])
+
+
+def learned_references(layout_path: str, learned_root: str | None) -> list[str]:
+    if not learned_root:
+        return []
+    return sorted(glob.glob(os.path.join(glob.escape(_learned_dir(layout_path, learned_root)), "*" + LEARNED_SUFFIX)))
+
+
+def learn_layout(capture_bgr: np.ndarray, layout_path: str, learned_root: str) -> str | None:
+    """Keep the capture's wall mask as an extra reference for layout_path (newest few only)."""
+    crop = _content_crop(drop_specks(wall_mask(capture_bgr)))
+    if crop is None:
+        return None
+    folder = _learned_dir(layout_path, learned_root)
+    os.makedirs(folder, exist_ok=True)
+    saved = os.path.join(folder, f"{time.time_ns()}{LEARNED_SUFFIX}")
+    cv2.imencode(".png", crop)[1].tofile(saved)  # tofile: zone folders have non-ASCII names
+    for old in learned_references(layout_path, learned_root)[:-LEARNED_PER_LAYOUT]:
+        os.remove(old)
+    return saved
 
 
 @lru_cache(maxsize=1024)
@@ -123,13 +159,31 @@ def _score(path: str, template: np.ndarray) -> float:
     return best
 
 
-def rank_layouts(capture_bgr: np.ndarray, paths: list[str]) -> list[tuple[str, float]]:
-    """Return (path, score) best-first; scores are in [0, 1]. Empty if the capture shows no map."""
+def rank_layouts(
+    capture_bgr: np.ndarray, paths: list[str], learned_root: str | None = None
+) -> list[tuple[str, float]]:
+    """Return (path, score) best-first. Empty if the capture shows no map.
+
+    A capture matches another capture ~0.1 better than any redrawn bundled image, whatever the
+    layout, so learned references would favour layouts that merely have some. That style gain is
+    measured on layouts having both kinds (the smallest gain, as the true layout gains most) and
+    granted to every layout's bundled score; only differences between layouts matter."""
     crop = _content_crop(drop_specks(wall_mask(capture_bgr)))
     if crop is None:
         return []
     template = _scaled(crop, TEMPLATE_SIZE)
-    ranked = [(path, _score(path, template)) for path in paths if _reference_crop(path) is not None]
+    scores = {}  # path -> (bundled score, best learned score or None)
+    for path in paths:
+        if _reference_crop(path) is None:
+            continue
+        learned = [_score(ref, template) for ref in learned_references(path, learned_root) if _reference_crop(ref) is not None]
+        scores[path] = (_score(path, template), max(learned) if learned else None)
+    gains = [learned - bundled for bundled, learned in scores.values() if learned is not None]
+    style_gain = min(gains) if gains else 0.0
+    ranked = [
+        (path, bundled + style_gain if learned is None else max(learned, bundled + style_gain))
+        for path, (bundled, learned) in scores.items()
+    ]
     return sorted(ranked, key=lambda item: item[1], reverse=True)
 
 
