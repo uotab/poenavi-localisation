@@ -1,9 +1,11 @@
 """Rank a zone's bundled layout images against a capture of the in-game map overlay.
 
-Both images are reduced to a mask of the light, low-saturation map lines, so the
-coloured route arrows and markers drawn on the reference images are ignored.
-The capture is usually a partly explored subset of the reference, so it is used
-as a template searched across scales and all 8 rotations/mirrorings.
+Both images are reduced to a mask of the pale blue-violet map lines, so the HUD and
+the coloured route arrows and markers drawn on the reference images are ignored.
+The capture is usually a partly explored subset of the reference, so it is used as a
+fixed-size template and the reference is resized to try each possible capture share.
+Layouts are matched upright only: the overlay and the reference screenshots share
+the game's fixed orientation, and allowing rotations produced false matches.
 """
 
 from __future__ import annotations
@@ -13,8 +15,10 @@ from functools import lru_cache
 import cv2
 import numpy as np
 
-WORK_SIZE = 240  # long side of the normalised reference, in pixels
-TEMPLATE_SCALES = np.linspace(0.3, 1.0, 10)  # capture size relative to the reference
+TEMPLATE_SIZE = 160  # long side of the capture template, in pixels
+# Capture size relative to the reference. The template stays fixed so small shares keep
+# their detail; shrinking the template instead made tiny blurry templates match anywhere.
+CAPTURE_SHARES = tuple(np.linspace(0.2, 1.0, 17))
 MIN_CONTENT_PIXELS = 50
 UNCERTAIN_MARGIN = 0.02  # best-vs-runner-up score gap below which the result is flagged
 NOISE_SHARE = 0.25  # capture groups smaller than this share of the largest are discarded (life globe ~11%)
@@ -67,33 +71,32 @@ def drop_specks(mask: np.ndarray) -> np.ndarray:
     return np.where(np.isin(labels, keep), mask, 0).astype(np.uint8)
 
 
-def _crop_and_scale(mask: np.ndarray, long_side: float) -> np.ndarray | None:
+def _content_crop(mask: np.ndarray) -> np.ndarray | None:
     ys, xs = np.nonzero(mask)
     if len(xs) < MIN_CONTENT_PIXELS:
         return None
-    cropped = mask[ys.min(): ys.max() + 1, xs.min(): xs.max() + 1]
-    height, width = cropped.shape
+    return mask[ys.min(): ys.max() + 1, xs.min(): xs.max() + 1]
+
+
+def _scaled(crop: np.ndarray, long_side: float) -> np.ndarray:
+    height, width = crop.shape
     factor = long_side / max(height, width)
     size = (max(1, round(width * factor)), max(1, round(height * factor)))
-    scaled = cv2.resize(cropped, size, interpolation=cv2.INTER_AREA)
+    scaled = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
     # Thin lines fade when shrunk; re-binarise, then blur for positional tolerance.
-    scaled = (scaled > 0).astype(np.float32)
-    return cv2.GaussianBlur(scaled, (0, 0), 2)
-
-
-def _orientations(image: np.ndarray):
-    for flipped in (image, cv2.flip(image, 1)):
-        for turns in range(4):
-            yield np.ascontiguousarray(np.rot90(flipped, turns))
+    return cv2.GaussianBlur((scaled > 0).astype(np.float32), (0, 0), 2)
 
 
 @lru_cache(maxsize=64)
-def _reference(path: str) -> np.ndarray | None:
-    prepared = _crop_and_scale(wall_mask(read_image(path)), WORK_SIZE)
-    if prepared is None:
-        return None
-    margin = WORK_SIZE // 10
-    return cv2.copyMakeBorder(prepared, margin, margin, margin, margin, cv2.BORDER_CONSTANT, value=0)
+def _reference_crop(path: str) -> np.ndarray | None:
+    return _content_crop(wall_mask(read_image(path)))
+
+
+@lru_cache(maxsize=1024)
+def _reference(path: str, share: float) -> np.ndarray:
+    margin = TEMPLATE_SIZE // 10
+    scaled = _scaled(_reference_crop(path), TEMPLATE_SIZE / share)
+    return cv2.copyMakeBorder(scaled, margin, margin, margin, margin, cv2.BORDER_CONSTANT, value=0)
 
 
 def _normalised_correlation(reference: np.ndarray, template: np.ndarray) -> float:
@@ -106,28 +109,20 @@ def _normalised_correlation(reference: np.ndarray, template: np.ndarray) -> floa
     return float((raw / np.sqrt(template_energy * window_energy)).max())
 
 
-def _score(reference: np.ndarray, capture_mask: np.ndarray) -> float:
+def _score(path: str, template: np.ndarray) -> float:
     best = 0.0
-    for scale in TEMPLATE_SCALES:
-        template = _crop_and_scale(capture_mask, WORK_SIZE * scale)
-        if template is None:
-            return best
-        for oriented in _orientations(template):
-            th, tw = oriented.shape
-            if th > reference.shape[0] or tw > reference.shape[1]:
-                continue
-            best = max(best, _normalised_correlation(reference, oriented))
+    for share in CAPTURE_SHARES:
+        reference = _reference(path, share)
+        if template.shape[0] <= reference.shape[0] and template.shape[1] <= reference.shape[1]:
+            best = max(best, _normalised_correlation(reference, template))
     return best
 
 
 def rank_layouts(capture_bgr: np.ndarray, paths: list[str]) -> list[tuple[str, float]]:
     """Return (path, score) best-first; scores are in [0, 1]. Empty if the capture shows no map."""
-    capture_mask = drop_specks(wall_mask(capture_bgr))
-    if np.count_nonzero(capture_mask) < MIN_CONTENT_PIXELS:
+    crop = _content_crop(drop_specks(wall_mask(capture_bgr)))
+    if crop is None:
         return []
-    ranked = []
-    for path in paths:
-        reference = _reference(path)
-        if reference is not None:
-            ranked.append((path, _score(reference, capture_mask)))
+    template = _scaled(crop, TEMPLATE_SIZE)
+    ranked = [(path, _score(path, template)) for path in paths if _reference_crop(path) is not None]
     return sorted(ranked, key=lambda item: item[1], reverse=True)

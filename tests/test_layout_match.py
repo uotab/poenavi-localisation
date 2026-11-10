@@ -14,14 +14,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZONE_PATHS = sorted(glob.glob(os.path.join(ROOT, "maps", "PoE1", "下水道", "*.png")))
 
 
-def _partial_capture(path, *, flip, turns):
-    """Simulate a partly explored in-game map: a crop, mirrored/rotated, with route lines."""
+def _partial_capture(path):
+    """Simulate a partly explored in-game map: an upright crop at another scale, with route lines."""
     image = read_image(path)
     height, width = image.shape[:2]
     crop = image[height // 5: height * 4 // 5, width // 6: width * 5 // 6].copy()
-    if flip:
-        crop = cv2.flip(crop, 1)
-    crop = np.ascontiguousarray(np.rot90(crop, turns))
     crop = cv2.resize(crop, None, fx=0.8, fy=0.8)
     cv2.line(crop, (0, 0), (crop.shape[1], crop.shape[0]), (180, 110, 230), 5)
     canvas = np.full((crop.shape[0] + 120, crop.shape[1] + 160, 3), (40, 30, 28), np.uint8)
@@ -31,8 +28,8 @@ def _partial_capture(path, *, flip, turns):
 
 def test_each_layout_is_ranked_first_for_its_own_partial_capture():
     assert len(ZONE_PATHS) >= 2
-    for index, truth in enumerate(ZONE_PATHS):
-        capture = _partial_capture(truth, flip=index % 2 == 1, turns=index % 4)
+    for truth in ZONE_PATHS:
+        capture = _partial_capture(truth)
         ranked = rank_layouts(capture, ZONE_PATHS)
         assert ranked[0][0] == truth
 
@@ -40,15 +37,15 @@ def test_each_layout_is_ranked_first_for_its_own_partial_capture():
 def test_stray_specks_around_the_map_do_not_change_the_result():
     """Game effects and HUD text elsewhere on screen must not flip the ranking between frames."""
     rng = np.random.default_rng(0)
-    for index, truth in enumerate(ZONE_PATHS):
-        overlay = _partial_capture(truth, flip=index % 2 == 1, turns=index % 4)
+    for truth in ZONE_PATHS:
+        overlay = _partial_capture(truth)
         height, width = overlay.shape[:2]
         for _ in range(5):
             capture = np.full((height + 400, width + 600, 3), (40, 30, 28), np.uint8)
             capture[200:200 + height, 300:300 + width] = overlay
             for _ in range(4):
                 x, y = rng.integers(6, capture.shape[1] - 6), rng.integers(6, capture.shape[0] - 6)
-                cv2.circle(capture, (int(x), int(y)), 3, (220, 220, 220), 1)
+                cv2.circle(capture, (int(x), int(y)), 3, (200, 170, 170), 1)  # wall-coloured, so only grouping removes it
             assert rank_layouts(capture, ZONE_PATHS)[0][0] == truth
 
 
