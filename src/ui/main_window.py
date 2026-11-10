@@ -4876,6 +4876,7 @@ class MainWindow(QMainWindow):
             return
         paths = list(self.map_thumbnail.current_paths)
         if len(paths) < 2:
+            print(f"[LAYOUT DEBUG] skipped: current zone has {len(paths)} layout image(s)")
             return
         from PySide6.QtGui import QGuiApplication
 

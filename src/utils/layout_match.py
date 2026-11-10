@@ -10,6 +10,7 @@ the game's fixed orientation, and allowing rotations produced false matches.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 import cv2
@@ -133,6 +134,7 @@ def rank_layouts(capture_bgr: np.ndarray, paths: list[str]) -> list[tuple[str, f
 def detect_layout(capture_bgr: np.ndarray, paths: list[str]) -> str | None:
     """Return the matching layout path, or None until the map clearly fits one layout."""
     ranked = rank_layouts(capture_bgr, paths)
+    print("[LAYOUT DEBUG]", [(os.path.basename(path), round(score, 3)) for path, score in ranked])
     if not ranked or (len(ranked) > 1 and ranked[0][1] - ranked[1][1] < DECISION_MARGIN):
         return None
     return ranked[0][0]
