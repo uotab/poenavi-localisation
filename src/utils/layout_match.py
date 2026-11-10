@@ -10,7 +10,6 @@ the game's fixed orientation, and allowing rotations produced false matches.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 
 import cv2
@@ -24,6 +23,9 @@ MIN_CONTENT_PIXELS = 50
 # Best-vs-runner-up gap needed to name a layout. On real 2560x1440 captures every wrong pick
 # had a gap <= 0.052 (layouts share their start area); correct partial ones reached 0.062+.
 DECISION_MARGIN = 0.06
+# A smaller gap is enough when the same layout already led the previous press: live presses on
+# a correct layout led by 0.008 then 0.028, while early wrong leaders flip between presses.
+REPEAT_MARGIN = 0.02
 NOISE_SHARE = 0.25  # capture groups smaller than this share of the largest are discarded (life globe ~11%)
 
 
@@ -131,10 +133,16 @@ def rank_layouts(capture_bgr: np.ndarray, paths: list[str]) -> list[tuple[str, f
     return sorted(ranked, key=lambda item: item[1], reverse=True)
 
 
-def detect_layout(capture_bgr: np.ndarray, paths: list[str]) -> str | None:
-    """Return the matching layout path, or None until the map clearly fits one layout."""
-    ranked = rank_layouts(capture_bgr, paths)
-    print("[LAYOUT DEBUG]", [(os.path.basename(path), round(score, 3)) for path, score in ranked])
-    if not ranked or (len(ranked) > 1 and ranked[0][1] - ranked[1][1] < DECISION_MARGIN):
+def pick_layout(ranked: list[tuple[str, float]], previous_leader: str | None = None) -> str | None:
+    """Return the layout to show for a ranking, or None until one layout clearly fits.
+
+    previous_leader is the top-ranked layout of the previous press in the same zone."""
+    if not ranked:
         return None
-    return ranked[0][0]
+    best = ranked[0][0]
+    if len(ranked) == 1:
+        return best
+    lead = ranked[0][1] - ranked[1][1]
+    if lead >= DECISION_MARGIN or (best == previous_leader and lead >= REPEAT_MARGIN):
+        return best
+    return None

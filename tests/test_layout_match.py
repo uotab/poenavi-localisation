@@ -6,7 +6,7 @@ import numpy as np
 from PySide6.QtGui import QImage
 
 from src.utils.feature_support import is_feature_hotkey_supported
-from src.utils.layout_match import detect_layout, qimage_to_bgr, rank_layouts, read_image
+from src.utils.layout_match import pick_layout, qimage_to_bgr, rank_layouts, read_image
 from src.utils.poe_version_data import POE1, POE2
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,15 +47,21 @@ def test_stray_specks_around_the_map_do_not_change_the_result():
             assert rank_layouts(capture, ZONE_PATHS)[0][0] == truth
 
 
-def test_detect_names_a_clear_winner():
-    assert detect_layout(_partial_capture(ZONE_PATHS[0]), ZONE_PATHS) == ZONE_PATHS[0]
+def test_pick_names_a_clear_winner():
+    assert pick_layout(rank_layouts(_partial_capture(ZONE_PATHS[0]), ZONE_PATHS)) == ZONE_PATHS[0]
 
 
-def test_detect_refuses_when_layouts_fit_equally():
+def test_pick_refuses_close_calls_and_empty_rankings():
     """Layouts sharing a start area score alike: ask to explore further instead of guessing."""
-    capture = _partial_capture(ZONE_PATHS[0])
-    assert detect_layout(capture, [ZONE_PATHS[0], ZONE_PATHS[0]]) is None
-    assert detect_layout(np.full((300, 400, 3), (40, 30, 28), np.uint8), ZONE_PATHS) is None
+    assert pick_layout([("5.png", 0.752), ("3.png", 0.724)]) is None
+    assert pick_layout([]) is None
+
+
+def test_pick_accepts_a_smaller_lead_when_the_leader_repeats():
+    # Real presses on Submerged Passage layout 5: leads 0.008, then 0.028 with the same leader.
+    assert pick_layout([("5.png", 0.752), ("3.png", 0.724)], previous_leader="5.png") == "5.png"
+    assert pick_layout([("5.png", 0.709), ("2.png", 0.701)], previous_leader="5.png") is None
+    assert pick_layout([("2.png", 0.62), ("3.png", 0.61)], previous_leader="1.png") is None
 
 
 def test_capture_without_map_lines_returns_no_ranking():

@@ -4881,7 +4881,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QGuiApplication
 
         from src.poetore.window_position import path_of_exile_client_rect
-        from src.utils.layout_match import detect_layout, qimage_to_bgr
+        from src.utils.layout_match import pick_layout, qimage_to_bgr, rank_layouts
 
         rect = path_of_exile_client_rect()
         if rect is None:
@@ -4894,7 +4894,12 @@ class MainWindow(QMainWindow):
         image.save(capture_path)
         print(f"[LAYOUT DEBUG] rect={rect.getRect()} image={image.width()}x{image.height()} saved={capture_path}")
         # shortcut: matching runs on the UI thread (~0.5 s); move to a worker if it stutters.
-        detected = detect_layout(qimage_to_bgr(image), paths)
+        ranked = rank_layouts(qimage_to_bgr(image), paths)
+        print("[LAYOUT DEBUG]", [(os.path.basename(path), round(score, 3)) for path, score in ranked])
+        # The previous press's leader only counts within the same zone (same set of layout images).
+        zone, previous_leader = getattr(self, "_layout_leader", (None, None))
+        detected = pick_layout(ranked, previous_leader if zone == tuple(paths) else None)
+        self._layout_leader = (tuple(paths), ranked[0][0] if ranked else None)
         if detected is None:
             self.map_thumbnail.header_label.setText(
                 tr_ui("🗺 マップを判定できません。ゲーム内のマップ（Tab）を開き、もう少し探索してから押してください")
