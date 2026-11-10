@@ -17,6 +17,7 @@ WORK_SIZE = 240  # long side of the normalised reference, in pixels
 TEMPLATE_SCALES = np.linspace(0.3, 1.0, 10)  # capture size relative to the reference
 MIN_CONTENT_PIXELS = 50
 UNCERTAIN_MARGIN = 0.02  # best-vs-runner-up score gap below which the result is flagged
+NOISE_SHARE = 0.1  # capture blobs smaller than this share of the largest are discarded
 
 
 def qimage_to_bgr(image) -> np.ndarray:
@@ -46,6 +47,21 @@ def wall_mask(bgr: np.ndarray) -> np.ndarray:
     # Map lines are thin; solid bright areas (screenshot borders, UI panels) are not walls.
     solid = cv2.dilate(cv2.erode(mask, np.ones((7, 7), np.uint8)), np.ones((11, 11), np.uint8))
     return cv2.bitwise_and(mask, cv2.bitwise_not(solid))
+
+
+def drop_specks(mask: np.ndarray) -> np.ndarray:
+    """Drop isolated specks (game effects, HUD text) that would stretch the capture's
+    bounding box and change the match from frame to frame. Map lines can be broken into
+    many tiny pieces, so pieces are grouped by proximity first and whole groups smaller
+    than NOISE_SHARE of the largest group are removed."""
+    reach = max(5, max(mask.shape) // 60) | 1
+    grouped = cv2.dilate(mask, np.ones((reach, reach), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
+    if count <= 1:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    keep = np.flatnonzero(areas >= areas.max() * NOISE_SHARE) + 1
+    return np.where(np.isin(labels, keep), mask, 0).astype(np.uint8)
 
 
 def _crop_and_scale(mask: np.ndarray, long_side: float) -> np.ndarray | None:
@@ -103,7 +119,7 @@ def _score(reference: np.ndarray, capture_mask: np.ndarray) -> float:
 
 def rank_layouts(capture_bgr: np.ndarray, paths: list[str]) -> list[tuple[str, float]]:
     """Return (path, score) best-first; scores are in [0, 1]. Empty if the capture shows no map."""
-    capture_mask = wall_mask(capture_bgr)
+    capture_mask = drop_specks(wall_mask(capture_bgr))
     if np.count_nonzero(capture_mask) < MIN_CONTENT_PIXELS:
         return []
     ranked = []

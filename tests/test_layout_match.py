@@ -37,6 +37,21 @@ def test_each_layout_is_ranked_first_for_its_own_partial_capture():
         assert ranked[0][0] == truth
 
 
+def test_stray_specks_around_the_map_do_not_change_the_result():
+    """Game effects and HUD text elsewhere on screen must not flip the ranking between frames."""
+    rng = np.random.default_rng(0)
+    for index, truth in enumerate(ZONE_PATHS):
+        overlay = _partial_capture(truth, flip=index % 2 == 1, turns=index % 4)
+        height, width = overlay.shape[:2]
+        for _ in range(5):
+            capture = np.full((height + 400, width + 600, 3), (40, 30, 28), np.uint8)
+            capture[200:200 + height, 300:300 + width] = overlay
+            for _ in range(4):
+                x, y = rng.integers(6, capture.shape[1] - 6), rng.integers(6, capture.shape[0] - 6)
+                cv2.circle(capture, (int(x), int(y)), 3, (220, 220, 220), 1)
+            assert rank_layouts(capture, ZONE_PATHS)[0][0] == truth
+
+
 def test_capture_without_map_lines_returns_no_ranking():
     blank = np.full((300, 400, 3), (40, 30, 28), np.uint8)
     assert rank_layouts(blank, ZONE_PATHS) == []
