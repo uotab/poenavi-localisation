@@ -17,7 +17,7 @@ WORK_SIZE = 240  # long side of the normalised reference, in pixels
 TEMPLATE_SCALES = np.linspace(0.3, 1.0, 10)  # capture size relative to the reference
 MIN_CONTENT_PIXELS = 50
 UNCERTAIN_MARGIN = 0.02  # best-vs-runner-up score gap below which the result is flagged
-NOISE_SHARE = 0.1  # capture blobs smaller than this share of the largest are discarded
+NOISE_SHARE = 0.25  # capture groups smaller than this share of the largest are discarded (life globe ~11%)
 
 
 def qimage_to_bgr(image) -> np.ndarray:
@@ -42,8 +42,11 @@ def read_image(path: str) -> np.ndarray:
 
 def wall_mask(bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    saturation, value = hsv[..., 1], hsv[..., 2]
-    mask = ((saturation < 90) & (value > 110)).astype(np.uint8) * 255
+    hue, saturation, value = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    # Map walls are a pale blue-violet (hue ~105-125); HUD text is pure white (saturation 0)
+    # and HUD frames/icons are gold, so both are excluded by hue and minimum saturation.
+    lavender = (hue >= 100) & (hue <= 130) & (saturation >= 20)
+    mask = (lavender & (saturation < 90) & (value > 110)).astype(np.uint8) * 255
     # Map lines are thin; solid bright areas (screenshot borders, UI panels) are not walls.
     solid = cv2.dilate(cv2.erode(mask, np.ones((7, 7), np.uint8)), np.ones((11, 11), np.uint8))
     return cv2.bitwise_and(mask, cv2.bitwise_not(solid))
