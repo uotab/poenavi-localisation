@@ -20,10 +20,9 @@ TEMPLATE_SIZE = 160  # long side of the capture template, in pixels
 # their detail; shrinking the template instead made tiny blurry templates match anywhere.
 CAPTURE_SHARES = tuple(np.linspace(0.2, 1.0, 17))
 MIN_CONTENT_PIXELS = 50
-# Share of the capture that must be map lines before ranking. Real 2560x1440 captures: a
-# correct pick had 0.87%; captures just after entering (wrong or coin-flip picks) had 0.19-0.39%.
-MIN_WALL_SHARE = 0.006
-UNCERTAIN_MARGIN = 0.02  # best-vs-runner-up score gap below which the result is flagged
+# Best-vs-runner-up gap needed to name a layout. On real 2560x1440 captures every wrong pick
+# had a gap <= 0.052 (layouts share their start area); correct partial ones reached 0.062+.
+DECISION_MARGIN = 0.06
 NOISE_SHARE = 0.25  # capture groups smaller than this share of the largest are discarded (life globe ~11%)
 
 
@@ -123,13 +122,17 @@ def _score(path: str, template: np.ndarray) -> float:
 
 def rank_layouts(capture_bgr: np.ndarray, paths: list[str]) -> list[tuple[str, float]]:
     """Return (path, score) best-first; scores are in [0, 1]. Empty if the capture shows no map."""
-    mask = drop_specks(wall_mask(capture_bgr))
-    # Layouts often share their start area, so a barely explored map gives confident wrong picks.
-    if np.count_nonzero(mask) < MIN_WALL_SHARE * mask.size:
-        return []
-    crop = _content_crop(mask)
+    crop = _content_crop(drop_specks(wall_mask(capture_bgr)))
     if crop is None:
         return []
     template = _scaled(crop, TEMPLATE_SIZE)
     ranked = [(path, _score(path, template)) for path in paths if _reference_crop(path) is not None]
     return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+
+def detect_layout(capture_bgr: np.ndarray, paths: list[str]) -> str | None:
+    """Return the matching layout path, or None until the map clearly fits one layout."""
+    ranked = rank_layouts(capture_bgr, paths)
+    if not ranked or (len(ranked) > 1 and ranked[0][1] - ranked[1][1] < DECISION_MARGIN):
+        return None
+    return ranked[0][0]

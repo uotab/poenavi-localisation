@@ -826,7 +826,6 @@
   "🗺 マップレイアウト": "🗺 Map Layout",
   "🗺 マップレイアウト ({value_0}パターン)": "🗺 Map Layout{value_0}(Example)",
   "🗺 マップレイアウト ({value_0}パターン) — 判定: {value_1}": "🗺 Map layout ({value_0} patterns) — detected: {value_1}",
-  "🗺 マップレイアウト ({value_0}パターン) — 判定: {value_1}（不確実）": "🗺 Map layout ({value_0} patterns) — detected: {value_1} (uncertain)",
   "🗺️ レイアウト": "🗺️ Layout",
   "🗺️ レイアウト情報": "🗺️ Layout Information",
   "🚩 条件分岐: {value_0}": "🚩 Conditional Statements:{value_0}",

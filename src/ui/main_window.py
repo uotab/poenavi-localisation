@@ -4880,7 +4880,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QGuiApplication
 
         from src.poetore.window_position import path_of_exile_client_rect
-        from src.utils.layout_match import UNCERTAIN_MARGIN, qimage_to_bgr, rank_layouts
+        from src.utils.layout_match import detect_layout, qimage_to_bgr
 
         rect = path_of_exile_client_rect()
         if rect is None:
@@ -4889,14 +4889,13 @@ class MainWindow(QMainWindow):
         screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
         image = screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height()).toImage()
         # shortcut: matching runs on the UI thread (~0.5 s); move to a worker if it stutters.
-        ranked = rank_layouts(qimage_to_bgr(image), paths)
-        if not ranked:
+        detected = detect_layout(qimage_to_bgr(image), paths)
+        if detected is None:
             self.map_thumbnail.header_label.setText(
                 tr_ui("🗺 マップを判定できません。ゲーム内のマップ（Tab）を開き、もう少し探索してから押してください")
             )
             return
-        uncertain = len(ranked) > 1 and ranked[0][1] - ranked[1][1] < UNCERTAIN_MARGIN
-        self.map_thumbnail.show_detected_layout(ranked[0][0], uncertain)
+        self.map_thumbnail.show_detected_layout(detected)
 
     def _update_cheat_sheets_hotkey_tooltip(self):
         hotkey = self.config.get("hotkeys", {}).get("cheat_sheets_toggle", "shift+space")

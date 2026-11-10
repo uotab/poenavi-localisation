@@ -6,7 +6,7 @@ import numpy as np
 from PySide6.QtGui import QImage
 
 from src.utils.feature_support import is_feature_hotkey_supported
-from src.utils.layout_match import qimage_to_bgr, rank_layouts, read_image
+from src.utils.layout_match import detect_layout, qimage_to_bgr, rank_layouts, read_image
 from src.utils.poe_version_data import POE1, POE2
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,13 +47,15 @@ def test_stray_specks_around_the_map_do_not_change_the_result():
             assert rank_layouts(capture, ZONE_PATHS)[0][0] == truth
 
 
-def test_barely_explored_map_returns_no_ranking():
-    """Just after entering, layouts share their start area: refuse to guess instead of picking one."""
-    image = read_image(ZONE_PATHS[0])
-    height, width = image.shape[:2]
-    capture = np.full((1440, 2560, 3), (40, 30, 28), np.uint8)
-    capture[600:600 + height // 8, 1200:1200 + width // 8] = image[height // 2: height // 2 + height // 8, width // 2: width // 2 + width // 8]
-    assert rank_layouts(capture, ZONE_PATHS) == []
+def test_detect_names_a_clear_winner():
+    assert detect_layout(_partial_capture(ZONE_PATHS[0]), ZONE_PATHS) == ZONE_PATHS[0]
+
+
+def test_detect_refuses_when_layouts_fit_equally():
+    """Layouts sharing a start area score alike: ask to explore further instead of guessing."""
+    capture = _partial_capture(ZONE_PATHS[0])
+    assert detect_layout(capture, [ZONE_PATHS[0], ZONE_PATHS[0]]) is None
+    assert detect_layout(np.full((300, 400, 3), (40, 30, 28), np.uint8), ZONE_PATHS) is None
 
 
 def test_capture_without_map_lines_returns_no_ranking():

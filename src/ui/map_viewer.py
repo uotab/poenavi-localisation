@@ -405,17 +405,13 @@ class MapThumbnailWidget(QWidget):
             self.open_first_map()
 
 
-    def show_detected_layout(self, image_path: str, uncertain: bool = False):
+    def show_detected_layout(self, image_path: str):
         """自動判定したレイアウトを見出しに示し、拡大表示する。"""
         if image_path not in self.current_paths:
             return
         number = self.current_paths.index(image_path) + 1
         total = len(self.current_paths)
-        if uncertain:
-            text = tr_ui(f"🗺 マップレイアウト ({total}パターン) — 判定: {number}（不確実）")
-        else:
-            text = tr_ui(f"🗺 マップレイアウト ({total}パターン) — 判定: {number}")
-        self.header_label.setText(text)
+        self.header_label.setText(tr_ui(f"🗺 マップレイアウト ({total}パターン) — 判定: {number}"))
         self._on_thumb_clicked(image_path)
 
     def wheelEvent(self, event):
