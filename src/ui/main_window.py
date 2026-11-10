@@ -4876,11 +4876,12 @@ class MainWindow(QMainWindow):
             return
         paths = list(self.map_thumbnail.current_paths)
         if len(paths) < 2:
+            print(f"[LAYOUT DEBUG] skipped: current zone has {len(paths)} layout image(s)")
             return
         from PySide6.QtGui import QGuiApplication
 
         from src.poetore.window_position import path_of_exile_client_rect
-        from src.utils.layout_match import UNCERTAIN_MARGIN, qimage_to_bgr, rank_layouts
+        from src.utils.layout_match import pick_layout, qimage_to_bgr, rank_layouts
 
         rect = path_of_exile_client_rect()
         if rect is None:
@@ -4888,15 +4889,23 @@ class MainWindow(QMainWindow):
             return
         screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
         image = screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height()).toImage()
+        # Debug aid: the exact frame that was matched, to compare with the in-game result.
+        capture_path = os.path.join(ConfigManager.get_user_data_dir(), "last_layout_capture.png")
+        image.save(capture_path)
+        print(f"[LAYOUT DEBUG] rect={rect.getRect()} image={image.width()}x{image.height()} saved={capture_path}")
         # shortcut: matching runs on the UI thread (~0.5 s); move to a worker if it stutters.
         ranked = rank_layouts(qimage_to_bgr(image), paths)
-        if not ranked:
+        print("[LAYOUT DEBUG]", [(os.path.basename(path), round(score, 3)) for path, score in ranked])
+        # The previous press's leader only counts within the same zone (same set of layout images).
+        zone, previous_leader = getattr(self, "_layout_leader", (None, None))
+        detected = pick_layout(ranked, previous_leader if zone == tuple(paths) else None)
+        self._layout_leader = (tuple(paths), ranked[0][0] if ranked else None)
+        if detected is None:
             self.map_thumbnail.header_label.setText(
-                tr_ui("🗺 マップを読み取れませんでした。ゲーム内のマップ（Tab）を開いてから押してください")
+                tr_ui("🗺 マップを判定できません。ゲーム内のマップ（Tab）を開き、もう少し探索してから押してください")
             )
             return
-        uncertain = len(ranked) > 1 and ranked[0][1] - ranked[1][1] < UNCERTAIN_MARGIN
-        self.map_thumbnail.show_detected_layout(ranked[0][0], uncertain)
+        self.map_thumbnail.show_detected_layout(detected)
 
     def _update_cheat_sheets_hotkey_tooltip(self):
         hotkey = self.config.get("hotkeys", {}).get("cheat_sheets_toggle", "shift+space")
