@@ -4881,7 +4881,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QGuiApplication
 
         from src.poetore.window_position import path_of_exile_client_rect
-        from src.utils.layout_match import pick_layout, qimage_to_bgr, rank_layouts
+        from src.utils.layout_match import LEARN_MARGIN, learn_layout, pick_layout, qimage_to_bgr, rank_layouts
 
         rect = path_of_exile_client_rect()
         if rect is None:
@@ -4894,7 +4894,9 @@ class MainWindow(QMainWindow):
         image.save(capture_path)
         print(f"[LAYOUT DEBUG] rect={rect.getRect()} image={image.width()}x{image.height()} saved={capture_path}")
         # shortcut: matching runs on the UI thread (~0.5 s); move to a worker if it stutters.
-        ranked = rank_layouts(qimage_to_bgr(image), paths)
+        capture = qimage_to_bgr(image)
+        learned_root = os.path.join(ConfigManager.get_user_data_dir(), "layout_refs")
+        ranked = rank_layouts(capture, paths, learned_root)
         print("[LAYOUT DEBUG]", [(os.path.basename(path), round(score, 3)) for path, score in ranked])
         # The previous press's leader only counts within the same zone (same set of layout images).
         zone, previous_leader = getattr(self, "_layout_leader", (None, None))
@@ -4906,6 +4908,8 @@ class MainWindow(QMainWindow):
             )
             return
         self.map_thumbnail.show_detected_layout(detected)
+        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] >= LEARN_MARGIN:
+            print(f"[LAYOUT DEBUG] learned reference: {learn_layout(capture, detected, learned_root)}")
 
     def _update_cheat_sheets_hotkey_tooltip(self):
         hotkey = self.config.get("hotkeys", {}).get("cheat_sheets_toggle", "shift+space")
